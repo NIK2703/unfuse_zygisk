@@ -217,27 +217,48 @@ Android 10, где sdcardfs пускал только процессы из гр
 `mask=0007` и `gid=9997` даёт каталоги `0770` и файлы `0660` (`0777 & ~7` и
 `0666 & ~7`), а «остальные» там нулевые по построению.
 
-**Почему шаг выполняется несколько раз.** vold готовит `/data/media` не один раз,
-и не всегда до того, как отработают скрипты модуля:
+**Гонка с vold и как она закрыта.** vold готовит `/data/media` не один раз, и не
+всегда до того, как отработают скрипты модуля:
 
 * `Android/obb` — единственный каталог, у которого vold **перезаписывает**
-  default ACL (`SetDefaultAcl(androidObbDir, ..., {})`, `Utils.cpp:1894`), а не
+  default ACL (`SetDefaultAcl(androidObbDir, ..., {})`, `Utils.cpp:1889`), а не
   просто `chmod`-ит. Проход на стадии `service` возвращает ACL на место и заодно
   накрывает пакеты, чьи каталоги vold создал за это время.
 * `/data/media/0` — vold дописывает ему default-ACL с именованной записью для
   **1023** (`media_rw`), перекрывая 9997, причём уже **после** `service.sh`.
-  Замерено на устройстве: у `/data/media/0` access-ACL содержит `GROUP(9997)`, а
-  default-ACL — `GROUP(1023)`, тогда как у всех остальных каталогов 9997 стоит в
-  обоих. Каталог, созданный в `/data/media/0` процессом, на который хуки libc не
-  распространяются (vold, MTP, root-демон), унаследует запись для 1023 вместо
+  Источник — `SetDefaultAcl(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW,
+  {AID_MEDIA_RW})` (`FsCrypt.cpp:1027`): `additionalGid` становится именованной
+  записью. Каталог, созданный в `/data/media/0` процессом, на который хуки libc
+  не распространяются (vold, MTP, root-демон), унаследует запись для 1023 вместо
   9997 — и приложения его не увидят.
 
-Поэтому `service.sh`, дождавшись `sys.boot_completed`, делает ещё три прохода с
-растущими паузами (15, 30 и 75 секунд): точный момент последней правки vold
-зависит от разблокировки и монтирования хранилища и заранее неизвестен. Проходы
-идемпотентны и стоят около секунды процессорного времени каждый. Идут они
-**фоном** — `service.sh` обязан вернуться сразу, иначе init заблокируется на нём
-(замерено: возврат за 0 с).
+Вместо того чтобы гоняться за vold повторами, модуль **снимает саму причину**:
+утилита `tools/vold-noacl` заменяет в памяти процесса одну инструкцию в
+`vold::SetDefaultAcl()`, после чего функция сразу возвращает `OK` и не пишет
+default-ACL вообще — ровно так, как она ведёт себя на устройствах с sdcardfs
+(«sdcardfs magically takes care of this»). Обоснование, разбор дизассемблера и
+все проверки — в шапке `tools/vold-noacl.c`.
+
+Замерено A/B на одном и том же пути загрузки, при отключённых повторных проходах:
+
+| | default-ACL у `/data/media/0` |
+|---|---|
+| без патча | `GROUP(1023)` |
+| с патчем | `GROUP(9997)` |
+
+Патч ставится дважды: в `post-fs-data.sh` — там он успевает до правки (vold
+готовит CE-хранилище пользователя только позже, `FsCrypt.cpp:657`: на этой стадии
+он делает лишь DE), — и в `service.sh`, потому что патч живёт в памяти процесса.
+Оба шага идемпотентны: утилита распознаёт уже поставленный патч.
+
+**Повторные проходы остались запасным путём.** Если vold окажется другой сборки,
+утилита не найдёт сигнатуру, ничего не запишет и вернёт код 2 — тогда
+`service.sh` включает прежний способ: дожидается `sys.boot_completed` и делает
+три прохода с растущими паузами (15, 30 и 75 секунд), потому что точный момент
+последней правки vold зависит от разблокировки и монтирования хранилища и заранее
+неизвестен. Проходы идемпотентны и стоят около секунды процессорного времени
+каждый. Идут они **фоном** — `service.sh` обязан вернуться сразу, иначе init
+заблокируется на нём (замерено: возврат за 0 с).
 
 **Как определяется, что путь нужен.** Основной путь считается поднятым, только
 если под всеми четырьмя точками `/mnt/runtime/*/emulated` действительно
@@ -272,14 +293,15 @@ API=30 ./build.sh                   # другой API level (по умолча�
 ZIP=0 ./build.sh                    # не паковать zip
 ```
 
-Собираются две вещи: `module/zygisk/<abi>.so` (сам модуль) и
-`module/tools/storage-fix-<abi>` (утилита ACL, ~7 КБ). В архиве лежат бинарники
-утилиты на все ABI, а `customize.sh` при установке оставляет нужный и
-переименовывает его в `tools/storage-fix`.
+Собираются три вещи: `module/zygisk/<abi>.so` (сам модуль),
+`module/tools/storage-fix-<abi>` (утилита ACL, ~7 КБ) и
+`module/tools/vold-noacl-<abi>` (снятие default-ACL с vold, ~10 КБ). В архиве
+лежат бинарники обеих утилит на все ABI, а `customize.sh` при установке оставляет
+нужные и переименовывает их в `tools/storage-fix` и `tools/vold-noacl`.
 
 ```sh
-adb push out/sdcardfs_restore-v2.6.1.zip /data/local/tmp/
-adb shell su -c "ksud module install /data/local/tmp/sdcardfs_restore-v2.6.1.zip"
+adb push out/sdcardfs_restore-v2.9.0.zip /data/local/tmp/
+adb shell su -c "ksud module install /data/local/tmp/sdcardfs_restore-v2.9.0.zip"
 adb reboot
 ```
 
@@ -305,6 +327,10 @@ ls -Zd /data/media
 logcat -d | grep SdcardFsRestore
 #    I SdcardFsRestore: sdcardfs подключён: uid=10398
 #    I SdcardFsRestore: сырой /data/media подключён: uid=10398
+
+# 5. встал ли патч vold — см. §6.3
+#    vold-noacl: патч поставлен
+#    service: патч vold на месте — повторные проходы ACL не нужны
 ```
 
 Полная регрессия обоих путей — `tools/device-test-fallback.sh`: она накрывает
@@ -436,6 +462,48 @@ adb shell su -c 'sh /data/local/tmp/device-e2e.sh'
 `/storage/emulated/0` лежит сырое дерево, и тот же uid читает чужой файл без
 всяких препятствий. Ради этого модуль и существует.
 
+### 6.3. Проверка патча vold
+
+Патч живёт только в памяти процесса, поэтому проверять его надо там же. Утилита
+идемпотентна, так что её можно звать в любой момент:
+
+```sh
+# что видит утилита (--dry-run ничего не пишет)
+adb shell su -c '/data/adb/modules/sdcardfs_restore/tools/vold-noacl --dry-run'
+#   vold-noacl: pid=919 база=0x61f509c000, охранник +0x54ea0 -> b +0x54f00
+#   vold-noacl: --dry-run, ничего не записано
+
+# поставить (или убедиться, что уже стоит)
+adb shell su -c '/data/adb/modules/sdcardfs_restore/tools/vold-noacl'
+#   vold-noacl: патч поставлен
+#   повторный запуск: vold-noacl: патч уже стоит (pid=919, +0x54ea0)
+```
+
+Что патч действительно работает, видно по `default`-ACL у `/data/media/0`.
+`tools/acl-dump.c` печатает ACL в читаемом виде (штатный `getfattr` не годится —
+toybox-овский обрывает значение на первом `NUL`, то есть на поле версии):
+
+```sh
+cc=.../aarch64-linux-android26-clang
+$cc -std=c11 -Oz tools/acl-dump.c -o /tmp/acl-dump
+adb push /tmp/acl-dump /data/local/tmp/acl-dump
+adb shell su -c '/data/local/tmp/acl-dump /data/media/0'
+#   /data/media/0 default GROUP     rwx id=9997     <- с патчем
+#   /data/media/0 default GROUP     rwx id=1023     <- без патча
+```
+
+Ожидаемая картина в логе загрузки — три строки:
+
+```
+vold-noacl: pid=919 база=0x61f509c000, охранник +0x54ea0 -> b +0x54f00
+vold-noacl: патч поставлен
+service: патч vold на месте — повторные проходы ACL не нужны
+```
+
+Если вместо третьей строки появилось `service: патч vold НЕ встал — включаю
+повторные проходы ACL`, значит `vold` оказался другой сборки и модуль работает по
+старому — повторами (см. §3.3).
+
 ## 7. Ограничения
 
 * Обрабатываются только процессы, которые запускает Zygote. Процессы, читающие
@@ -447,24 +515,39 @@ adb shell su -c 'sh /data/local/tmp/device-e2e.sh'
   приложение, которое сделает `chown` своему `Android/data/<pkg>`, сломает доступ
   к этому каталогу для MediaProvider. Это свойство любого решения без sdcardfs,
   включая AOSP-овский `/mnt/pass_through`.
+* Патч `vold` привязан к конкретной сборке `/system/bin/vold`: утилита ищет
+  сигнатуру и сверяет байты. После обновления прошивки она перестанет находить
+  место, ничего не запишет и вернёт код 2 — модуль вернётся к повторным проходам
+  ACL. Доступ это не ломает, но гонка за `default`-ACL возвращается. Чтобы
+  пересчитать сигнатуру под новый бинарник, `tools/find-acl-writer.py` находит
+  `SetDefaultAcl` по ссылке на строку `system.posix_acl_default` (в `vold` от
+  Android 16 это `adrp @ 0x54fcc`), а дальше якорь охранника читается из
+  дизассемблера вокруг неё — там же, где он разобран в шапке `tools/vold-noacl.c`.
 
 ## 8. Структура
 
 ```
-build.sh                        сборка .so и утилиты, упаковка zip
+build.sh                        сборка .so и утилит, упаковка zip
 src/sdcardfs_restore.cpp        модуль целиком (234 строки)
 src/hook_libc.cpp/.h            правка входов libc: режимы и ACL при создании
 src/func_size.cpp/.h            размеры целей патча из .dynsym на диске
 src/zygisk.hpp                  интерфейс Zygisk
 module/module.prop              метаданные
-module/customize.sh             установщик: ABI, выбор бинарника утилиты, права
-module/post-fs-data.sh          вызов storage.sh до старта Zygote
-module/service.sh               вызов storage.sh после vold + поздние проходы ACL
+module/customize.sh             установщик: ABI, выбор бинарников, права
+module/post-fs-data.sh          storage.sh до старта Zygote + патч vold
+module/service.sh               storage.sh после vold + повтор патча vold
+                                (+ поздние проходы ACL, только если патч не встал)
 module/storage.sh               ярлык /data/media, маунты /mnt/runtime, ACL
 module/zygisk/*.so              собранный модуль
 module/tools/storage-fix-<abi>  собранная утилита ACL
+module/tools/vold-noacl-<abi>   собранная утилита снятия default-ACL с vold
 tools/storage-fix.c             исходник утилиты ACL (241 строка)
+tools/vold-noacl.c              исходник утилиты для vold (495 строк)
 tools/aclprobe.c                стенд для опытов с ACL и namespace
+tools/acl-dump.c                печать POSIX ACL (диагностика, в архив не идёт)
+tools/find-acl-writer.py        поиск кода, пишущего default-ACL, в бинарнике vold
+tools/bitness.sh                перепись: сколько процессов приложений 32-битные
+tools/groups.sh                 перепись групп реальных процессов приложений
 tools/device-test-fallback.sh   регрессия обоих путей на устройстве
 tools/verify-hook-targets.py    предварительная проверка целей хука на хосте
 tools/hookselftest.cpp          самопроверка хука на устройстве (28 проверок)
@@ -478,6 +561,19 @@ device/libc/                    копии libc, снятые с устройс�
 
 ## 9. История версий
 
+* **v2.9.0** — гонка с vold за `default`-ACL у `/data/media/0` устранена, а не
+  замаскирована повторами. Новая утилита `tools/vold-noacl` заменяет в памяти
+  `vold` одну инструкцию в `vold::SetDefaultAcl()`: функция сразу возвращает `OK`
+  и не пишет default-ACL вообще — ровно так, как она ведёт себя на устройствах с
+  sdcardfs. Так закрываются сразу все три её вызова (`/data/media/<user>`,
+  `Android/data/<pkg>`, `Android/obb`). Пишется через `/proc/<pid>/mem`, без
+  `PTRACE_ATTACH`, — процесс не останавливается, заморозить vold нечем; перед
+  записью утилита сверяет найденное место с ожидаемым и при чужой сборке `vold`
+  молча отказывается (код 2). Патч ставится в `post-fs-data.sh` (vold готовит
+  CE-хранилище пользователя только позже) и повторно в `service.sh`. Три
+  таймерных прохода ACL стали запасным путём и выполняются только если патч не
+  встал. Проверено A/B на одном пути загрузки при отключённых повторах: без
+  патча `default`-ACL = `GROUP(1023)`, с патчем = `GROUP(9997)`.
 * **v2.8.0** — закрыты две дыры в правах на альтернативном пути, обе найдены на
   устройстве:
   * `storage-fix` больше не переносит в ACL бит «остальных» с диска: он
