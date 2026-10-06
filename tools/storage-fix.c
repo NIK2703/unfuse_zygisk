@@ -111,17 +111,35 @@ static int acl_apply(const char *path, const char *name, mode_t mode) {
     return setxattr(path, name, buf, len, 0);
 }
 
-/* Каталог: владелец и «остальные» сохраняются, группе — rwx. */
-static mode_t dir_mode(mode_t m) { return (m & S_IRWXU) | S_IRWXG | (m & S_IRWXO); }
+/*
+ * Бит «остальных» (S_IRWXO) здесь СОЗНАТЕЛЬНО отбрасывается во всех трёх
+ * функциях — и это не мелочь, а условие совместимости с хуком.
+ *
+ * Доступ к общему хранилищу выдаёт именованная запись ACL для группы 9997, а
+ * не бит «остальных». Если оставить «остальных» как было на диске, то объекты,
+ * поправленные на загрузке, и объекты, созданные приложением (их режим считает
+ * as_sdcardfs_file/as_sdcardfs_dir в src/hook_libc.cpp, а ACL пишет acl_build с
+ * ACL_OTHER=0), выглядели бы по-разному. Хуже того, «остальные» получили бы
+ * доступ В ОБХОД записи для 9997 — то есть шире, чем было на Android 10, где
+ * sdcardfs пускал только процессы из группы 9997.
+ *
+ * Ровно поэтому же вызовы ниже передают в acl_apply уже обнулённые «остальные»,
+ * и `mode & S_IRWXO` внутри acl_apply даёт 0. Сама acl_apply остаётся точным
+ * повтором vold::SetDefaultAcl (vold-16/Utils.cpp:142) — vold всегда зовёт её с
+ * режимом 0770, где «остальные» и так нулевые.
+ */
 
-/* Файл: группе — rw, плюс x, если он уже был исполняемым. */
+/* Каталог: владелец сохраняется, группе — rwx. */
+static mode_t dir_mode(mode_t m) { return (m & S_IRWXU) | S_IRWXG; }
+
+/* Файл: владельцу — как было, группе — rw, плюс x, если он был исполняемым. */
 static mode_t file_mode(mode_t m) {
-    return (m & S_IRWXU) | ((m & S_IRWXG) | S_IRGRP | S_IWGRP) | (m & S_IRWXO);
+    return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP;
 }
 
 /* Корень тома: группе только r-x — его надо пройти, но не менять. */
 static mode_t traverse_mode(mode_t m) {
-    return (m & S_IRWXU) | ((m & S_IRWXG) | S_IRGRP | S_IXGRP) | (m & S_IRWXO);
+    return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IXGRP;
 }
 
 static void fix_dir(const char *path, mode_t m, int traverse_only) {
