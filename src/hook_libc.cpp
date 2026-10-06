@@ -13,14 +13,14 @@
  * loaded/later-dlopen'd/dlsym'd calls and needs no trampoline (handlers syscall
  * directly); handlers must be reentrant (syscalls only). arm64 only.
  *
- * The patch is 20 bytes and opens with bti c, so a patched entry stays a legal
+ * The patch is 20 bytes and opens with bti jc, so a patched entry stays a legal
  * branch target on a bionic built with -mbranch-protection (17 already is), and
  * hooks_install() refuses the release when libc declares BTI but the module was
- * built without it. See patch_entry for why bti c and x17 specifically.
+ * built without it. See patch_entry for why bti jc and x17 specifically.
  *
  * The target list below is version-independent — the same names resolve on every
- * release, and what comes out of it is 10 roots on 13 and 9 on 14/15/16/17, 12
- * and 11 targets once open64/open and openat64/openat are counted as the aliases
+ * release, and what comes out of it is 10 roots on 12/12L/13 and 9 on 14/15/16/17,
+ * 12 and 11 targets once open64/open and openat64/openat are counted as the aliases
  * they are — but the COUNT is not something to assume: android_ver.h names the
  * releases this was validated on and what each covers, and hooks_release()
  * reports a release that comes out otherwise.
@@ -585,12 +585,12 @@ void *tail_call_target(const void *, unsigned) { return nullptr; }
 //
 // bionic 17 is built with -mbranch-protection=standard, so its entries carry
 // bti c / paciasp, and a loader sets PROT_BTI on an image the moment it declares
-// GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image declares it — 13, 14, 15,
-// 16 and 17, 64- and 32-bit, vold, libdl, all have no .note.gnu.property at all —
-// which is why those instructions are inert hints today. But the direction is
-// plain (bti c in libc: 68 on 13, 69 on 14, 76 on 15, 64 on 16, 799 on 17;
-// paciasp 47, 48, 48, 47, 1443), so the flip is a matter of time, and the
-// consequences land on the patch: offset 0 of a patched root becomes a guarded
+// GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image declares it — 12, 12L, 13,
+// 14, 15, 16 and 17, 64- and 32-bit, vold, libdl, all have no .note.gnu.property at
+// all — which is why those instructions are inert hints today. But the direction is
+// plain (bti c in libc: 46 on 12/12L, 68 on 13, 69 on 14, 76 on 15, 64 on 16, 799 on
+// 17; paciasp 44, 44, 47, 48, 48, 47, 1443), so the flip is a matter of time, and
+// the consequences land on the patch: offset 0 of a patched root becomes a guarded
 // entry. That is what the bti jc in the patch is for, and this is where the
 // assumption is written down and reported.
 //
