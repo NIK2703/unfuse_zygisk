@@ -123,6 +123,33 @@
  * процесса, поэтому после каждой перезагрузки его надо ставить заново — и на
  * свежем vold трамплин снова цел, так что первый запуск всегда идёт по п. 3.
  *
+ * ===================================== на чём держится патч и когда он откажет
+ *
+ * Патч — не универсальная затычка, а утверждение о конкретном бинарнике. Две
+ * посылки проверяются явно, и при невыполнении ЛЮБОЙ из них утилита отказывается
+ * (код 2) и НИЧЕГО не пишет. Отказ здесь лучше ложного успеха: молча
+ * «поставивший» патч оставил бы гонку, а журнал говорил бы, что её нет.
+ *
+ *  1. setxattr вызывается в vold РОВНО ОДИН раз (--dry-run печатает
+ *     «вызовов N»). Так в vold-16: единственный вызов — из
+ *     vold::SetDefaultAcl (Utils.cpp:195), getxattr не вызывается вовсе.
+ *     Если вызовов 0 — мы бы отчитались об успехе, ничего не изменив. Если
+ *     больше одного — обезвредили бы заодно чужой код. Оба случая — отказ.
+ *
+ *  2. Трамплины .plt идут шагом ровно 16 байт и имеют вид
+ *     adrp x16 / ldr x17,[x16,#imm] / add x16,x16,#imm / br x17.
+ *     Это раскладка lld без BTI/PAC. При сборке с -mbranch-protection=bti
+ *     записи становятся 32-байтовыми, и постоянная C перестаёт быть
+ *     постоянной — проверка ловит это на второй же паре («раскладка .plt
+ *     нелинейна») и отказывается. Проверено на своём бинарнике: без BTI
+ *     разбирается, с BTI — отказ с кодом 2.
+ *
+ * Проверить конкретный vold, не трогая устройство:
+ *
+ *     adb pull /system/bin/vold /tmp/vold
+ *     vold-noacl --file /tmp/vold --selftest   # раскладка: 473 из 473 без пропусков
+ *     vold-noacl --file /tmp/vold --check      # 0 — патч есть, 1 — нет, 2 — отказ
+ *
  * ============================================================== как позвать
  *
  *     vold-noacl [--wait СЕК] [--pid PID] [--check] [--dry-run]
@@ -144,6 +171,23 @@
  *     1  vold не найден / не запущен, либо --check увидел целый трамплин
  *     2  не удалось разобрать ELF, найти символ или трамплин
  *     3  не удалось записать
+ *
+ * ==================================================== где запускать и где нет
+ *
+ * Запись идёт через /proc/<pid>/mem, а он требует PTRACE_MODE_ATTACH к vold.
+ * Отсюда требование к окружению, которое легко нарушить незаметно:
+ *
+ *     su -c 'vold-noacl'              работает: домен u:r:ksu:s0
+ *     su -c 'a; vold-noacl'           НЕ работает: домен u:r:shell:s0
+ *     su -c 'sh -c "vold-noacl"'      работает: домен u:r:ksu:s0
+ *
+ * KernelSU, увидев в -c составную команду, выполняет её через шелл, а шелл
+ * оказывается в домене shell, которому ptrace к vold не разрешён. Отличить
+ * это от «нет базы загрузки» помогает сообщение: при отказе по домену
+ * печатается «/proc/<pid>/maps не читается — скорее всего нет
+ * PTRACE_MODE_READ». Поэтому вызывать утилиту надо ОДНОЙ простой командой;
+ * редирект (`>>журнал 2>&1`) домен не меняет, он делается тем же шеллом.
+ * Именно так её и зовут post-fs-data.sh и service.sh.
  *
  * Сборка: cc -std=c11 -Oz -o vold-noacl vold-noacl.c
  *         (на хосте проверялось clang -std=c11 -O2 -Wall -Wextra)
@@ -602,8 +646,21 @@ static int collect_stubs(Src *s, Stubs *st) {
 /* ------------------------------------------------------------ база загрузки */
 
 /* Первая запись /proc/<pid>/maps с offset=0 — это отображение шапки ELF, её
- * начало и есть база загрузки PIE. */
-static int find_load_base(pid_t pid, uint64_t *base, char *exe, size_t exelen) {
+ * начало и есть база загрузки PIE.
+ *
+ * Ищется отображение ИМЕННО того файла, который нам нужен (want_exe), а не
+ * просто минимальный адрес среди всех: рядом лежат линкер, libc и прочее, и
+ * любое из них может оказаться ниже. Раньше брался минимум — на проверенном
+ * устройстве он случайно совпадал с vold, но это везение, а не свойство:
+ * промах дал бы чужую базу, и дальше утилита читала бы не тот код. Минимум
+ * оставлен запасным вариантом, когда want_exe неизвестен (--pid без опознания).
+ *
+ * Возврат: 0 — база найдена; -1 — maps не читается; -2 — читается, но
+ * подходящих записей нет. Разные коды нужны, чтобы в журнале было видно, что
+ * именно случилось: это разные поломки с разным лечением.
+ */
+static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
+                          char *exe_out, size_t exelen) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/maps", pid);
 
@@ -611,8 +668,9 @@ static int find_load_base(pid_t pid, uint64_t *base, char *exe, size_t exelen) {
     if (!f) return -1;
 
     char line[4096];
-    uint64_t best = 0;
-    bool got_exe = false;
+    uint64_t exact = 0, best = 0;
+    char best_path[4096] = {0};
+
     while (fgets(line, sizeof(line), f)) {
         unsigned long long start = 0, end = 0, off = 0;
         char perms[8] = {0};
@@ -623,16 +681,33 @@ static int find_load_base(pid_t pid, uint64_t *base, char *exe, size_t exelen) {
         if (nl) *nl = '\0';
         char *sp = strstr(line, " /");
         if (!sp) continue;            /* анонимное отображение не подходит */
-        if (best == 0 || start < best) best = start;
-        if (exe && !got_exe) {
-            snprintf(exe, exelen, "%s", sp + 1);
-            got_exe = true;
+        char *mp = sp + 1;
+        /* У заменённого на диске файла ядро дописывает " (deleted)" — при
+         * сравнении с /proc/<pid>/exe этот хвост надо отбросить. */
+        char *del = strstr(mp, " (deleted)");
+        if (del) *del = '\0';
+
+        if (want_exe && want_exe[0] && strcmp(mp, want_exe) == 0) {
+            if (exact == 0 || start < exact) exact = start;
+        }
+        if (best == 0 || start < best) {
+            best = start;
+            snprintf(best_path, sizeof(best_path), "%s", mp);
         }
     }
     fclose(f);
-    if (best == 0) return -1;
-    *base = best;
-    return 0;
+
+    if (exact != 0) {
+        if (exe_out) snprintf(exe_out, exelen, "%s", want_exe);
+        *base = exact;
+        return 0;
+    }
+    if (best != 0) {
+        if (exe_out) snprintf(exe_out, exelen, "%s", best_path);
+        *base = best;
+        return 0;
+    }
+    return -2;
 }
 
 /* ------------------------------------------------------------- поиск vold */
@@ -927,7 +1002,30 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
         }
     }
 
-    if (want_call_sites) r->call_sites = count_call_sites(s, r->stub_va);
+    if (want_call_sites) {
+        r->call_sites = count_call_sites(s, r->stub_va);
+
+        /* Здесь проверяется ПРЕДПОСЫЛКА всего патча, а не раскладка.
+         *
+         * Патч имеет смысл ровно потому, что в vold setxattr вызывается один
+         * раз — из vold::SetDefaultAcl. Если это не так, обезвреживать символ
+         * нельзя:
+         *   - при 0 вызовов мы отчитались бы «патч поставлен», ничего не
+         *     изменив: гонка осталась бы, а журнал говорил бы, что её нет;
+         *   - при нескольких вызовах мы сломали бы заодно чужой код, который
+         *     к default-ACL отношения не имеет.
+         * Оба случая — отказ, а не «поставлю и посмотрю».
+         *
+         * На уже пропатченном vold проверка работает: `bl` в .text патч не
+         * трогает, у трамплина пропадает только `ldr`. */
+        if (r->call_sites != 1) {
+            warn("%s: \"%s\" вызывается %d раз(а), а ожидался ровно один — "
+                 "отказываюсь (патч рассчитан на единственный вызов из "
+                 "SetDefaultAcl)", s->label, TARGET_SYM, r->call_sites);
+            stubs_free(&st);
+            return EXIT_NO_RESOLVE;
+        }
+    }
     stubs_free(&st);
     return EXIT_OK;
 }
@@ -1141,8 +1239,17 @@ int main(int argc, char **argv) {
     }
 
     uint64_t base = 0;
-    if (find_load_base(pid, &base, exe, sizeof(exe)) != 0) {
-        warn("pid %d: не удалось определить базу загрузки", (int)pid);
+    /* exe уже заполнен опознанием (или пуст при --pid) — он же служит и
+     * фильтром, и местом для записи найденного пути. */
+    int lb = find_load_base(pid, exe, &base, exe, sizeof(exe));
+    if (lb == -1) {
+        warn("pid %d: /proc/%d/maps не читается — скорее всего нет "
+             "PTRACE_MODE_READ к этому процессу", (int)pid, (int)pid);
+        return EXIT_NO_RESOLVE;
+    }
+    if (lb != 0) {
+        warn("pid %d: в /proc/%d/maps нет ни одного отображения с offset=0 и "
+             "путём — базу загрузки определить нечем", (int)pid, (int)pid);
         return EXIT_NO_RESOLVE;
     }
 
