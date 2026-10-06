@@ -9,13 +9,7 @@
 #   A. самопроверка хука libc — 28 проверок;
 #   B. сквозная проверка из namespace живого приложения (плюс самопроверка);
 #   C. обнуление «остальных» в ACL у storage-fix;
-#   D. поздние проходы ACL по журналу загрузки и итоговый default-ACL
-#      /data/media/0.
-#
-# Намеренно НЕ ждёт поздних проходов: они идут через 15, 45 и 120 секунд после
-# sys.boot_completed, и ожидание в лоб превратило бы проверку в двухминутное
-# молчание. Вместо этого проходы читаются из журнала — то есть проверяется то,
-# что реально произошло при загрузке, а не синтетический прогон.
+#   D. сторож ACL: жив ли процесс, что он вернул и на чём сошёлся инвариант.
 #
 # Требует, чтобы на устройстве уже лежали hookselftest и device-e2e.sh:
 #   adb push out/hookselftest-arm64 /data/local/tmp/hookselftest
@@ -42,11 +36,17 @@ echo "=== C. Обнуление «остальных» в ACL (storage-fix) ==="
 sh /data/local/tmp/test-storage-fix.sh 2>&1 | grep -E '^/data.*OTHER|открывает' | head -6
 
 echo
-echo "=== D. Поздние проходы ACL по журналу ==="
-echo "последние проходы:"
-grep 'повтор ACL' "$LOG" | tail -3 | sed 's/^/  /'
-N=$(grep -c 'повтор ACL' "$LOG")
-echo "всего проходов в журнале: $N"
+echo "=== D. Сторож ACL ==="
+if pgrep -f 'storage-fix --guard' >/dev/null 2>&1; then
+    echo "процесс сторожа: есть"
+else
+    echo "процесс сторожа: НЕТ (на основном пути его и не должно быть — см. README §3.3)"
+fi
+echo "что он вернул:"
+grep сторож "$LOG" | tail -4 | sed 's/^/  /'
 echo
-echo "default-ACL /data/media/0 (ожидается GROUP(9997)):"
+echo "инвариант /data/media/0 (ожидается ОК):"
+"$M/tools/storage-fix" --check /data/media/0 | sed 's/^/  /'
+echo
+echo "default-ACL /data/media/0:"
 "$T" acl /data/media/0 | grep -E 'data/media/0|default' | sed 's/^/  /'
