@@ -3,9 +3,12 @@
  * behaviour: direct access to all storage for ALL apps, no FUSE, no
  * MediaProvider in the data path.
  *
- * (1) Places a storage source under /mnt/user/<user>/emulated in the process's
- * private mount namespace; Zygote then recursively binds it onto /storage, so
- * /storage/emulated is substituted too. (2) Clears *args->mount_storage_dirs so
+ * (1) Places a storage source under the point Zygote is about to bind onto
+ * /storage, in the process's private mount namespace, so /storage/emulated is
+ * substituted too. Which point that is depends on the release: 14 and up always
+ * bind /mnt/user/<user>, while 11, 12, 12L and 13 have a second arm that binds
+ * /mnt/runtime/<view> whenever persist.sys.fuse is not true. Both are covered —
+ * see zygote_uses_runtime_view(). (2) Clears *args->mount_storage_dirs so
  * Zygote does not cover Android/{data,obb} with a per-package tmpfs, giving full
  * Android/data and Android/obb as before scoped storage.
  *
@@ -19,7 +22,9 @@
  * DEFAULT and ANDROID_WRITABLE (SAF provider com.android.externalstorage behind
  * the system "Files" app) are handled; NONE, INSTALLER and PASS_THROUGH are
  * skipped as raw /data/media consumers. No app list: every Zygote-started
- * process is covered.
+ * process is covered. ANDROID_WRITABLE is the one mode number that is not the
+ * same on every release — 8 on 11, 4 from 12 on — so both are accepted; see
+ * is_android_writable().
  *
  * The libc entry patch (hook_libc.cpp) runs after specialisation, only on the
  * RAW source (on sdcardfs it is useless/harmful: the fs synthesises mode/group
@@ -40,8 +45,10 @@
 #include <jni.h>
 #include <sched.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <string>
@@ -76,9 +83,27 @@ bool claim_once(const char *path) {
     return true;
 }
 
-// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*
+// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is
+// IVold.REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it.
+//
+// DEFAULT is 1 on every release. ANDROID_WRITABLE is NOT: 11 still carries the
+// long enum (READ, WRITE, LEGACY, FULL) and numbers it 8, while 12 dropped
+// those and renumbered it to 4. Both are accepted here instead of branching on
+// the release, because the two values cannot collide. 4 is LEGACY on 11, and
+// 11's StorageManagerService never hands LEGACY out — only NONE, DEFAULT, READ,
+// WRITE, INSTALLER, FULL and ANDROID_WRITABLE leave getMountMode(), and the two
+// ExternalStorageMountPolicy implementations return nothing outside NONE,
+// DEFAULT, READ and WRITE. 8 is past the end of the 12+ enum, so it cannot
+// occur there. A release that renumbers again shows up as an android_writable
+// process the module declines, which the log names rather than hides.
 constexpr int kMountModeExternalDefault = 1;
-constexpr int kMountModeExternalAndroidWritable = 4;
+constexpr int kMountModeExternalAndroidWritable = 4;      // 12 and up
+constexpr int kMountModeExternalAndroidWritableR = 8;     // 11 only
+
+bool is_android_writable(int mode) {
+    return mode == kMountModeExternalAndroidWritable ||
+           mode == kMountModeExternalAndroidWritableR;
+}
 
 // AID_USER_OFFSET from android_filesystem_config.h
 constexpr unsigned kAidUserOffset = 100000;
@@ -86,6 +111,46 @@ constexpr unsigned kAidUserOffset = 100000;
 // SDCARDFS_SUPER_MAGIC, FUSE_SUPER_MAGIC (include/uapi/linux/magic.h)
 constexpr unsigned long kSdcardFsMagic = 0x5dca2df5UL;
 constexpr unsigned long kFuseMagic = 0x65735546UL;
+
+// android::base::GetBoolProperty: the same set of spellings it accepts, and the
+// caller's fallback when the property is unset or unreadable.
+bool prop_bool(const char *name, bool fallback) {
+    char v[PROP_VALUE_MAX];
+    if (__system_property_get(name, v) <= 0) return fallback;
+    static const char *const kTrue[] = {"1", "y", "yes", "on", "true", "t"};
+    static const char *const kFalse[] = {"0", "n", "no", "off", "false", "f"};
+    for (const char *s : kTrue) {
+        if (strcasecmp(v, s) == 0) return true;
+    }
+    for (const char *s : kFalse) {
+        if (strcasecmp(v, s) == 0) return false;
+    }
+    return fallback;
+}
+
+// Zygote's MountEmulatedStorage() has two arms, and the module has to place the
+// source where the arm that will actually run is going to look.
+//
+// 11 (and 12/12L/13) keeps the pre-FUSE shape: when persist.sys.fuse is not
+// true, Zygote binds ExternalStorageViews[mount_mode] — /mnt/runtime/<view> —
+// onto /storage, and /mnt/user/<user> only onto /storage/self. The
+// substitution at /mnt/user/<user>/emulated is then off the path entirely.
+// 14 dropped that arm: /mnt/user/<user> is bound onto /storage unconditionally,
+// so the runtime view never matters there.
+//
+// Rather than guess the ROM, mirror Zygote's own test — the same property, the
+// same default it reads (false; vold reads the same name with a default of
+// true, which is why the two can disagree on a device that sets neither).
+bool zygote_uses_runtime_view() { return !prop_bool("persist.sys.fuse", false); }
+
+// ExternalStorageViews[] in that arm, restricted to the two modes the module
+// handles. ANDROID_WRITABLE maps to /mnt/runtime/full, which is the sdcardfs
+// source itself, so the caller skips it when the source already is sdcardfs.
+const char *runtime_view_for_mode(int mode) {
+    if (mode == kMountModeExternalDefault) return "default";
+    if (is_android_writable(mode)) return "full";
+    return nullptr;
+}
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -145,7 +210,7 @@ class UnfuseZygisk : public zygisk::ModuleBase {
 public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const int mode = args->mount_external;
-        const bool android_writable = (mode == kMountModeExternalAndroidWritable);
+        const bool android_writable = is_android_writable(mode);
         if (mode != kMountModeExternalDefault && !android_writable) return;
 
         // Private namespace copy: otherwise the mount leaks into zygote and all
@@ -176,6 +241,31 @@ public:
                 used = writable;
             }
         }
+
+        // The other arm of Zygote's MountEmulatedStorage(): when it is going to
+        // bind /mnt/runtime/<view> onto /storage instead of /mnt/user/<user>,
+        // the substitution above is off the path. Put the source there as well.
+        // Both binds are kept: /storage/self comes from /mnt/user/<user> even on
+        // that arm, so dropping the first would lose it.
+        std::string runtime_dst;
+        if (zygote_uses_runtime_view()) {
+            const char *view = runtime_view_for_mode(mode);
+            if (view != nullptr) {
+                const std::string dst =
+                    std::string("/mnt/runtime/") + view + "/emulated";
+                // ANDROID_WRITABLE's view is /mnt/runtime/full, which IS the
+                // sdcardfs source: binding it onto itself adds nothing, while
+                // the raw fallback still has to be substituted there.
+                if (dst != kSourceSdcardfs) {
+                    Source rt = Source::Sdcardfs;
+                    if (attach(dst, &rt)) {
+                        ok = true;
+                        used = rt;
+                        runtime_dst = dst;
+                    }
+                }
+            }
+        }
         if (!ok) return;
 
         if (args->mount_storage_dirs != nullptr) {
@@ -191,11 +281,18 @@ public:
         // over) it falls back to the module being mapped.
         log_once_ = claim_once(kOnceFlag);
         if (log_once_) {
-            LOGI("%s подключён: uid=%d%s",
+            // The arm is named only when the runtime view is the one in play, so
+            // the sample says which half of MountEmulatedStorage() this release
+            // actually ran — the one thing about the mount that is not the same
+            // on every release.
+            const std::string arm =
+                runtime_dst.empty() ? std::string() : (", вид " + runtime_dst);
+            LOGI("%s подключён: uid=%d%s%s",
                  used == Source::Sdcardfs ? "sdcardfs" : "сырой /data/media",
                  static_cast<int>(args->uid),
                  raw_ ? (hooks_allowed_ ? ", хуки включены" : ", хуки выключены файлом")
-                      : "");
+                      : "",
+                 arm.c_str());
         }
     }
 
