@@ -1,6 +1,6 @@
 id=sdcardfs_restore
 name=sdcardfs Restore
-version=v2.9.0
-versionCode=20900
+version=v3.0.0
+versionCode=30000
 author=marble
-description=Внутренняя память напрямую, без FUSE и без scoped storage — для всех приложений. Модуль делает три вещи: подкладывает источник памяти в приватный mount namespace каждого процесса, который запускает Zygote, отключает изоляцию Android/data и Android/obb, а на сыром /data/media дополнительно правит входы libc, чтобы режимы и ACL создаваемых файлов совпадали с тем, что отдавал sdcardfs. Источник выбирается на месте: sdcardfs с маской 0007 и gid 9997, а если ядро собрано без sdcardfs — сырое дерево /data/media с ACL на ту же группу 9997. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Требуется Zygisk/ZygiskNext.
+description=Внутренняя память напрямую, без FUSE и без scoped storage — для всех приложений. Модуль делает три вещи: подкладывает источник памяти в приватный mount namespace каждого процесса, который запускает Zygote, отключает изоляцию Android/data и Android/obb, а на сыром /data/media дополнительно правит входы libc, чтобы режимы и ACL создаваемых файлов совпадали с тем, что отдавал sdcardfs. Источник выбирается на месте: sdcardfs с маской 0007 и gid 9997, а если ядро собрано без sdcardfs — сырое дерево /data/media с ACL на ту же группу 9997 и сторожем, который возвращает запись 9997 всякий раз, когда vold переписывает default-ACL. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Требуется Zygisk/ZygiskNext.

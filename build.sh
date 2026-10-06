@@ -2,14 +2,12 @@
 #
 # build.sh — сборка Zygisk-модуля sdcardfs-restore.
 #
-# Собирает три вещи:
+# Собирает две вещи:
 #   module/zygisk/<abi>.so          — сам модуль (C++, NDK, clang++);
-#   module/tools/storage-fix-<abi>  — утилита, расставляющая ACL на сыром дереве
-#                                     (C; нужна альтернативному пути, когда в ядре
-#                                     нет sdcardfs);
-#   module/tools/vold-noacl-<abi>   — утилита, снимающая с vold запись
-#                                     default-ACL для группы 1023 (C; обоснование
-#                                     — в её исходнике).
+#   module/tools/storage-fix-<abi>  — утилита, которая расставляет ACL на сыром
+#                                     дереве и стережёт их (C; нужна
+#                                     альтернативному пути, когда в ядре нет
+#                                     sdcardfs).
 # Затем пакует module/ в out/sdcardfs_restore-<version>.zip.
 #
 # Использование:
@@ -27,7 +25,6 @@ SRC="$HERE/src/sdcardfs_restore.cpp"
 HOOK_SRC="$HERE/src/hook_libc.cpp"
 SIZE_SRC="$HERE/src/func_size.cpp"
 TOOLS_SRC="$HERE/tools/storage-fix.c"
-VOLD_SRC="$HERE/tools/vold-noacl.c"
 ZYG_DIR="$HERE/module/zygisk"
 TOOLS_DIR="$HERE/module/tools"
 OUT_DIR="$HERE/out"
@@ -105,16 +102,6 @@ tool_name_for() {
     esac
 }
 
-# То же для утилиты, снимающей с vold запись default-ACL (tools/vold-noacl.c).
-vold_name_for() {
-    case "$1" in
-        arm64-v8a)   echo "vold-noacl-arm64" ;;
-        armeabi-v7a) echo "vold-noacl-arm" ;;
-        x86_64)      echo "vold-noacl-x86_64" ;;
-        *)           return 1 ;;
-    esac
-}
-
 # --------------------------------------------------------------- main
 NDK_DIR="$(find_ndk)" || die "NDK не найден. Укажите путь: NDK=/path/to/ndk $0"
 TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
@@ -130,7 +117,6 @@ info "          $SIZE_SRC"
 [[ -f "$HOOK_SRC" ]] || die "нет исходника $HOOK_SRC"
 [[ -f "$SIZE_SRC" ]] || die "нет исходника $SIZE_SRC"
 [[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
-[[ -f "$VOLD_SRC" ]] || die "нет исходника $VOLD_SRC"
 mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 
 ABIS=("$@")
@@ -242,22 +228,6 @@ for abi in "${ABIS[@]}"; do
 
     ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
     built+=("$tout")
-
-    # ------------------------------------- утилита снятия default-ACL с vold
-    vtool="$(vold_name_for "$abi")" || die "нет имени утилиты для $abi"
-    vtout="$TOOLS_DIR/$vtool"
-    info "сборка $abi -> $(basename "$vtout")"
-
-    "$cc" "${CFLAGS[@]}" "$VOLD_SRC" -o "$vtout" \
-        -Wl,--gc-sections -Wl,--build-id=none
-
-    if [[ "$STRIP" == "1" ]]; then
-        strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$vtout"
-    fi
-
-    ok "$abi: $(basename "$vtout") — $(wc -c < "$vtout") байт"
-    built+=("$vtout")
 done
 
 # --------------------------------------------------------------- zip
