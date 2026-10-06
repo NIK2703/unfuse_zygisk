@@ -2,6 +2,13 @@
 #
 # build.sh — сборка Zygisk-модуля sdcardfs-restore.
 #
+# Собирает две вещи:
+#   module/zygisk/<abi>.so          — сам модуль (C++, NDK, clang++);
+#   module/tools/storage-fix-<abi>  — утилита, расставляющая ACL на сыром дереве
+#                                     (C, статическая; нужна альтернативному пути,
+#                                     когда в ядре нет sdcardfs).
+# Затем пакует module/ в out/sdcardfs_restore-<version>.zip.
+#
 # Использование:
 #   ./build.sh                  # arm64-v8a + armeabi-v7a, затем zip в out/
 #   ./build.sh arm64-v8a        # только один ABI
@@ -14,7 +21,9 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/src/sdcardfs_restore.cpp"
+TOOLS_SRC="$HERE/tools/storage-fix.c"
 ZYG_DIR="$HERE/module/zygisk"
+TOOLS_DIR="$HERE/module/tools"
 OUT_DIR="$HERE/out"
 
 API="${API:-26}"
@@ -75,6 +84,21 @@ triple_for() {
     esac
 }
 
+# abi -> имя бинарника утилиты в module/tools/.
+#
+# Утилита — нативный исполняемый файл, один на архитектуру (в отличие от
+# zygisk/*.so, которые Zygisk сам выбирает по ABI). Поэтому в архиве лежат все
+# варианты, а customize.sh на устройстве оставляет нужный и переименовывает его
+# в tools/storage-fix.
+tool_name_for() {
+    case "$1" in
+        arm64-v8a)   echo "storage-fix-arm64" ;;
+        armeabi-v7a) echo "storage-fix-arm" ;;
+        x86_64)      echo "storage-fix-x86_64" ;;
+        *)           return 1 ;;
+    esac
+}
+
 # --------------------------------------------------------------- main
 NDK_DIR="$(find_ndk)" || die "NDK не найден. Укажите путь: NDK=/path/to/ndk $0"
 TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
@@ -85,7 +109,8 @@ info "API:      $API"
 info "исходник: $SRC"
 
 [[ -f "$SRC" ]] || die "нет исходника $SRC"
-mkdir -p "$ZYG_DIR" "$OUT_DIR"
+[[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
+mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 
 ABIS=("$@")
 [[ ${#ABIS[@]} -eq 0 ]] && ABIS=("${DEFAULT_ABIS[@]}")
@@ -129,6 +154,20 @@ LDFLAGS=(
     -llog
 )
 
+# Утилита линкуется как обычный бинарник Android (динамически, через bionic):
+# она запускается из post-fs-data.sh/service.sh, когда /system уже смонтирован,
+# ровно как mount(1) и chcon(1) в тех же скриптах. Статическая сборка дала бы
+# 420 КБ вместо 10 КБ и утроила бы вес архива ради ничего.
+CFLAGS=(
+    -std=c11
+    -Oz
+    -ffunction-sections
+    -fdata-sections
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+)
+
 # --------------------------------------------------------------- сборка
 built=()
 for abi in "${ABIS[@]}"; do
@@ -162,6 +201,25 @@ for abi in "${ABIS[@]}"; do
     fi
 
     built+=("$out")
+
+    # --------------------------------------------- утилита альтернативного пути
+    cc="$TOOLCHAIN/bin/${prefix}${API}-clang"
+    [[ -x "$cc" ]] || die "нет компилятора $cc (проверьте API=$API)"
+
+    tool="$(tool_name_for "$abi")" || die "нет имени утилиты для $abi"
+    tout="$TOOLS_DIR/$tool"
+    info "сборка $abi -> $(basename "$tout")"
+
+    "$cc" "${CFLAGS[@]}" "$TOOLS_SRC" -o "$tout" \
+        -Wl,--gc-sections -Wl,--build-id=none
+
+    if [[ "$STRIP" == "1" ]]; then
+        strip_bin="$TOOLCHAIN/bin/llvm-strip"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$tout"
+    fi
+
+    ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
+    built+=("$tout")
 done
 
 # --------------------------------------------------------------- zip
@@ -173,7 +231,9 @@ if [[ "$ZIP" == "1" ]]; then
 
     # Все shell-скрипты модуля должны быть исполняемыми уже в архиве:
     # customize.sh вызывается установщиком, остальные — загрузчиком модулей.
+    # Бинарники утилиты — тоже.
     chmod 0755 "$HERE/module"/*.sh 2>/dev/null || true
+    chmod 0755 "$HERE/module"/tools/* 2>/dev/null || true
 
     info "упаковка $zipname"
 
@@ -196,10 +256,11 @@ with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
                 skipped.append(rel)
                 continue
             zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-            # Права берём из файловой системы, но .sh всегда исполняемые:
-            # иначе при установке модуль может не запустить свои скрипты.
+            # Права берём из файловой системы, но .sh и утилиты всегда
+            # исполняемые: иначе при установке модуль может не запустить свои
+            # скрипты или не найти бинарник storage-fix.
             mode = os.stat(full).st_mode & 0o7777
-            if rel.endswith('.sh'):
+            if rel.endswith('.sh') or rel.startswith('tools/'):
                 mode |= 0o111
             zi.external_attr = mode << 16
             zi.compress_type = zipfile.ZIP_DEFLATED

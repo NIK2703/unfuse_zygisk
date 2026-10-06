@@ -1,6 +1,6 @@
 id=sdcardfs_restore
 name=sdcardfs Restore
-version=v2.5.0
-versionCode=20500
+version=v2.6.0
+versionCode=20600
 author=marble
-description=Внутренняя память через sdcardfs вместо FUSE — для всех приложений, без scoped storage. Модуль делает две вещи: подкладывает sdcardfs в приватный mount namespace каждого процесса, который запускает Zygote, и отключает изоляцию Android/data и Android/obb. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Требуется ядро с CONFIG_SDCARD_FS и Zygisk/ZygiskNext.
+description=Внутренняя память напрямую, без FUSE и без scoped storage — для всех приложений. Модуль делает две вещи: подкладывает источник памяти в приватный mount namespace каждого процесса, который запускает Zygote, и отключает изоляцию Android/data и Android/obb. Источник выбирается на месте: sdcardfs с маской 0007 и gid 9997, а если ядро собрано без sdcardfs — сырое дерево /data/media с ACL на ту же группу 9997. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Требуется Zygisk/ZygiskNext.
