@@ -3,12 +3,12 @@
  * against, and what each of them expects.
  *
  * This is NOT a per-release byte fork. Both patchers read the target's own ELF
- * tables, so neither holds an offset to swap, and 15, 16 and 17 resolve to the
- * very same bytes: same 22 libc entry points, same 9 roots, same single setxattr
- * call in vold. What does differ per release is the EXPECTATION — how many
- * targets the module's list covers there, and which AOSP site writes the ACL that
- * vold-noacl disarms. The table records those, so a release that shifts the shape
- * shows up in the log instead of silently patching less than it claims.
+ * tables, so neither holds an offset to swap, and 14, 15, 16 and 17 resolve to
+ * the very same bytes: same 22 libc entry points, same 9 roots, same single
+ * setxattr call in vold. What does differ per release is the EXPECTATION — how
+ * many targets the module's list covers there, and which AOSP site writes the ACL
+ * that vold-noacl disarms. The table records those, so a release that shifts the
+ * shape shows up in the log instead of silently patching less than it claims.
  *
  * A release not in the table gets the newest profile (UNFUSE_VER_LATEST) — the
  * one most likely to still hold — and the run is marked as unvalidated, so
@@ -38,32 +38,40 @@ typedef struct {
     const char *vold_acl;   /* AOSP site that writes the ACL vold-noacl disarms */
 } UnfuseVer;
 
-/* Verified against a real image (device/ holds the reference binaries). Codenames
- * are spelled as the platform itself does — ro.build.version.known_codenames on
- * the 15/16/17 images ends "...VanillaIceCream,Baklava,CinnamonBun".
+/* Verified against a real image (device/ holds the reference binaries, one GSI per
+ * release). Codenames are spelled as the platform itself does —
+ * ro.build.version.known_codenames on these images ends "...UpsideDownCake,
+ * VanillaIceCream,Baklava,CinnamonBun".
  *
- *   libc: 15, 16 and 17 all yield the same 9 distinct roots
- *         (__open_2, __openat_2, fchmod, fchmodat, linkat, mkdirat, open, openat,
- *         renameat2), and open64/open and openat64/openat share those addresses,
- *         so 11 of the 22 listed targets come out covered. The offline verifier
- *         reports 9 because it counts distinct addresses; 11 was measured
- *         on-device (Android 16, hookselftest) and follows for 15 and 17 from a
- *         classification the verifier finds identical, target for target.
- *   vold:  setxattr is called exactly once and the stub resolves, on all three
- *         (15/16: Utils.cpp:195, 17: :196).
+ *   libc: all four yield the same 9 distinct roots (__open_2, __openat_2, fchmod,
+ *         fchmodat, linkat, mkdirat, open, openat, renameat2), and open64/open and
+ *         openat64/openat share those addresses, so 11 of the 22 listed targets
+ *         come out covered. The offline verifier reports 9 because it counts
+ *         distinct addresses; 11 was measured on-device (Android 16, hookselftest)
+ *         and follows for 14, 15 and 17 from a classification the verifier finds
+ *         identical, target for target.
+ *   vold:  setxattr is called exactly once and the stub resolves, on all four
+ *         (14/15: Utils.cpp:195, 16: :195, 17: :196), and each binary carries
+ *         exactly one R_AARCH64_JUMP_SLOT for it.
  *
- * The three are indistinguishable to the patch: all 22 targets classify the same
- * on 15, 16 and 17 — патчится=11, коротка=5, переходник=6 — and the same 9 roots
- * come out. The sizes differ (17 is built with -mbranch-protection=standard, so
- * its thunks carry a bti c prefix and its roots open with paciasp, and its leaf
- * syscall wrappers lost an instruction, 24 -> 20 bytes) but never across the patch
- * width: the tightest fit is mkdirat, renameat2 and linkat at 20 bytes on 17 and
- * 24 on 15/16, against a 20-byte patch. Had the patch stayed 16 bytes, the bti c
- * prefix alone would have moved creat, creat64, mkstemps and mkostemps from
- * "коротка" to "переходник" on 17 and made the three releases look different for
- * no reason. Below 20 bytes of room a target drops out of the count, and the tally
+ * The four are indistinguishable to the PATCH: the same 11 targets are patched and
+ * the same 9 roots come out on 14, 15, 16 and 17. What differs is the verifier's
+ * summary line — 14/15/16 read патчится=11, коротка=8, переходник=3, and 17 reads
+ * 11/5/6 — and that is the bti c prefix, not the patch. 17 alone is built with
+ * -mbranch-protection=standard, so its thunks are 4 bytes longer, and mkdir (16 ->
+ * 20), mkstemp and mkostemp (16 -> 20) cross the 20-byte gate and get reported as
+ * "переходник" rather than "коротка". creat/creat64 (12 -> 16) and mkstemps/
+ * mkostemps (12 -> 16) stay under the gate and keep their label; rename and link
+ * (28 -> 32) and chmod (24) were thunks above it already. Labels moved, coverage
+ * did not.
+ *
+ * The gate those labels are measured against is the patch width, so that is the
+ * number that matters: the tightest fit is mkdirat, renameat2 and linkat at 24
+ * bytes on 14/15/16 and exactly 20 on 17, against a 20-byte patch — no margin at
+ * all on 17. Below 20 bytes of room a target drops out of the count, and the tally
  * check in unfuse_zygisk.cpp says so rather than passing quietly. */
 static const UnfuseVer UNFUSE_VERSIONS[] = {
+    {34, 14, "UpsideDownCake",  11, "vold-14/Utils.cpp:195"},
     {35, 15, "VanillaIceCream", 11, "vold-15/Utils.cpp:195"},
     {36, 16, "Baklava",         11, "vold-16/Utils.cpp:195"},
     {37, 17, "CinnamonBun",     11, "vold-17/Utils.cpp:196"},

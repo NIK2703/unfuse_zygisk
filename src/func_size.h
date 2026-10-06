@@ -1,10 +1,13 @@
 /*
  * func_size.h — function sizes from the .dynsym of the object they live in.
  *
- * Needed so 16 bytes never overwrite the next function's start: only functions
- * >= patch size may be patched. On Android 16 libc-16 four hook targets are
- * shorter (creat/creat64 12, renameat 8, mkstemps 12, mkostemps 12); all are
- * thunks reaching the patched root via .plt, but only the sizes reveal it.
+ * Needed so the 20-byte patch never overwrites the next function's start: only
+ * functions >= patch size may be patched. On Android 16 libc eight hook targets
+ * are shorter than that (creat/creat64 12, mkdir 16, renameat 8, mkstemp/mkostemp
+ * 16, mkstemps/mkostemps 12) — four thunks that jump to the patched root through
+ * .plt, and the four mktemp wrappers, which reach open indirectly through
+ * mktemp_internal. Only the sizes reveal any of it, so they are read here rather
+ * than assumed.
  *
  * Check: tools/verify-hook-targets.py device/libc/libc-arm64.so
  */

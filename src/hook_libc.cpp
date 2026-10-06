@@ -18,7 +18,7 @@
  * hooks_install() refuses the release when libc declares BTI but the module was
  * built without it. See patch_entry for why bti c and x17 specifically.
  *
- * The target list below is version-independent — on 15, 16 and 17 the same 9
+ * The target list below is version-independent — on 14, 15, 16 and 17 the same 9
  * roots come out of it, 11 targets once open64/open and openat64/openat are
  * counted as the aliases they are — but the COUNT is not something to assume:
  * android_ver.h names the releases this was validated on and what each covers,
@@ -436,7 +436,7 @@ extern "C" int h_mkostemps(char *tmpl, int suffixlen, int flags) {
 
 #if defined(__aarch64__)
 
-// 20 bytes: bti c; ldr x17,#8; br x17; .quad <handler>. The literal is
+// 20 bytes: bti jc; ldr x17,#8; br x17; .quad <handler>. The literal is
 // PC-relative (the load at offset 4 reads offset 12) and the branch is
 // register-indirect, so the patch needs no range or instruction relocation — but
 // it does need 20 bytes of room, hence the size gate in hooks_install.
@@ -444,9 +444,9 @@ extern "C" int h_mkostemps(char *tmpl, int suffixlen, int flags) {
 // bti jc is not decoration. bionic 17 is built with -mbranch-protection=standard
 // (roots open with paciasp, thunks with bti c), and a loader sets PROT_BTI as
 // soon as an image declares GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image
-// declares it today, so these are inert hints on 15/16/17 — but if one ever does,
-// offset 0 becomes a guarded entry and an indirect call to a patched root must
-// land on a landing pad. The pad has to come first: a patch starting with the
+// declares it today, so these are inert hints on 14/15/16/17 — but if one ever
+// does, offset 0 becomes a guarded entry and an indirect call to a patched root
+// must land on a landing pad. The pad has to come first: a patch starting with the
 // load would fault before ever reaching the handler.
 //
 // jc rather than c: the pad has to accept both branch types the entry can see. A
@@ -584,13 +584,14 @@ void *tail_call_target(const void *, unsigned) { return nullptr; }
 //
 // bionic 17 is built with -mbranch-protection=standard, so its entries carry
 // bti c / paciasp, and a loader sets PROT_BTI on an image the moment it declares
-// GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image declares it — 15, 16 and
-// 17, 64- and 32-bit, vold, libdl, all have no .note.gnu.property at all — which
-// is why those instructions are inert hints today. But the direction is plain
-// (bti c in libc: 64 on 16, 799 on 17), so the flip is a matter of time, and the
-// consequences land on the patch: offset 0 of a patched root becomes a guarded
-// entry. That is what the bti jc in the patch is for, and this is where the
-// assumption is written down and reported.
+// GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image declares it — 14, 15, 16
+// and 17, 64- and 32-bit, vold, libdl, all have no .note.gnu.property at all —
+// which is why those instructions are inert hints today. But the direction is
+// plain (bti c in libc: 69 on 14, 76 on 15, 64 on 16, 799 on 17; paciasp 48, 48,
+// 47, 1443), so the flip is a matter of time, and the consequences land on the
+// patch: offset 0 of a patched root becomes a guarded entry. That is what the
+// bti jc in the patch is for, and this is where the assumption is written down
+// and reported.
 //
 // Nothing here refuses to patch. The patch opens with a pad, so a guarded libc
 // entry stays a legal target; the handler it branches to lives in our module,
@@ -761,7 +762,7 @@ int hooks_install(int *total) {
     void *fns[kHookCount];
     for (int i = 0; i < kHookCount; i++) fns[i] = dlsym(RTLD_DEFAULT, kHooks[i].name);
 
-    // Step 2: sizes — 16 bytes into an 8/12-byte function clobbers the next.
+    // Step 2: sizes — 20 bytes into an 8/12-byte function clobbers the next.
     unsigned sizes[kHookCount];
     func_sizes(fns, kHookCount, sizes);
 
