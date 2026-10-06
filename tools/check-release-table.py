@@ -35,6 +35,7 @@ ROOT = os.path.dirname(HERE)
 
 # Один образ на строку. 16 назван без суффикса: он и есть базовая версия.
 SDK_IMAGE = {
+    30: "device/libc/libc-arm64-a11.so",
     31: "device/libc/libc-arm64-a12.so",
     32: "device/libc/libc-arm64-a12l.so",
     33: "device/libc/libc-arm64-a13.so",

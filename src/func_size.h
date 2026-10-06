@@ -7,8 +7,8 @@
  * 16, mkstemps/mkostemps 12) — four thunks that jump to the patched root through
  * .plt, and the four mktemp wrappers, which reach open indirectly through
  * mktemp_internal. Only the sizes reveal any of it, so they are read here rather
- * than assumed. The set is not fixed across releases: mkdir is 16 on 13-16 but 20
- * on 12/12L and on 17, which moves it from "too short" to "thunk" without changing
+ * than assumed. The set is not fixed across releases: mkdir is 16 on 13-16 but 20 on
+ * 11/12/12L and on 17, which moves it from "too short" to "thunk" without changing
  * that it is skipped. android_ver.h records what each release settles at.
  *
  * Check: tools/verify-hook-targets.py device/libc/libc-arm64.so

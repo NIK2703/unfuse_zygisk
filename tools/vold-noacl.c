@@ -4,12 +4,16 @@
  *
  * ============================== why
  *
- * Preparing a user's CE storage, vold calls SetDefaultAcl(...) (FsCrypt.cpp:1027)
- * and sets a default ACL on /data/media/<user> naming group 1023 (media_rw). The
+ * Preparing a user's CE storage, vold calls SetDefaultAcl(...) (FsCrypt.cpp:1027 on
+ * 16) and sets a default ACL on /data/media/<user> naming group 1023 (media_rw). The
  * module grants shared-storage access via a named entry for 9997 (AID_EVERYBODY);
  * new dirs inherit whatever wrote the default ACL last, and vold writes later (CE
  * prep, after post-fs-data), so dirs created by anything but the app inherit 1023
- * and apps cannot see them. The other two call sites (Utils.cpp:406, :1889) hurt too.
+ * and apps cannot see them. The other two call sites (Utils.cpp:406, :1889 on 16)
+ * hurt too — and on 11 those are the ONLY ones: there is no FsCrypt.cpp caller at
+ * all there, because its CE prep goes through the local prepare_dir() ->
+ * fs_prepare_dir(), which sets mode and owner and no ACL. Fewer call sites, the same
+ * damage, and the patch covers it identically — see "why the ELF tables" below.
  *
  * AOSP already has a no-op branch (vold-16/Utils.cpp:142): `if (IsSdcardfsUsed())
  * return OK;`, gated by the property external_storage.sdcardfs.enabled (0 here in
@@ -53,9 +57,10 @@
  * ------------------------- which releases
  *
  * The resolver is version-independent by construction — it reads vold's own tables, so
- * nothing here changes between 16 and 17 — but the EXPECTATION is not something to
+ * nothing here changes between 11 and 17 — but the EXPECTATION is not something to
  * assume. android_ver.h names the releases this was validated on and the AOSP site that
- * writes the ACL the patch disarms (vold-16/Utils.cpp:195, vold-17/Utils.cpp:196); the
+ * writes the ACL the patch disarms (11/12/12L/13: vold-<n>/Utils.cpp:192,
+ * vold-14/15/16/17: :195/:195/:195/:196); the
  * release in force is printed with it, and one not in the table is marked as borrowing
  * the newest profile rather than being verified. --sdk overrides the detection, for
  * looking at an image that is not this device's. The refusal below is NOT version-
@@ -944,7 +949,7 @@ int main(int argc, char **argv) {
     /* The release in force: this system's, or --sdk for an image that is not this
      * device's. It decides what the run is compared against and how the log
      * reads — the resolution below reads the target's own tables either way,
-     * which is why 16 and 17 take the identical path. */
+     * which is why 11 through 17 take the identical path. */
     UnfusePick vp = unfuse_pick(sdk_opt > 0 ? (int)sdk_opt : unfuse_sdk());
     char vbuf[192];
     unfuse_ver_str(&vp, vbuf, sizeof(vbuf));

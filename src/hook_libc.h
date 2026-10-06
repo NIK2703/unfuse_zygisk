@@ -29,7 +29,7 @@ int hooks_release(char *buf, size_t len);
 // What the loaded images declare about branch protection, for the boot sample:
 // "libc: BTI+PAC; модуль: свойства GNU нет". Returns
 //    1  libc declares BTI — the patch's bti jc pad is what keeps that working;
-//    0  libc declares nothing, true for Android 12, 12L, 13, 14, 15, 16 and 17
+//    0  libc declares nothing, true for Android 11, 12, 12L, 13, 14, 15, 16 and 17
 //       today;
 //   -1  the module declares BTI without having been built for it, i.e. its pages
 //       are guarded while its handlers are not landing pads — the one state worth
