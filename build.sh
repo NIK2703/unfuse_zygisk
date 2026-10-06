@@ -2,12 +2,14 @@
 #
 # build.sh — сборка Zygisk-модуля sdcardfs-restore.
 #
-# Собирает две вещи:
-#   module/zygisk/<abi>.so          — сам модуль (C++, NDK, clang++);
-#   module/tools/storage-fix-<abi>  — утилита, которая расставляет ACL на сыром
-#                                     дереве и стережёт их (C; нужна
-#                                     альтернативному пути, когда в ядре нет
-#                                     sdcardfs).
+# Собирает три вещи:
+#   module/zygisk/<abi>.so            — сам модуль (C++, NDK, clang++);
+#   module/tools/storage-fix-<abi>    — утилита, которая расставляет ACL на сыром
+#                                       дереве (C; нужна альтернативному пути,
+#                                       когда в ядре нет sdcardfs);
+#   module/tools/vold-noacl-<abi>     — патчер vold: делает vold::SetDefaultAcl()
+#                                       пустышкой, чтобы vold не перебивал эти
+#                                       ACL своей записью для группы 1023 (C).
 # Затем пакует module/ в out/sdcardfs_restore-<version>.zip.
 #
 # Использование:
@@ -25,6 +27,7 @@ SRC="$HERE/src/sdcardfs_restore.cpp"
 HOOK_SRC="$HERE/src/hook_libc.cpp"
 SIZE_SRC="$HERE/src/func_size.cpp"
 TOOLS_SRC="$HERE/tools/storage-fix.c"
+NOACL_SRC="$HERE/tools/vold-noacl.c"
 ZYG_DIR="$HERE/module/zygisk"
 TOOLS_DIR="$HERE/module/tools"
 OUT_DIR="$HERE/out"
@@ -102,6 +105,18 @@ tool_name_for() {
     esac
 }
 
+# abi -> имя бинарника патчера vold в module/tools/. По той же причине, что и у
+# storage-fix: в архиве лежат все варианты, customize.sh оставляет нужный и
+# переименовывает его в tools/vold-noacl.
+noacl_name_for() {
+    case "$1" in
+        arm64-v8a)   echo "vold-noacl-arm64" ;;
+        armeabi-v7a) echo "vold-noacl-arm" ;;
+        x86_64)      echo "vold-noacl-x86_64" ;;
+        *)           return 1 ;;
+    esac
+}
+
 # --------------------------------------------------------------- main
 NDK_DIR="$(find_ndk)" || die "NDK не найден. Укажите путь: NDK=/path/to/ndk $0"
 TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
@@ -117,6 +132,7 @@ info "          $SIZE_SRC"
 [[ -f "$HOOK_SRC" ]] || die "нет исходника $HOOK_SRC"
 [[ -f "$SIZE_SRC" ]] || die "нет исходника $SIZE_SRC"
 [[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
+[[ -f "$NOACL_SRC" ]] || die "нет исходника $NOACL_SRC"
 mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 
 ABIS=("$@")
@@ -228,6 +244,27 @@ for abi in "${ABIS[@]}"; do
 
     ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
     built+=("$tout")
+
+    # ------------------------------------------------ патчер vold
+    #
+    # Патчер трогает только память процесса vold, поэтому ABI бинарника не
+    # обязан совпадать с ABI vold: он читает и пишет /proc/<pid>/mem, а ELF
+    # разбирает сам. Собираем под ту же архитектуру, что и storage-fix, — просто
+    # чтобы в архиве не было ничего лишнего.
+    ntool="$(noacl_name_for "$abi")" || die "нет имени патчера для $abi"
+    nout="$TOOLS_DIR/$ntool"
+    info "сборка $abi -> $(basename "$nout")"
+
+    "$cc" "${CFLAGS[@]}" "$NOACL_SRC" -o "$nout" \
+        -Wl,--gc-sections -Wl,--build-id=none
+
+    if [[ "$STRIP" == "1" ]]; then
+        strip_bin="$TOOLCHAIN/bin/llvm-strip"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$nout"
+    fi
+
+    ok "$abi: $(basename "$nout") — $(wc -c < "$nout") байт"
+    built+=("$nout")
 done
 
 # --------------------------------------------------------------- zip

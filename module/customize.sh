@@ -8,8 +8,8 @@
 SKIPUNZIP=0
 
 case "$ARCH" in
-    arm64) ABI=arm64-v8a;   FIX=storage-fix-arm64 ;;
-    arm)   ABI=armeabi-v7a; FIX=storage-fix-arm ;;
+    arm64) ABI=arm64-v8a;   FIX=storage-fix-arm64; NOACL=vold-noacl-arm64 ;;
+    arm)   ABI=armeabi-v7a; FIX=storage-fix-arm;   NOACL=vold-noacl-arm   ;;
     *)     abort "! Неподдерживаемая архитектура: $ARCH (нужны arm64-v8a или armeabi-v7a)" ;;
 esac
 
@@ -17,17 +17,24 @@ if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
     abort "! В модуле нет zygisk/$ABI.so — похоже, сборка не выполнялась (build.sh)"
 fi
 
-# В архиве лежат бинарники утилиты на все ABI: оставляем только свой и
-# переименовываем в tools/storage-fix — под этим именем её ищет storage.sh.
+# В архиве лежат бинарники обеих утилит на все ABI: оставляем только свои и
+# переименовываем — под этими именами их ищут storage.sh, post-fs-data.sh и
+# service.sh.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
     abort "! В модуле нет tools/$FIX — похоже, сборка не выполнялась (build.sh)"
 fi
-mv "$MODPATH/tools/$FIX" "$MODPATH/tools/storage-fix"
-rm -f "$MODPATH/tools/storage-fix-arm64" "$MODPATH/tools/storage-fix-arm"
+if [ ! -f "$MODPATH/tools/$NOACL" ]; then
+    abort "! В модуле нет tools/$NOACL — похоже, сборка не выполнялась (build.sh)"
+fi
+mv "$MODPATH/tools/$FIX"   "$MODPATH/tools/storage-fix"
+mv "$MODPATH/tools/$NOACL" "$MODPATH/tools/vold-noacl"
+rm -f "$MODPATH/tools/storage-fix-arm64" "$MODPATH/tools/storage-fix-arm" \
+      "$MODPATH/tools/vold-noacl-arm64"  "$MODPATH/tools/vold-noacl-arm"
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/zygisk/$ABI.so"     0 0 0644
 set_perm "$MODPATH/tools/storage-fix"  0 0 0755
+set_perm "$MODPATH/tools/vold-noacl"   0 0 0755
 set_perm "$MODPATH/customize.sh"       0 0 0755 2>/dev/null
 set_perm "$MODPATH/post-fs-data.sh"    0 0 0755 2>/dev/null
 set_perm "$MODPATH/service.sh"         0 0 0755 2>/dev/null
