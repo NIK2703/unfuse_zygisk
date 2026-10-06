@@ -1,6 +1,6 @@
 id=sdcardfs_restore
 name=sdcardfs Restore
-version=v2.4.0
-versionCode=20400
+version=v2.5.0
+versionCode=20500
 author=marble
-description=Возвращает внутренней памяти поведение Android 10 и более ранних версий: sdcardfs вместо FUSE и ПОЛНЫЙ доступ ко всей памяти для ВСЕХ приложений без исключений — включая корень /storage/emulated, Android/data, Android/obb и каталоги чужих пакетов, без scoped storage. Работает для каждого процесса: приватный mount namespace, sdcardfs под /mnt/user/<user>/emulated, отключение изоляции Android/{data,obb}, перемаркировка корня /data/media. Обрабатываются и DEFAULT, и ANDROID_WRITABLE — поэтому Android/data виден и в системном приложении «Файлы». Требуется ядро с CONFIG_SDCARD_FS и Zygisk/ZygiskNext.
+description=Внутренняя память через sdcardfs вместо FUSE — для всех приложений, без scoped storage. Модуль делает две вещи: подкладывает sdcardfs в приватный mount namespace каждого процесса, который запускает Zygote, и отключает изоляцию Android/data и Android/obb. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Требуется ядро с CONFIG_SDCARD_FS и Zygisk/ZygiskNext.
