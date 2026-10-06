@@ -2,7 +2,8 @@
 #
 # customize.sh — called by the Magisk/KernelSU installer while unpacking the
 # module: checks the build is present, keeps the tool binary for this
-# architecture and sets permissions.
+# architecture, sets permissions, carries the mode over from the previous
+# install, and prints the one line described at the bottom.
 #
 
 SKIPUNZIP=0
@@ -10,20 +11,20 @@ SKIPUNZIP=0
 case "$ARCH" in
     arm64) ABI=arm64-v8a;   FIX=storage-fix-arm64; NOACL=vold-noacl-arm64 ;;
     arm)   ABI=armeabi-v7a; FIX=storage-fix-arm;   NOACL=vold-noacl-arm   ;;
-    *)     abort "! Неподдерживаемая архитектура: $ARCH (нужны arm64-v8a или armeabi-v7a)" ;;
+    *)     abort "! Unsupported architecture: $ARCH (arm64-v8a or armeabi-v7a required)" ;;
 esac
 
 if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
-    abort "! В модуле нет zygisk/$ABI.so — похоже, сборка не выполнялась (build.sh)"
+    abort "! zygisk/$ABI.so is missing - the build did not run (build.sh)"
 fi
 
 # The archive carries both tools for every ABI: keep only ours and rename them —
 # storage.sh, post-fs-data.sh and service.sh look for these names.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
-    abort "! В модуле нет tools/$FIX — похоже, сборка не выполнялась (build.sh)"
+    abort "! tools/$FIX is missing - the build did not run (build.sh)"
 fi
 if [ ! -f "$MODPATH/tools/$NOACL" ]; then
-    abort "! В модуле нет tools/$NOACL — похоже, сборка не выполнялась (build.sh)"
+    abort "! tools/$NOACL is missing - the build did not run (build.sh)"
 fi
 mv "$MODPATH/tools/$FIX"   "$MODPATH/tools/storage-fix"
 mv "$MODPATH/tools/$NOACL" "$MODPATH/tools/vold-noacl"
@@ -46,8 +47,8 @@ set_perm "$MODPATH/status.sh"          0 0 0755 2>/dev/null
 # KernelSU docs advise against touching it by hand. Our set_perm calls change
 # owner and mode only, never the context.
 
-# Module id — so the paths below and the hints at the end point at the module
-# AFTER a reboot rather than at the install directory: $MODPATH points at
+# Module id — so prev_mode() below reads the module as it will be AFTER a
+# reboot rather than at the install directory: $MODPATH points at
 # /data/adb/modules_update/ during install, which does not work until a reboot.
 MODID=$(sed -n 's/^id=//p' "$MODPATH/module.prop" 2>/dev/null | head -1)
 [ -n "$MODID" ] || MODID=unfuse_zygisk
@@ -97,30 +98,34 @@ case "$MODE" in
     *) MODE=auto ;;
 esac
 
-ui_print "- Внутренняя память отдаётся приложениям напрямую:"
-ui_print "  корень /storage/emulated, Android/data, Android/obb и каталоги"
-ui_print "  чужих пакетов — как на Android 10 и раньше."
+# --- one line of output ------------------------------------------------------
+#
+# The installer says exactly one thing: whether the kernel has sdcardfs and which
+# path that leaves the module using. Everything else it could report (what the
+# module does, how to change the mode, how to disable it) is in the module's own
+# WebUI and in path-mode.sh, and printing it here only buries the one fact that
+# cannot be read anywhere else at install time.
+if grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
+    HAVE_SDCARDFS=1
+else
+    HAVE_SDCARDFS=0
+fi
 
 case "$MODE" in
     acl)
-        ui_print "- Режим пути: acl — только сырое дерево /data/media с ACL на"
-        ui_print "  группу 9997 (AID_EVERYBODY); sdcardfs не поднимается."
-        ;;
+        STORAGE="raw /data/media + ACL (mode=acl)" ;;
     sdcardfs)
-        ui_print "- Режим пути: sdcardfs — только основной путь. Если ядро его не"
-        ui_print "  умеет, приложения останутся без памяти (альтернативный запрещён)."
-        ;;
-    *)
-        if grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
-            ui_print "- Режим пути: auto — ядро умеет sdcardfs, будет основной путь."
+        if [ "$HAVE_SDCARDFS" = 1 ]; then
+            STORAGE="sdcardfs (mode=sdcardfs, kernel has sdcardfs)"
         else
-            ui_print "- Режим пути: auto — в ядре нет sdcardfs, включится"
-            ui_print "  альтернативный: сырое дерево /data/media с ACL на группу 9997."
-        fi
-        ;;
+            STORAGE="none - mode=sdcardfs but the kernel has no sdcardfs"
+        fi ;;
+    *)
+        if [ "$HAVE_SDCARDFS" = 1 ]; then
+            STORAGE="sdcardfs (auto, kernel has sdcardfs)"
+        else
+            STORAGE="raw /data/media + ACL (auto, kernel has no sdcardfs)"
+        fi ;;
 esac
 
-ui_print "- Режим и галочки состояния — в веб-интерфейсе модуля (WebUI в менеджере)."
-ui_print "- Сменить режим из терминала:"
-ui_print "  sh /data/adb/modules/$MODID/path-mode.sh acl|sdcardfs|auto"
-ui_print "- Отключить: создать /data/adb/modules/$MODID/disable и перезагрузиться."
+ui_print "- Storage path: $STORAGE"
