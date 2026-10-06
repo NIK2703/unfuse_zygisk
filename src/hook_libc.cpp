@@ -8,16 +8,29 @@
  * files, gid 9997 (mask=0007). Patch bionic entry points to shape the mode
  * pre-syscall: open/creat group rw + other cleared; mkdir also group x; chmod
  * never narrowed; rename/link into storage adds ACL (rename skips the default
- * ACL); mkstemp 0600 -> 0660. Only roots are patched; 8-16 byte thunks are
- * skipped (16 bytes would clobber the next function; they reach the root via
- * .plt). Entry patching covers loaded/later-dlopen'd/dlsym'd calls and needs no
- * trampoline (handlers syscall directly); handlers must be reentrant (syscalls
- * only). arm64 only.
+ * ACL); mkstemp 0600 -> 0660. Only roots are patched; thunks up to 32 bytes are
+ * skipped (they reach the root via .plt). Entry patching covers
+ * loaded/later-dlopen'd/dlsym'd calls and needs no trampoline (handlers syscall
+ * directly); handlers must be reentrant (syscalls only). arm64 only.
+ *
+ * The patch is 20 bytes and opens with bti c, so a patched entry stays a legal
+ * branch target on a bionic built with -mbranch-protection (17 already is), and
+ * hooks_install() refuses the release when libc declares BTI but the module was
+ * built without it. See patch_entry for why bti c and x17 specifically.
+ *
+ * The target list below is version-independent — on 15, 16 and 17 the same 9
+ * roots come out of it, 11 targets once open64/open and openat64/openat are
+ * counted as the aliases they are — but the COUNT is not something to assume:
+ * android_ver.h names the releases this was validated on and what each covers,
+ * and hooks_release() reports a release that comes out otherwise.
  *
  *   tools/verify-hook-targets.py device/libc/libc-arm64.so
  */
 
 #include "hook_libc.h"
+
+#include "android_ver.h"
+#include "gnu_props.h"
 
 #include "func_size.h"
 
@@ -33,6 +46,7 @@
 #include <unistd.h>
 
 #include <dlfcn.h>
+#include <link.h>  // dl_iterate_phdr, ElfW: the branch-protection preflight
 
 #include <android/log.h>
 
@@ -422,12 +436,35 @@ extern "C" int h_mkostemps(char *tmpl, int suffixlen, int flags) {
 
 #if defined(__aarch64__)
 
-// 16 bytes: ldr x17,#8; br x17; .quad <handler>. Literal PC-relative, branch
-// register-indirect -> no range/instruction relocation; literal written first so
-// the handler is in place before the branch appears.
+// 20 bytes: bti c; ldr x17,#8; br x17; .quad <handler>. The literal is
+// PC-relative (the load at offset 4 reads offset 12) and the branch is
+// register-indirect, so the patch needs no range or instruction relocation — but
+// it does need 20 bytes of room, hence the size gate in hooks_install.
+//
+// bti jc is not decoration. bionic 17 is built with -mbranch-protection=standard
+// (roots open with paciasp, thunks with bti c), and a loader sets PROT_BTI as
+// soon as an image declares GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image
+// declares it today, so these are inert hints on 15/16/17 — but if one ever does,
+// offset 0 becomes a guarded entry and an indirect call to a patched root must
+// land on a landing pad. The pad has to come first: a patch starting with the
+// load would fault before ever reaching the handler.
+//
+// jc rather than c: the pad has to accept both branch types the entry can see. A
+// plain call arrives with BTYPE=call (bti c would do), but a jump that did not
+// come through x16/x17 arrives with BTYPE=jump, which bti c rejects. jc accepts
+// both, and costs the same one instruction.
+//
+// Two constraints follow, both silent if broken:
+//   - paciasp, the other legal pad (and what bionic uses at framed entries), is
+//     unusable here: it signs x30 against the caller's SP, so the handler's ret
+//     would return to a signed address.
+//   - the branch must stay in x17. A br normally requires a bti j pad, but the
+//     architecture exempts x16/x17 exactly so the PLT idiom may land on bti c —
+//     which is also why the branch cannot move to another register.
+constexpr uint32_t kBitJc = 0xd50324dfu;   // bti jc (hint #38)
 constexpr uint32_t kLdrX17 = 0x58000051u;  // ldr x17, #8
 constexpr uint32_t kBrX17 = 0xd61f0220u;   // br  x17
-constexpr size_t kPatchSize = 16;
+constexpr size_t kPatchSize = 20;
 
 bool patch_entry(void *target, void *handler) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(target);
@@ -453,11 +490,45 @@ bool patch_entry(void *target, void *handler) {
         return false;
     }
 
-    memcpy(reinterpret_cast<void *>(addr + 8), &handler, sizeof handler);
-    reinterpret_cast<uint32_t *>(addr)[1] = kBrX17;
-    reinterpret_cast<uint32_t *>(addr)[0] = kLdrX17;
+    // The write is not atomic, and no order of these stores is safe in general —
+    // each order only picks the least bad window. This one is chosen so that:
+    //   after the literal — the original code runs: correct for every target;
+    //   after the load    — framed roots still run their own body (x17 is
+    //                       call-clobbered scratch, so clobbering it is
+    //                       harmless); the leaf syscall wrappers skip their
+    //                       syscall and return a wrong value, but do not crash;
+    //   after the branch  — the leaf wrappers work, but a framed root is now
+    //                       entered through a live paciasp, which signs x30 and
+    //                       breaks the handler's ret;
+    //   after the pad     — final state.
+    // The pad therefore goes last: the one broken window is a single store wide
+    // and covers only the framed roots. What makes any of this acceptable is
+    // that it runs from postAppSpecialize, where the process has one thread and
+    // nothing can be executing the entry being rewritten.
+    //
+    // volatile: the order above is the whole argument, and it is only preserved
+    // if the compiler is not free to reorder stores through these casts.
+    auto *words = reinterpret_cast<volatile uint32_t *>(addr);
+    auto *literal = reinterpret_cast<volatile uint64_t *>(addr + 12);
+    *literal = reinterpret_cast<uint64_t>(handler);
+    words[1] = kLdrX17;
+    words[2] = kBrX17;
+    words[0] = kBitJc;
     __builtin___clear_cache(reinterpret_cast<char *>(addr),
                             reinterpret_cast<char *>(addr) + kPatchSize);
+
+    // Read back what was actually written. The pad is the one word whose absence
+    // would be silent today and fatal the moment a release declares BTI, so it is
+    // worth one load to know the page really took the write.
+    const uint32_t got_pad = words[0];
+    const uint32_t got_ldr = words[1];
+    const uint32_t got_br = words[2];
+    if (got_pad != kBitJc || got_ldr != kLdrX17 || got_br != kBrX17) {
+        LOGE("патч входа %p не лёг: bti=%08x ldr=%08x br=%08x",
+             target, got_pad, got_ldr, got_br);
+        mprotect(reinterpret_cast<void *>(page), mlen, PROT_READ | PROT_EXEC);
+        return false;
+    }
 
     mprotect(reinterpret_cast<void *>(page), mlen, PROT_READ | PROT_EXEC);
     return true;
@@ -470,13 +541,13 @@ bool patch_entry(void *target, void *handler) {
 // function may tail-call; a short one may be the real impl). bionic thunks
 // shuffle args first, branch last, so the first instruction proves nothing.
 //
-// A 12-byte thunk vs a 16-byte patch would clobber the next function, so no
+// A 12-byte thunk vs a 20-byte patch would clobber the next function, so no
 // patch: the branch goes via .plt and bionic libc lacks -Bsymbolic, so
 // intra-library calls use the GOT pointing at the already-patched entry
 // (libc-16 R_AARCH64_JUMP_SLOT: creat/creat64 -> open@plt -> open; renameat ->
 // renameat2@plt -> renameat2; mkstemps/mkostemps -> mktemp_internal -> open@plt).
 //
-// Safety is size: a 16-byte patch needs >=16 bytes, so a long thunk (mkdir = 16)
+// Safety is size: the patch needs >=20 bytes, so a long thunk (mkdir = 20 on 17)
 // may be patched but need not be; tools/verify-hook-targets.py uses the same rule.
 void *tail_call_target(const void *fn, unsigned size) {
     if (size < 4 || size > kThunkMax) return nullptr;
@@ -496,7 +567,9 @@ void *tail_call_target(const void *fn, unsigned size) {
 
 #else
 
-constexpr size_t kPatchSize = 16;
+// Same width as the arm64 patch, so the size gate in hooks_install means the
+// same thing on both ABIs even though nothing is patched here.
+constexpr size_t kPatchSize = 20;
 
 bool patch_entry(void *, void *) {
     LOGE("правка входов libc реализована только для arm64");
@@ -506,6 +579,107 @@ bool patch_entry(void *, void *) {
 void *tail_call_target(const void *, unsigned) { return nullptr; }
 
 #endif
+
+// ------------------------------------------------------------ branch protection
+//
+// bionic 17 is built with -mbranch-protection=standard, so its entries carry
+// bti c / paciasp, and a loader sets PROT_BTI on an image the moment it declares
+// GNU_PROPERTY_AARCH64_FEATURE_1_BTI. No Android image declares it — 15, 16 and
+// 17, 64- and 32-bit, vold, libdl, all have no .note.gnu.property at all — which
+// is why those instructions are inert hints today. But the direction is plain
+// (bti c in libc: 64 on 16, 799 on 17), so the flip is a matter of time, and the
+// consequences land on the patch: offset 0 of a patched root becomes a guarded
+// entry. That is what the bti jc in the patch is for, and this is where the
+// assumption is written down and reported.
+//
+// Nothing here refuses to patch. The patch opens with a pad, so a guarded libc
+// entry stays a legal target; the handler it branches to lives in our module,
+// and OUR pages are guarded only if our module declares BTI too. It does not, and
+// that is deliberate: a guarded handler would have to be a pad for the jump case
+// as well, and the compiler emits paciasp at framed entries, which accepts calls
+// only. Not declaring BTI keeps the branch into the handler unchecked.
+//
+// If the module's note and its build flags ever disagree, the handlers are pads
+// by accident rather than by construction, and that is the one combination worth
+// refusing — reported as -1 by hooks_bti_report.
+
+#if defined(__ARM_FEATURE_BTI_DEFAULT) && __ARM_FEATURE_BTI_DEFAULT
+constexpr int kBuildBti = 1;
+#else
+constexpr int kBuildBti = 0;
+#endif
+
+constexpr uint32_t kFeatBti = UNFUSE_FEAT_BTI;
+constexpr uint32_t kFeatPac = UNFUSE_FEAT_PAC;
+constexpr uint32_t kFeatGcs = UNFUSE_FEAT_GCS;
+
+using ImageProps = UnfuseImageProps;
+
+struct PropsQuery {
+    const char *name_part;  // pick the image whose dlpi_name contains this...
+    const void *addr;       // ...or, when null, the one containing this address
+    ImageProps props;
+};
+
+// The note itself is parsed by gnu_props.h, which the host self-test exercises on
+// synthetic notes; this callback only decides which image to look at and hands
+// over one PT_GNU_PROPERTY segment at a time.
+int props_cb(struct dl_phdr_info *info, size_t, void *data) {
+    auto *q = static_cast<PropsQuery *>(data);
+
+    int hit = 0;
+    if (q->name_part != nullptr) {
+        hit = info->dlpi_name != nullptr && strstr(info->dlpi_name, q->name_part) != nullptr;
+    } else if (q->addr != nullptr) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(q->addr);
+        for (int i = 0; i < info->dlpi_phnum && !hit; i++) {
+            const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD) continue;
+            const uintptr_t lo = info->dlpi_addr + ph.p_vaddr;
+            hit = a >= lo && a < lo + ph.p_memsz;
+        }
+    }
+    if (!hit) return 0;
+
+    q->props.matched = 1;
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type != UNFUSE_PT_GNU_PROPERTY || ph.p_memsz == 0) continue;
+        unfuse_props_parse(reinterpret_cast<const void *>(info->dlpi_addr + ph.p_vaddr),
+                           ph.p_memsz, &q->props);
+        break;
+    }
+    return 1;
+}
+
+ImageProps image_props(const char *name_part, const void *addr) {
+    PropsQuery q{};
+    q.name_part = name_part;
+    q.addr = addr;
+    dl_iterate_phdr(props_cb, &q);
+    return q.props;
+}
+
+void props_str(const ImageProps &p, char *out, size_t len) {
+    if (!p.matched) {
+        snprintf(out, len, "образ не найден");
+        return;
+    }
+    if (!p.has_note) {
+        snprintf(out, len, "свойства GNU нет");
+        return;
+    }
+    char bits[64];
+    size_t u = 0;
+    bits[0] = '\0';
+    if (p.features & kFeatBti) u += snprintf(bits + u, sizeof bits - u, "BTI");
+    if (p.features & kFeatPac) u += snprintf(bits + u, sizeof bits - u, "%sPAC", u ? "+" : "");
+    if (p.features & kFeatGcs) u += snprintf(bits + u, sizeof bits - u, "%sGCS", u ? "+" : "");
+    // A note with no AArch64 feature word is the normal case off-device (an x86
+    // host has the note for its own ISA), so it reads as a fact, not a problem.
+    snprintf(out, len, "%s", u ? bits : "свойство есть, AArch64-возможностей нет");
+}
 
 enum class State { Failed, Ok, Alias, Missing, Thunk, Small, Unknown };
 
@@ -548,6 +722,11 @@ constexpr int kHookCount = static_cast<int>(sizeof(kHooks) / sizeof(kHooks[0]));
 State g_state[kHookCount];
 bool g_installed = false;
 
+// The release the patch ran on (android_ver.h): filled by hooks_install, read by
+// hooks_release. Only the .so build sees the table; this TU keeps the result.
+UnfusePick g_ver;
+bool g_ver_ready = false;
+
 // open64 is the same address as open on 64-bit: alias, not re-patch.
 void *g_patched[kHookCount];
 int g_patched_n = 0;
@@ -563,6 +742,12 @@ bool already_patched(void *fn) {
 
 int hooks_install(int *total) {
     if (total != nullptr) *total = kHookCount;
+
+    // The release decides only what the tally is COMPARED against, not how the
+    // entries are patched — that stays table-driven, see android_ver.h.
+    g_ver = unfuse_pick(unfuse_sdk());
+    g_ver_ready = true;
+
     if (g_installed) {
         int n = 0;
         for (int i = 0; i < kHookCount; i++) {
@@ -642,6 +827,40 @@ void hooks_report(char *buf, size_t len) {
         if (w < 0 || static_cast<size_t>(w) >= len - used) break;
         used += static_cast<size_t>(w);
     }
+}
+
+int hooks_release(char *buf, size_t len) {
+    if (buf != nullptr && len > 0) buf[0] = '\0';
+    if (!g_ver_ready) return -1;
+
+    unfuse_ver_str(&g_ver, buf, len);
+
+    // -1 for a borrowed profile: its number was never measured, so a different
+    // tally there is not a regression, only an unvalidated release.
+    return g_ver.known ? g_ver.v->installed : -1;
+}
+
+int hooks_bti_report(char *buf, size_t len) {
+    if (buf != nullptr && len > 0) buf[0] = '\0';
+
+    // libc by name — it is what gets patched. The module by address, since its
+    // path depends on where the manager installed it.
+    const ImageProps libc = image_props("libc.so", nullptr);
+    const ImageProps self = image_props(nullptr, reinterpret_cast<const void *>(&hooks_bti_report));
+
+    if (buf != nullptr && len > 0) {
+        char a[96], b[96];
+        props_str(libc, a, sizeof a);
+        props_str(self, b, sizeof b);
+        snprintf(buf, len, "libc: %s; модуль: %s", a, b);
+    }
+
+    // The module's note and the flags it was built with have to agree: if the
+    // note says BTI but the handlers were not compiled as landing pads, our pages
+    // are guarded and the branch into them is unchecked for nothing.
+    if (self.has_note && (self.features & kFeatBti) && !kBuildBti) return -1;
+
+    return (libc.has_note && (libc.features & kFeatBti)) ? 1 : 0;
 }
 
 int hooks_path_is_storage(const char *path) {

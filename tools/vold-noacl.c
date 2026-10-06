@@ -50,6 +50,17 @@
  * via /proc/<pid>/mem triggers COW: only the process's private copy changes. The patch
  * lives in memory only, so it must be reinstalled after every boot; a fresh vold takes path 3.
  *
+ * ------------------------- which releases
+ *
+ * The resolver is version-independent by construction — it reads vold's own tables, so
+ * nothing here changes between 16 and 17 — but the EXPECTATION is not something to
+ * assume. android_ver.h names the releases this was validated on and the AOSP site that
+ * writes the ACL the patch disarms (vold-16/Utils.cpp:195, vold-17/Utils.cpp:196); the
+ * release in force is printed with it, and one not in the table is marked as borrowing
+ * the newest profile rather than being verified. --sdk overrides the detection, for
+ * looking at an image that is not this device's. The refusal below is NOT version-
+ * dependent: whatever the table says, exactly one call site or refuse.
+ *
  * ============================== when it refuses
  *
  * Two premises are checked; if EITHER fails the tool refuses (code 2) and writes
@@ -84,6 +95,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include "android_ver.h"
 
 #define TARGET_SYM "setxattr"
 
@@ -894,12 +907,14 @@ static int selftest(Src *s) {
 
 static void usage(void) {
     fputs("usage: vold-noacl [--wait SEC] [--pid PID] [--check] [--dry-run]\n"
-          "                  [--file ELF] [--selftest] [--quiet]\n", stderr);
+          "                  [--file ELF] [--selftest] [--sdk N] [--quiet]\n",
+          stderr);
 }
 
 int main(int argc, char **argv) {
     int  wait_sec = 0;
     long pid_opt = -1;
+    long sdk_opt = -1;
     bool check = false, dry_run = false, self = false;
     const char *file = NULL;
 
@@ -908,6 +923,8 @@ int main(int argc, char **argv) {
             wait_sec = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
             pid_opt = strtol(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--sdk") && i + 1 < argc) {
+            sdk_opt = strtol(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--file") && i + 1 < argc) {
             file = argv[++i];
         } else if (!strcmp(argv[i], "--check")) {
@@ -923,6 +940,15 @@ int main(int argc, char **argv) {
             return EXIT_NO_RESOLVE;
         }
     }
+
+    /* The release in force: this system's, or --sdk for an image that is not this
+     * device's. It decides what the run is compared against and how the log
+     * reads — the resolution below reads the target's own tables either way,
+     * which is why 16 and 17 take the identical path. */
+    UnfusePick vp = unfuse_pick(sdk_opt > 0 ? (int)sdk_opt : unfuse_sdk());
+    char vbuf[192];
+    unfuse_ver_str(&vp, vbuf, sizeof(vbuf));
+    info("версия: %s; default-ACL пишет %s", vbuf, vp.v->vold_acl);
 
     Src s;
     memset(&s, 0, sizeof(s));

@@ -190,6 +190,9 @@ CFLAGS=(
     -Wall
     -Wextra
     -Wno-unused-parameter
+    # vold-noacl.c includes android_ver.h — the release table the patchers share.
+    # storage-fix.c does not, and an unused -I costs it nothing.
+    -I"$HERE/src"
 )
 
 # --------------------------------------------------------------- build

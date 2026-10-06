@@ -30,7 +30,9 @@
  * The tag gets one sample per boot, not one per app launch: the first app that
  * receives storage claims /data/adb/unfuse_zygisk.once and logs, the rest stay
  * quiet. post-fs-data.sh removes the marker at boot. Everything else on the tag
- * is an error.
+ * is an error. The sample names the Android release the hooks ran on, what the
+ * loaded images declare about branch protection, and complains when the tally
+ * differs from what that release is known to yield (android_ver.h).
  */
 
 #include <errno.h>
@@ -209,11 +211,45 @@ public:
 
         char report[768];
         hooks_report(report, sizeof report);
-        LOGI("хуки libc в uid=%d: %s", static_cast<int>(args->uid), report);
+
+        // Which release this is, and what the tally is measured against
+        // (android_ver.h). The version sits AFTER the target list: status.sh
+        // keys on "хуки libc в uid=" and reads ok/alias out of that list, so a
+        // prefix would be one more thing to keep out of its way.
+        char ver[192];
+        const int expected = hooks_release(ver, sizeof ver);
+
+        // Branch protection of the images involved (hook_libc.cpp): invisible
+        // until the day libc declares BTI, which is why it belongs in the sample.
+        char bti[224];
+        const int bti_state = hooks_bti_report(bti, sizeof bti);
+
+        LOGI("хуки libc в uid=%d: %s | %s | %s",
+             static_cast<int>(args->uid), report, ver, bti);
+
+        if (bti_state < 0) {
+            // The module's own note claims BTI while its handlers were not
+            // compiled as landing pads: its pages would be guarded and the
+            // branch into them unchecked. The patch is sound, the module is not.
+            LOGE("модуль объявляет BTI, но собран без branch protection — "
+                 "обработчики не площадки входа");
+        } else if (bti_state > 0) {
+            // Not an error: the patch opens with bti jc precisely so a guarded
+            // entry stays a legal target. Said out loud because it changes the
+            // threat model and would otherwise look like a mystery crash later.
+            LOGI("libc объявила BTI — входы патча держатся на bti jc");
+        }
 
         if (installed == 0) {
             LOGE("хуки libc не установлены ни одной цели — сырое дерево останется "
                  "без приведения режимов");
+        } else if (expected > 0 && installed != expected) {
+            // The release is in the table, so that number was measured on a real
+            // image: a different one means the target list stopped covering this
+            // build. Loud rather than fatal — the patch did install, just less.
+            LOGE("хуки libc: покрыто %d целей, а %s ожидает %d — список целей "
+                 "разошёлся с проверенным для этой сборки",
+                 installed, ver, expected);
         }
     }
 

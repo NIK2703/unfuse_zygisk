@@ -2,11 +2,22 @@
 """
 verify-hook-targets.py — предполётная проверка хука на РЕАЛЬНОЙ libc с устройства.
 
-Хук правит входные точки функций в libc, записывая туда 16 байт:
+Хук правит входные точки функций в libc, записывая туда 20 байт:
 
-    ldr x17, #8          ; 0x58000051
+    bti jc               ; 0xd50324df — площадка входа, обязательно ПЕРВОЙ
+    ldr x17, #8          ; 0x58000051 — литерал ниже, PC-относительно
     br  x17              ; 0xd61f0220
-    .quad <обработчик>   ; литерал, читается PC-относительно
+    .quad <обработчик>   ; 8 байт по смещению 12
+
+bti jc здесь не украшение. bionic 17 собран с -mbranch-protection=standard
+(корни начинаются с paciasp, переходники с bti c), и загрузчик выставляет
+PROT_BTI на образ, как только тот объявит GNU_PROPERTY_AARCH64_FEATURE_1_BTI.
+Ни один образ Android этого не объявляет, поэтому сегодня это инертные hint'ы —
+но если объявит, смещение 0 станет охраняемым входом, и косвенное обращение к
+пропатченному корню обязано попасть на площадку. Поэтому площадка идёт первой:
+патч, начинающийся с загрузки, упал бы до обработчика. Вариант jc, а не c,
+потому что площадка должна принимать оба типа ветвления: вызов приходит с
+BTYPE=call, а переход не через x16/x17 — с BTYPE=jump, который bti c отвергает.
 
 Прежде чем ставить это на устройство, надо убедиться в следующем — и всё это
 проверяется здесь по копии libc, снятой с устройства.
@@ -16,13 +27,13 @@ verify-hook-targets.py — предполётная проверка хука н
 
   2. Адрес выровнен по 4 байта. Иначе записать 32-битные инструкции нельзя.
 
-  3. Функция не короче 16 байт. Это главная опасность: если функция короче,
+  3. Функция не короче 20 байт. Это главная опасность: если функция короче,
      патч затрёт начало СЛЕДУЮЩЕЙ функции, и приложение упадёт в случайном
      месте. Размер берётся из st_size, а при st_size == 0 — как расстояние до
      следующего символа в той же секции.
 
   4. Функция не является «переходником» — телом из пары перестановок аргументов
-     и одного безусловного перехода. Переходники всегда коротки (8–16 байт),
+     и одного безусловного перехода. Переходники всегда коротки (8–32 байта),
      поэтому их пропускают, а покрытие доказывается по .plt.
 
   5. Пропущенные имена действительно покрыты: цепочка безусловных переходов
@@ -56,7 +67,8 @@ import tempfile
 
 LDR_X17 = 0x58000051  # ldr x17, #8
 BR_X17 = 0xD61F0220   # br  x17
-PATCH_SIZE = 16
+BTI_JC = 0xD50324DF   # bti jc (hint #38)
+PATCH_SIZE = 20
 
 # Must match kHooks[] in src/hook_libc.cpp.
 HOOK_NAMES = [
@@ -353,7 +365,7 @@ def is_thunk(elf, addr, size):
 
     Ровно то же условие использует движок (tail_call_target в
     src/hook_libc.cpp). Переходник, даже если он не короче патча (mkdir — ровно
-    16 байт), движок НЕ патчит: вызовы к нему и так приходят на пропатченный
+    20 байт на 17), движок НЕ патчит: вызовы к нему и так приходят на пропатченный
     корень через .plt, а лишняя правка — лишний риск. Поэтому и здесь он не
     попадает в список патчей: проверка должна подтверждать тот план, который
     исполняется на устройстве, а не более широкий.
@@ -621,10 +633,12 @@ def patch_and_show(elf, rows, patch_copy):
         if off is None:
             continue
         before = bytes(data[off:off + PATCH_SIZE])
-        # Literal first so the handler address is set before the branch (same order as patch_entry()).
-        struct.pack_into(elf.endian + "Q", data, off + 8, addr + 8)
-        struct.pack_into(elf.endian + "I", data, off + 4, BR_X17)
-        struct.pack_into(elf.endian + "I", data, off + 0, LDR_X17)
+        # Same order as patch_entry(): literal, then the load, then the branch,
+        # and the landing pad last — see there for why this order and no other.
+        struct.pack_into(elf.endian + "Q", data, off + 12, addr + 12)
+        struct.pack_into(elf.endian + "I", data, off + 4, LDR_X17)
+        struct.pack_into(elf.endian + "I", data, off + 8, BR_X17)
+        struct.pack_into(elf.endian + "I", data, off + 0, BTI_JC)
         patched.append({"name": row["name"], "addr": addr,
                         "before": before.hex(),
                         "after": bytes(data[off:off + PATCH_SIZE]).hex()})
@@ -681,9 +695,9 @@ def report(path, elf, rows, roots, addr_name, collisions, bad, patched, tool,
         print("--- проверка кодирования патча (в копии) ---")
         for p in patched:
             print("  %s @ 0x%x" % (p["name"], p["addr"]))
-            print("    до:    %s" % " ".join(p["before"][i:i + 8] for i in range(0, 32, 8)))
-            print("    после: %s" % " ".join(p["after"][i:i + 8] for i in range(0, 32, 8)))
-            for ln in disasm(tool, disasm_path, p["addr"], triple, 4):
+            print("    до:    %s" % " ".join(p["before"][i:i + 8] for i in range(0, PATCH_SIZE * 2, 8)))
+            print("    после: %s" % " ".join(p["after"][i:i + 8] for i in range(0, PATCH_SIZE * 2, 8)))
+            for ln in disasm(tool, disasm_path, p["addr"], triple, PATCH_SIZE // 4):
                 print("      %s" % ln)
     return n_ok, n_skip, n_bad
 

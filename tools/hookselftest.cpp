@@ -3,7 +3,7 @@
  * Built as a normal arm64 dynamic executable, run as root on the phone. Checks:
  *   1. target sizes from .dynsym ON DEVICE match the host preflight
  *      (tools/verify-hook-targets.py) — two independent ELF readers agree;
- *   2. entry bytes become ldr x17,#8 / br x17;
+ *   2. entry bytes become bti jc / ldr x17,#8 / br x17 (20 байт);
  *   3. modes are coerced to sdcardfs form (0600->0660, 0700->0770) plus a 9997
  *      ACL entry;
  *   4. .plt thunk coverage works: creat, mkstemp(s), mkdtemp are not patched
@@ -130,7 +130,7 @@ void dump_entry(const char *name) {
     }
     const unsigned char *p = static_cast<const unsigned char *>(fn);
     printf("  %-10s %p:", name, fn);
-    for (int i = 0; i < 16; i++) printf(" %02x", p[i]);
+    for (int i = 0; i < 20; i++) printf(" %02x", p[i]);
     printf("\n");
 }
 
@@ -177,6 +177,24 @@ void test_patch_bytes() {
     hooks_report(report, sizeof report);
     printf("  отчёт:\n    %s\n", report);
 
+    // Which release the table matched, and whether the tally is what that
+    // release is known to yield (android_ver.h). -1 means the release is not in
+    // the table, so there is no measured number to compare against — which is
+    // exactly the state a new release starts in, and why this prints the count
+    // instead of asserting it.
+    char ver[192];
+    const int expected = hooks_release(ver, sizeof ver);
+    printf("  версия: %s\n", ver);
+    if (expected > 0) {
+        char what[256];
+        snprintf(what, sizeof what, "покрыто целей %d, ожидается %d",
+                 installed, expected);
+        check(installed == expected, what);
+    } else {
+        printf("  ожидание неизвестно — сюда впишите измеренное: %d целей\n",
+               installed);
+    }
+
     printf("  после:\n");
     dump_entry("openat");
     dump_entry("mkdirat");
@@ -185,11 +203,12 @@ void test_patch_bytes() {
     check(fn != nullptr, "openat разрешён через dlsym");
     if (fn != nullptr) {
         const uint32_t *w = static_cast<const uint32_t *>(fn);
-        char what[160];
+        char what[200];
         snprintf(what, sizeof what,
-                 "вход openat = ldr x17,#8 / br x17 (получено 0x%08x 0x%08x)",
-                 w[0], w[1]);
-        check(w[0] == 0x58000051u && w[1] == 0xd61f0220u, what);
+                 "вход openat = bti jc / ldr x17,#8 / br x17 "
+                 "(получено 0x%08x 0x%08x 0x%08x)",
+                 w[0], w[1], w[2]);
+        check(w[0] == 0xd50324dfu && w[1] == 0x58000051u && w[2] == 0xd61f0220u, what);
     }
 }
 
