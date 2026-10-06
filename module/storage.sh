@@ -21,6 +21,19 @@ LOG=/data/adb/sdcardfs_restore.log
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $STAGE: $*" >> "$LOG"; }
 
+# --- ВРЕМЕННЫЙ переключатель для тестов ---------------------------------------
+#
+# Если этот файл существует, основной путь не поднимается вообще, и модуль
+# работает на альтернативном: сырое /data/media плюс ACL на группу 9997. Нужен,
+# чтобы прогнать альтернативный путь на ядре, где sdcardfs ЕСТЬ, — иначе он
+# включается только на ядре без CONFIG_SDCARD_FS, а такое ядро надо ещё собрать.
+#
+# Переключать можно без перезагрузки: создать/удалить файл, выполнить
+# `sh /data/adb/modules/sdcardfs_restore/storage.sh <стадия>` и перезапустить
+# приложение. Удалить файл и перезагрузиться — вернётся sdcardfs.
+#
+FORCE_RAW=/data/adb/sdcardfs_restore.force_raw
+
 # --- 1. Ярлык корня /data/media: media_userdir_file -> media_rw_data_file -----
 #
 # sdcardfs не заводит отдельного инода для корня точки монтирования: getattr()
@@ -118,7 +131,15 @@ sdcardfs_ready() {
     return 0
 }
 
-if grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
+if [ -e "$FORCE_RAW" ]; then
+    # Тестовый режим: основной путь выключен. Прежние маунты снимаем тут же,
+    # чтобы модуль ушёл на сырое дерево, не дожидаясь перезагрузки.
+    log "ТЕСТ: $FORCE_RAW на месте — основной путь выключен принудительно"
+    for m in default read write full; do
+        p="/mnt/runtime/$m/emulated"
+        [ "$(fs_type "$p")" = "$SDCARDFS_FS" ] && umount "$p" 2>/dev/null
+    done
+elif grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
     mount_one default 6  1015
     mount_one read    23 9997
     mount_one write   7  9997

@@ -18,7 +18,7 @@ Zygisk-модуль, возвращающий внутренней памяти 
 
 * Устройство проверки: POCO F5 (marble), Android 16, ядро 5.10 с
   `CONFIG_SDCARD_FS`.
-* Версия: **v2.6.0**
+* Версия: **v2.6.1**
 
 ---
 
@@ -252,8 +252,8 @@ ZIP=0 ./build.sh                    # не паковать zip
 переименовывает его в `tools/storage-fix`.
 
 ```sh
-adb push out/sdcardfs_restore-v2.6.0.zip /data/local/tmp/
-adb shell su -c "ksud module install /data/local/tmp/sdcardfs_restore-v2.6.0.zip"
+adb push out/sdcardfs_restore-v2.6.1.zip /data/local/tmp/
+adb shell su -c "ksud module install /data/local/tmp/sdcardfs_restore-v2.6.1.zip"
 adb reboot
 ```
 
@@ -319,6 +319,31 @@ adb shell su -c 'sh /data/local/tmp/device-test-fallback.sh'
 Системное приложение «Файлы» показывает `Android/data` со всеми пакетами —
 значит, провайдер `com.android.externalstorage` тоже получил подмену.
 
+### 6.1. Принудительный альтернативный путь (временно, для тестов)
+
+На ядре с `CONFIG_SDCARD_FS` альтернативный путь сам не включается — он
+предназначен для ядер без sdcardfs. Чтобы прогнать его на обычном ядре, есть
+переключатель: если существует файл `/data/adb/sdcardfs_restore.force_raw`,
+`storage.sh` не поднимает sdcardfs и снимает прежние маунты, после чего модуль
+уходит на сырое дерево.
+
+```sh
+# включить
+adb shell su -c 'touch /data/adb/sdcardfs_restore.force_raw'
+adb shell su -c 'sh /data/adb/modules/sdcardfs_restore/storage.sh test'
+adb shell am force-stop com.termux          # приложение перезапустится через модуль
+
+# выключить
+adb shell su -c 'rm /data/adb/sdcardfs_restore.force_raw'
+adb reboot
+```
+
+Признак того, что включился именно он: в `/data/adb/sdcardfs_restore.log`
+появляется `ТЕСТ: ... основной путь выключен принудительно`, затем
+`альтернативный путь: ACL с группой 9997 расставлены`, а в logcat —
+`сырой /data/media подключён`. Под `/storage/emulated/0` при этом лежит `f2fs`
+(сырое дерево), а не `sdcardfs`.
+
 ## 7. Ограничения
 
 * Обрабатываются только процессы, которые запускает Zygote. Процессы, читающие
@@ -351,6 +376,11 @@ tools/device-test-fallback.sh   регрессия обоих путей на у
 
 ## 9. История версий
 
+* **v2.6.1** — переключатель для прогона альтернативного пути на ядре, где
+  sdcardfs есть: файл `/data/adb/sdcardfs_restore.force_raw` заставляет
+  `storage.sh` не поднимать sdcardfs и снять прежние маунты (см. §6.1). Ничего
+  больше не менялось; на ядре без `CONFIG_SDCARD_FS` путь включается сам, без
+  этого файла.
 * **v2.6.0** — альтернативный путь без sdcardfs. Модуль пробует
   `/mnt/runtime/full/emulated`, проверяет тип ФС под точкой через `statfs` и при
   несовпадении откатывается на сырое `/data/media`; `storage.sh` в этом случае
