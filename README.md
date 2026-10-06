@@ -68,7 +68,7 @@ Android 16 **уже есть**:
 
 ---
 
-## 3. Две причины, которые пришлось обойти
+## 3. Три причины, которые пришлось обойти
 
 Это самая важная часть: причин было **две, и они разные**. Обе давали
 `EACCES` **без единого AVC** в логе, из-за чего их легко принять за одну.
@@ -142,6 +142,52 @@ allow appdomain media_rw_data_file:dir create_dir_perms;
 > отдавал `Permission denied`, после — `555`, и в namespace приложения
 > `/storage/emulated` тоже стал `555`, а `statfs` — `0x5dca2df5` (sdcardfs).
 
+### 3.3. Почему системное приложение «Файлы» показывало `Android/data` пустым
+
+Это **не** FUSE и **не** Java-фильтр. Причина — отдельные маунты **сырой ФС**
+поверх FUSE, которые видны в таблице маунтов:
+
+```
+fuse   /storage/emulated
+f2fs   /storage/emulated/0/Android/data    ← /dev/block/sda33, сырой f2fs
+f2fs   /storage/emulated/0/Android/obb
+```
+
+их права:
+
+```
+/data/media/0/Android/data = 2771 uid 1023 gid 1023   ← остальным только --x
+/data/media/0/Android/obb  = 2771 uid 1059 gid 1059
+```
+
+`--x` без `r` — войти в каталог можно, **листинг запрещён**. Эти маунты создаёт
+vold глобально, а Zygote повторяет per-app (`BindMountStorageDirs`,
+`mirrorAppDataPath → actualAppDataPath` в
+`com_android_internal_os_Zygote.cpp:1046-1087`). Именно их отключает наш
+`mount_storage_dirs = JNI_FALSE` — поэтому Termux и MiXplorer видят все пакеты.
+
+Но **DocumentsUI сам файлы не читает**: он спрашивает провайдера
+`com.android.externalstorage`, а тот запущен с
+
+```
+ProcessRecord{... :com.android.externalstorage/u0a300}
+    mountMode=ANDROID_WRITABLE
+```
+
+Пока модуль обрабатывал только `DEFAULT`, провайдер оставался с mirror-маунтом
+→ `EACCES` → «Файлы» рисовали «Ничего нет».
+
+**Решение:** обрабатывать и `ANDROID_WRITABLE` (v2.4.0). Проверено живьём —
+подкладка sdcardfs в namespace провайдера:
+
+| | до | после |
+|---|---|---|
+| ФС `/storage/emulated` | `0x65735546` (fuse) | `0x5dca2df5` (**sdcardfs**) |
+| `ls …/Android/data` | `Permission denied` | **51 пакет** |
+| `ls …/Android/obb` | `Permission denied` | 2 |
+
+после чего DocumentsUI отрисовал `POCO F5 > Android > data` со всеми пакетами.
+
 ---
 
 ## 4. Права, которые получает приложение
@@ -201,7 +247,13 @@ reinterpret_cast<...>(fork_app_methods[0].fnPtr)(..., mount_storage_dirs, ...);
 ## 6. Кого модуль покрывает
 
 Подмена выполняется для **каждого** процесса, который запускает Zygote с
-`mount_external == MOUNT_EXTERNAL_DEFAULT` — это **все обычные приложения**.
+`mount_external == MOUNT_EXTERNAL_DEFAULT` **или `MOUNT_EXTERNAL_ANDROID_WRITABLE`** —
+то есть для всех приложений.
+
+`ANDROID_WRITABLE` нужен отдельно: с ним работают приложения с
+`MANAGE_EXTERNAL_STORAGE` и системный провайдер SAF `com.android.externalstorage`,
+через который ходит **DocumentsUI**. Без этого «Файлы» показывали `Android/data`
+и `Android/obb` пустыми — см. §3.3.
 
 Пропускаются не приложения, а системные потребители сырого `/data/media`:
 
@@ -209,12 +261,7 @@ reinterpret_cast<...>(fork_app_methods[0].fnPtr)(..., mount_storage_dirs, ...);
 |---|---|---|
 | `NONE` (0) | изолированные процессы | внешнего хранилища у них нет вовсе |
 | `INSTALLER` (2) | installd | нужен сырой `/data/media` |
-| `PASS_THROUGH` (3) | MediaProvider, DownloadManager, ExternalStorageProvider | нужен сырой `/data/media`, иначе отвалится сам слой хранилища |
-| `ANDROID_WRITABLE` (4) | приложения с `MANAGE_EXTERNAL_STORAGE` | им и так выдаётся расширенный доступ; подмена сломала бы их модель |
-
-Важно: пропуск `ANDROID_WRITABLE` — это **не** ограничение доступа. Такие
-приложения и без модуля получают доступ ко всей памяти (в этом и смысл
-`MANAGE_EXTERNAL_STORAGE`), просто через FUSE.
+| `PASS_THROUGH` (3) | MediaProvider | нужен сырой `/data/media`, иначе отвалится сам слой хранилища |
 
 ---
 
@@ -324,8 +371,9 @@ su -c "nsenter -t \$(pidof $P) -m -- sh -c '
   `getMountUserId() == 0` (`EmulatedVolume.cpp:380`). Для остальных пользователей
   модуль использует второй путь — собственный `mount("sdcardfs")` с
   `userid=<n>`, — он от vold не зависит.
-* **Только `mount_external == MOUNT_EXTERNAL_DEFAULT`** — см. §6. Пропускаются не
-  приложения, а системные потребители сырого `/data/media`.
+* **Только `MOUNT_EXTERNAL_DEFAULT` и `MOUNT_EXTERNAL_ANDROID_WRITABLE`** — см. §6.
+  Пропускаются не приложения, а системные потребители сырого `/data/media`
+  (изолированные процессы, installd, MediaProvider).
 * `sdcardfs` — устаревший драйвер: часть приложений, рассчитанных на семантику
   FUSE, может вести себя иначе.
 * **`!android_dirs=raw` расширяет доступ.** Отключая tmpfs-обвязку, модуль делает
@@ -357,10 +405,11 @@ sdcardfs-restore/
 │   └── zygisk/
 │       ├── arm64-v8a.so
 │       └── armeabi-v7a.so
-├── device/                         ← снятое с устройства (см. §14)
+├── device/                         ← снятое с устройства (см. §15), в git не входит
+├── screenshots/                    снимки экрана с проверками (см. §3.3, §14)
 ├── tools/                          probe/test-скрипты и помощники
 └── out/
-    └── sdcardfs_restore-v2.3.0.zip
+    └── sdcardfs_restore-v2.4.0.zip
 ```
 
 ---
@@ -390,12 +439,16 @@ sdcardfs-restore/
 ## 14. Статус проверки
 
 **Проверено на живом устройстве** (POCO F5 / marble, Android 16 SDK 36,
-KernelSU 3.3.0, ZygiskNext, ядро `5.10.269-Bouquet-v5.1`), модуль **v2.3.0**:
+KernelSU 3.3.0, ZygiskNext, ядро `5.10.269-Bouquet-v5.1`), модуль **v2.4.0**:
 
 * Zygisk-хук вызывается живым Zygote для каждого приложения; в logcat —
   `sdcardfs подключён (uid=…, <пакет>): bind /mnt/runtime/full/emulated`
   (проверено на `com.mixplorer`, `com.android.documentsui`,
   `com.x8bit.bitwarden`, `org.amnezia.vpn` и других);
+* **DocumentsUI показывает `Android/data` со всеми пакетами** — см. §3.3:
+  провайдер SAF `com.android.externalstorage` (`mountMode=ANDROID_WRITABLE`)
+  получает sdcardfs, и «Файлы» отрисовывают `POCO F5 > Android > data`
+  (`screenshots/4-documentsui-android-data.png`);
 * перемаркировка корня выполняется модулем при загрузке; в логе —
   `relabel: /data/media: u:object_r:media_userdir_file:s0 -> media_rw_data_file`
   (специально проверялось на сброшенном вручную ярлыке);

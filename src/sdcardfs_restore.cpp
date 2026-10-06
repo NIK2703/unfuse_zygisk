@@ -4,12 +4,21 @@
  * каталогам, без scoped storage и без изоляции Android/data и Android/obb.
  *
  * МОДУЛЬ НЕ ЗНАЕТ ПОНЯТИЯ «СПИСОК ПРИЛОЖЕНИЙ»: подмена выполняется для КАЖДОГО
- * обычного процесса, который запускает Zygote (mount_external == DEFAULT).
- * Единственное, что модуль пропускает, — это не приложения, а системные
- * потребители сырого /data/media (MediaProvider, installd, DownloadManager,
- * ExternalStorageProvider: mount_external == PASS_THROUGH / INSTALLER /
- * ANDROID_WRITABLE) и изолированные процессы (NONE). Если подменить им
- * хранилище, отвалится сам FUSE-слой и доступ к памяти потеряют ВСЕ.
+ * процесса, который запускает Zygote с mount_external == DEFAULT или
+ * ANDROID_WRITABLE, то есть для всех приложений.
+ *
+ * ANDROID_WRITABLE нужен отдельно: с ним работают приложения с
+ * MANAGE_EXTERNAL_STORAGE и системный провайдер SAF com.android.externalstorage,
+ * через который ходит DocumentsUI. Пока провайдер оставался на FUSE, «Файлы»
+ * показывали Android/data и Android/obb пустыми: поверх FUSE там лежит
+ * mirror-маунт сырой ФС (/data/media/0/Android/data, режим 2771 uid/gid 1023),
+ * листинг которого провайдеру запрещён по DAC — остаётся только --x.
+ *
+ * Пропускает модуль только настоящих потребителей сырого /data/media:
+ *   NONE         — изолированные процессы (внешнего хранилища нет вовсе);
+ *   INSTALLER    — installd;
+ *   PASS_THROUGH — MediaProvider.
+ * Если подменить хранилище им, отвалится сам слой хранилища.
  *
  * Вариант B из aosp-ref/DESIGN-zygisk-sdcardfs.md.
  *
@@ -90,6 +99,7 @@
 
 #include <string>
 #include <stdlib.h>
+#include <vector>
 
 // bionic отдаёт их только через <sys/fsuid.h>, которого нет в NDK-заголовках.
 extern "C" int setfsuid(uid_t fsuid);
@@ -145,8 +155,11 @@ constexpr const char *kSdcardFsOptions =
 constexpr const char *kLowerRoot = "/data/media";
 
 // android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*
+// Значения — как в A16 (в Android 11 их было 9, в A16 осталось 5):
+//   NONE = 0, DEFAULT = 1, INSTALLER = 2, PASS_THROUGH = 3, ANDROID_WRITABLE = 4
 constexpr int kMountModeExternalNone = 0;
 constexpr int kMountModeExternalDefault = 1;
+constexpr int kMountModeExternalAndroidWritable = 4;
 
 // Только для читаемых логов.
 const char *mountModeName(int mode) {
@@ -588,12 +601,15 @@ bool tryAttach(const std::string &dst, unsigned user_id, std::string &detail) {
     return false;
 }
 
-// Делает /mnt/user/<user>/emulated точкой sdcardfs в ТЕКУЩЕМ (приватном)
-// namespace. Возвращает true при успехе, заполняя detail.
-bool attachSdcardFs(unsigned user_id, std::string &detail) {
-    const std::string dst =
-        "/mnt/user/" + std::to_string(user_id) + "/emulated";
-
+// Делает dst точкой sdcardfs в ТЕКУЩЕМ (приватном) namespace.
+// Возвращает true при успехе, заполняя detail.
+//
+// dst — это ровно тот каталог, который Zygote затем рекурсивно биндит на
+// /storage (см. MountEmulatedStorage в com_android_internal_os_Zygote.cpp):
+//   /mnt/user/<user>/emulated             — DEFAULT и обычно ANDROID_WRITABLE
+//   /mnt/androidwritable/<user>/emulated  — ANDROID_WRITABLE, когда включён
+//                                           persist.sys.vold_app_data_isolation_enabled
+bool attachSdcardFs(unsigned user_id, const std::string &dst, std::string &detail) {
     // Проверяем именно statfs: он не трогает inode и не может быть отклонён
     // из-за прав на сам каталог (в отличие от прежнего stat()).
     if (!fsMagic(dst.c_str(), nullptr)) {
@@ -685,16 +701,26 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // mount_external == DEFAULT — это все обычные приложения, то есть ровно
-        // то, ради чего модуль существует. Остальные значения — не приложения:
-        //   NONE            — изолированные процессы (нет внешнего хранилища)
-        //   INSTALLER       — installd
-        //   PASS_THROUGH    — MediaProvider, DownloadManager, ExternalStorageProvider
-        //   ANDROID_WRITABLE— смонтировать Android/ как записываемый
-        // Им нужен именно сырой /data/media; подмена сломает хранилище всем.
-        if (args->mount_external != kMountModeExternalDefault) {
-            LOGV("пропуск (%s): %s", mountModeName(args->mount_external),
-                 resolvePackage(args).c_str());
+        // Обрабатываем ДВА режима:
+        //   DEFAULT          — все обычные приложения;
+        //   ANDROID_WRITABLE — приложения с MANAGE_EXTERNAL_STORAGE и системный
+        //                      провайдер SAF com.android.externalstorage, через
+        //                      который ходит DocumentsUI. Без него «Файлы»
+        //                      показывают Android/data и Android/obb пустыми:
+        //                      провайдер остаётся на FUSE, а поверх неё лежит
+        //                      mirror-маунт сырой ФС (/data/media/0/Android/data,
+        //                      режим 2771 uid/gid 1023), листинг которого ему
+        //                      запрещён по DAC — остаётся только --x.
+        // Пропускаем только настоящих потребителей сырого /data/media:
+        //   NONE         — изолированные процессы (внешнего хранилища нет вовсе)
+        //   INSTALLER    — installd
+        //   PASS_THROUGH — MediaProvider (ему нужен сырой /data/media)
+        // Им подмена сломала бы работу хранилища.
+        const int mode = args->mount_external;
+        const bool is_default = (mode == kMountModeExternalDefault);
+        const bool is_android_writable = (mode == kMountModeExternalAndroidWritable);
+        if (!is_default && !is_android_writable) {
+            LOGV("пропуск (%s): %s", mountModeName(mode), resolvePackage(args).c_str());
             return;
         }
 
@@ -703,8 +729,31 @@ public:
 
         const unsigned user_id = static_cast<unsigned>(args->uid) / kAidUserOffset;
 
+        // Точка (или точки), которую Zygote заберёт под /storage. Для
+        // ANDROID_WRITABLE их может быть две — выбор зависит от
+        // persist.sys.vold_app_data_isolation_enabled. Накрываем все, которые
+        // есть в namespace, чтобы не зависеть от значения свойства.
+        std::vector<std::string> targets;
+        targets.push_back("/mnt/user/" + std::to_string(user_id) + "/emulated");
+        if (is_android_writable) {
+            targets.push_back("/mnt/androidwritable/" + std::to_string(user_id) +
+                              "/emulated");
+        }
+
         std::string detail;
-        if (!attachSdcardFs(user_id, detail)) {
+        bool ok = false;
+        for (const std::string &t : targets) {
+            std::string one;
+            if (attachSdcardFs(user_id, t, one)) {
+                ok = true;
+                if (!detail.empty()) detail += "; ";
+                detail += t + " (" + one + ")";
+            } else {
+                LOGV("не удалось накрыть %s: %s", t.c_str(), one.c_str());
+            }
+        }
+
+        if (!ok) {
             LOGW("не удалось подключить sdcardfs (uid=%d user=%u, %s): %s", args->uid,
                  user_id, resolvePackage(args).c_str(), detail.c_str());
             return;

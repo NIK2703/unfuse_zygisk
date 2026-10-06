@@ -1,6 +1,6 @@
 id=sdcardfs_restore
 name=sdcardfs Restore
-version=v2.3.0
-versionCode=20300
+version=v2.4.0
+versionCode=20400
 author=marble
-description=Возвращает внутренней памяти поведение Android 10 и более ранних версий: sdcardfs вместо FUSE и ПОЛНЫЙ доступ ко всей памяти для ВСЕХ приложений без исключений — включая корень /storage/emulated, Android/data, Android/obb и каталоги чужих пакетов, без scoped storage. Работает для каждого обычного процесса: приватный mount namespace, sdcardfs под /mnt/user/<user>/emulated, отключение изоляции Android/{data,obb}, перемаркировка корня /data/media. Требуется ядро с CONFIG_SDCARD_FS и Zygisk/ZygiskNext.
+description=Возвращает внутренней памяти поведение Android 10 и более ранних версий: sdcardfs вместо FUSE и ПОЛНЫЙ доступ ко всей памяти для ВСЕХ приложений без исключений — включая корень /storage/emulated, Android/data, Android/obb и каталоги чужих пакетов, без scoped storage. Работает для каждого процесса: приватный mount namespace, sdcardfs под /mnt/user/<user>/emulated, отключение изоляции Android/{data,obb}, перемаркировка корня /data/media. Обрабатываются и DEFAULT, и ANDROID_WRITABLE — поэтому Android/data виден и в системном приложении «Файлы». Требуется ядро с CONFIG_SDCARD_FS и Zygisk/ZygiskNext.
