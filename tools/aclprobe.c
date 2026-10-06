@@ -151,7 +151,21 @@ static void stat_line(const char *path) {
     printf("      %-44s mode=%04o uid=%u gid=%u\n", path, st.st_mode & 07777, st.st_uid, st.st_gid);
 }
 
-enum act { ACT_CREATE, ACT_MKDIR, ACT_OPEN_RDWR, ACT_LIST, ACT_PROBE };
+enum act {
+    ACT_CREATE,
+    ACT_MKDIR,
+    ACT_OPEN_RDWR,
+    ACT_OPEN_RDONLY,
+    ACT_LIST,
+    ACT_PROBE,
+    ACT_CHMOD,
+    ACT_CHOWN,
+    ACT_STAT
+};
+
+/* Target of ACT_CHOWN; the forked child inherits them. */
+static uid_t g_new_uid;
+static gid_t g_new_gid;
 
 struct task {
     enum act act;
@@ -236,6 +250,33 @@ static int run_as(enum act a, const char *path, mode_t mode, uid_t uid, gid_t gi
                 close(fd);
             else
                 rc = 1;
+        } else if (a == ACT_OPEN_RDONLY) {
+            int fd = open(path, O_RDONLY);
+            printf("      [%s uid=%u] open(O_RDONLY) %-36s -> %s\n", label, uid, path,
+                   fd < 0 ? strerror(errno) : "OK");
+            if (fd >= 0)
+                close(fd);
+            else
+                rc = 1;
+        } else if (a == ACT_CHMOD) {
+            int r = chmod(path, mode);
+            printf("      [%s uid=%u] chmod %-40s %04o -> %s\n", label, uid, path, mode,
+                   r != 0 ? strerror(errno) : "OK");
+            rc = r != 0 ? 1 : 0;
+        } else if (a == ACT_CHOWN) {
+            int r = chown(path, g_new_uid, g_new_gid);
+            printf("      [%s uid=%u] chown %-38s uid=%u gid=%u -> %s\n", label, uid, path,
+                   g_new_uid, g_new_gid, r != 0 ? strerror(errno) : "OK");
+            rc = r != 0 ? 1 : 0;
+        } else if (a == ACT_STAT) {
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                printf("      [%s uid=%u] stat %-39s -> %s\n", label, uid, path, strerror(errno));
+                rc = 1;
+            } else {
+                printf("      [%s uid=%u] stat %-39s -> mode=%04o uid=%u gid=%u\n", label, uid, path,
+                       st.st_mode & 07777, st.st_uid, st.st_gid);
+            }
         } else if (a == ACT_LIST) {
             DIR *d = opendir(path);
             if (!d) {
@@ -531,10 +572,114 @@ static int cmd_bind(void) {
     return 0;
 }
 
+/*
+ * Q5: what can sdcardfs do that the raw path cannot?
+ *
+ * sdcardfs synthesises the *visible* mode and owner on every lookup: a file an
+ * app created with 0600 still reads as 0660 to every other app, because the
+ * mount's mask/gid decide what callers see, not the lower inode. The raw path
+ * has no such synthesis — whatever mode the app asks for lands on disk, and the
+ * kernel masks the inherited ACL by that mode (posix_acl_create_masq).
+ *
+ * This battery performs the same operations as one app uid and then checks what
+ * a *different* app uid may do, so a raw tree and an sdcardfs mount of the same
+ * tree can be compared operation by operation.
+ */
+static int cmd_gap(const char *base) {
+    char f[512], d[512];
+    struct statfs sfs;
+
+    mkdir(base, 0777);
+    chmod(base, 0777);
+    grant_dir(base, 0777);
+
+    if (statfs(base, &sfs) != 0) {
+        printf("statfs(%s) -> %s\n", base, strerror(errno));
+        return 1;
+    }
+    printf("=== %s ===\n", base);
+    printf("    fs magic = 0x%lx  (%s)\n", (unsigned long)sfs.f_type,
+           sfs.f_type == 0x5dca2df5UL   ? "sdcardfs"
+           : sfs.f_type == 0xf2f52010UL ? "f2fs"
+                                        : "другая");
+
+    snprintf(f, sizeof(f), "%s/f0600", base);
+    unlink(f);
+    printf("\n-- 1. app1 создаёт файл с режимом 0600\n");
+    AS_APP(ACT_CREATE, f, 0600);
+    stat_line(f);
+    dump_acl(f, XATTR_ACL_ACCESS);
+    AS_APP2(ACT_STAT, f, 0);
+    AS_APP2(ACT_OPEN_RDONLY, f, 0);
+
+    snprintf(d, sizeof(d), "%s/d0700", base);
+    rmdir(d);
+    printf("\n-- 2. app1 создаёт каталог с режимом 0700\n");
+    AS_APP(ACT_MKDIR, d, 0700);
+    stat_line(d);
+    AS_APP2(ACT_STAT, d, 0);
+    AS_APP2(ACT_LIST, d, 0);
+
+    snprintf(f, sizeof(f), "%s/f0666", base);
+    unlink(f);
+    printf("\n-- 3. app1 создаёт файл 0666, затем chmod 0600\n");
+    AS_APP(ACT_CREATE, f, 0666);
+    stat_line(f);
+    AS_APP(ACT_CHMOD, f, 0600);
+    stat_line(f);
+    dump_acl(f, XATTR_ACL_ACCESS);
+    AS_APP2(ACT_OPEN_RDONLY, f, 0);
+
+    snprintf(d, sizeof(d), "%s/d0770", base);
+    rmdir(d);
+    printf("\n-- 4. app1 создаёт каталог 0770, затем chmod 0700\n");
+    AS_APP(ACT_MKDIR, d, 0770);
+    stat_line(d);
+    AS_APP(ACT_CHMOD, d, 0700);
+    stat_line(d);
+    dump_acl(d, XATTR_ACL_DEFAULT);
+    AS_APP2(ACT_LIST, d, 0);
+
+    snprintf(f, sizeof(f), "%s/fown", base);
+    unlink(f);
+    printf("\n-- 5. app1 пытается chown свой файл\n");
+    AS_APP(ACT_CREATE, f, 0666);
+    g_new_uid = APP2_UID;
+    g_new_gid = APP2_GID;
+    AS_APP(ACT_CHOWN, f, 0);
+    g_new_uid = (uid_t)-1;
+    g_new_gid = 3003; /* группа, в которой app1 состоит */
+    AS_APP(ACT_CHOWN, f, 0);
+    stat_line(f);
+    AS_APP2(ACT_OPEN_RDWR, f, 0);
+
+    /*
+     * 6. Гипотеза для патча: доступ ломает не сам режим, а обнулённая ядром
+     *    маска ACL. Если ACL переписать ЗАНОВО уже после создания, именованная
+     *    запись перестаёт глушиться маской и доступ возвращается. Ровно это
+     *    делает storage-fix — и именно поэтому он лечит дерево, созданное до
+     *    него. Здесь проверяется, работает ли это для файла, созданного
+     *    приложением только что.
+     */
+    printf("\n-- 6. повторное применение ACL к уже созданному (как storage-fix)\n");
+    snprintf(f, sizeof(f), "%s/f0600", base);
+    grant_file(f, 0660);
+    stat_line(f);
+    dump_acl(f, XATTR_ACL_ACCESS);
+    AS_APP2(ACT_OPEN_RDONLY, f, 0);
+
+    snprintf(d, sizeof(d), "%s/d0700", base);
+    grant_dir(d, 0770);
+    stat_line(d);
+    AS_APP2(ACT_LIST, d, 0);
+
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 2) {
-        fprintf(stderr, "usage: %s acl|bind\n", argv[0]);
+        fprintf(stderr, "usage: %s acl|bind|gap <dir>|verify <dir>|list <dir>\n", argv[0]);
         return 2;
     }
     if (!strcmp(argv[1], "acl")) return cmd_acl();
@@ -543,6 +688,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "dbg2")) return cmd_dbg2();
     if (!strcmp(argv[1], "dbg3")) return cmd_dbg3();
     if (!strcmp(argv[1], "verify") && argc > 2) return cmd_verify(argv[2]);
+    if (!strcmp(argv[1], "gap") && argc > 2) return cmd_gap(argv[2]);
     if (!strcmp(argv[1], "list") && argc > 2) {
         printf("=== app1 (uid %u) opendir %s ===\n", APP_UID, argv[2]);
         AS_APP(ACT_LIST, argv[2], 0);

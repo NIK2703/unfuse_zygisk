@@ -21,6 +21,8 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/src/sdcardfs_restore.cpp"
+HOOK_SRC="$HERE/src/hook_libc.cpp"
+SIZE_SRC="$HERE/src/func_size.cpp"
 TOOLS_SRC="$HERE/tools/storage-fix.c"
 ZYG_DIR="$HERE/module/zygisk"
 TOOLS_DIR="$HERE/module/tools"
@@ -107,8 +109,12 @@ TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
 info "NDK:      $NDK_DIR"
 info "API:      $API"
 info "исходник: $SRC"
+info "          $HOOK_SRC"
+info "          $SIZE_SRC"
 
 [[ -f "$SRC" ]] || die "нет исходника $SRC"
+[[ -f "$HOOK_SRC" ]] || die "нет исходника $HOOK_SRC"
+[[ -f "$SIZE_SRC" ]] || die "нет исходника $SIZE_SRC"
 [[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
 mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 
@@ -151,6 +157,7 @@ LDFLAGS=(
     -Wl,-z,now
     -Wl,--build-id=none
     -static-libstdc++
+    -ldl
     -llog
 )
 
@@ -178,7 +185,7 @@ for abi in "${ABIS[@]}"; do
     out="$ZYG_DIR/$abi.so"
     info "сборка $abi -> $(basename "$out")"
 
-    "$cxx" "${COMMON[@]}" "$SRC" -o "$out" "${LDFLAGS[@]}"
+    "$cxx" "${COMMON[@]}" "$SRC" "$HOOK_SRC" "$SIZE_SRC" -o "$out" "${LDFLAGS[@]}"
 
     if [[ "$STRIP" == "1" ]]; then
         strip_bin="$TOOLCHAIN/bin/llvm-strip"

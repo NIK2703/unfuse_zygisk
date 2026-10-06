@@ -40,6 +40,13 @@
  *
  * Списка приложений нет и быть не должно: подмена выполняется для каждого
  * процесса, который запускает Zygote.
+ *
+ * Отдельно, уже после специализации процесса, включается правка входов libc
+ * (hook_libc.cpp) — но только если сработал СЫРОЙ источник. На sdcardfs она не
+ * нужна и вредна: там режимы и группу синтезирует сама файловая система, а
+ * запись ACL в sdcardfs-маунт не пройдёт. Отключается файлом
+ * /data/adb/sdcardfs_restore.no_hooks — он проверяется в preAppSpecialize, пока
+ * процесс ещё root: /data/adb недоступен приложениям.
  */
 
 #include <errno.h>
@@ -48,11 +55,13 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
+#include <unistd.h>
 
 #include <string>
 
 #include <android/log.h>
 
+#include "hook_libc.h"
 #include "zygisk.hpp"
 
 #define LOG_TAG "SdcardFsRestore"
@@ -64,6 +73,10 @@ constexpr const char *kSourceSdcardfs = "/mnt/runtime/full/emulated";
 
 // Альтернативный источник: сырое дерево тома, когда sdcardfs в ядре нет.
 constexpr const char *kSourceRaw = "/data/media";
+
+// Файл-выключатель правки входов libc. Проверяется в preAppSpecialize, пока
+// процесс ещё root: из приложения /data/adb не виден.
+constexpr const char *kNoHooksFlag = "/data/adb/sdcardfs_restore.no_hooks";
 
 // android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*
 constexpr int kMountModeExternalDefault = 1;
@@ -175,10 +188,45 @@ public:
             *args->mount_storage_dirs = JNI_FALSE;
         }
 
-        LOGI("%s подключён: uid=%d",
+        // Правка входов libc нужна только на сыром дереве: на sdcardfs режимы и
+        // группу синтезирует файловая система, и трогать их не надо.
+        raw_ = (used == Source::Raw);
+
+        // Выключатель читается здесь, пока процесс ещё root: /data/adb закрыт
+        // для приложений, и в postAppSpecialize его было бы не видно.
+        hooks_allowed_ = (access(kNoHooksFlag, F_OK) != 0);
+
+        LOGI("%s подключён: uid=%d%s",
              used == Source::Sdcardfs ? "sdcardfs" : "сырой /data/media",
-             static_cast<int>(args->uid));
+             static_cast<int>(args->uid),
+             raw_ ? (hooks_allowed_ ? ", хуки включены" : ", хуки выключены файлом")
+                  : "");
     }
+
+    void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
+        if (!raw_ || !hooks_allowed_) return;
+
+        // Процесс уже специализирован: это код приложения, с его правами и в его
+        // namespace. Правка входов libc здесь никуда не утечёт — в отличие от
+        // preAppSpecialize, откуда её забрал бы с собой zygote.
+        int total = 0;
+        const int installed = hooks_install(&total);
+
+        char report[768];
+        hooks_report(report, sizeof report);
+        LOGI("хуки libc в uid=%d: %s", static_cast<int>(args->uid), report);
+
+        if (installed == 0) {
+            LOGE("хуки libc не установлены ни одной цели — сырое дерево останется "
+                 "без приведения режимов");
+        }
+    }
+
+private:
+    // Состояние переживает специализацию: preAppSpecialize и postAppSpecialize
+    // вызываются в одном и том же процессе над одним и тем же экземпляром.
+    bool raw_ = false;
+    bool hooks_allowed_ = true;
 };
 
 }  // namespace
