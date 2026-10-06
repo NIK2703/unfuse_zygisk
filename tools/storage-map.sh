@@ -37,9 +37,27 @@ ls -ld /mnt/runtime/full/emulated 2>&1
 ls /mnt/runtime/full/emulated 2>&1 | head -8
 
 echo
-echo "--- переключатель альтернативного пути ---"
-if [ -e /data/adb/sdcardfs_restore.force_raw ]; then
-    echo "  force_raw НА МЕСТЕ — модуль принудительно на альтернативном пути"
+echo "--- настройка пути модуля: /data/adb/sdcardfs_restore.conf ---"
+CONF=/data/adb/sdcardfs_restore.conf
+if [ -r "$CONF" ]; then
+    mode=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null \
+        | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
+    echo "  path=${mode:-<пусто>}  (файл есть)"
 else
-    echo "  force_raw нет — модуль на основном пути"
+    echo "  конфига нет — действует значение по умолчанию: auto"
+fi
+
+if [ -e /data/adb/sdcardfs_restore.force_raw ]; then
+    echo "  устаревшая метка force_raw НА МЕСТЕ — означает path=raw,"
+    echo "  но явный path в конфиге главнее (см. журнал модуля)"
+fi
+
+echo
+echo "--- что говорит журнал модуля о выбранном режиме ---"
+if [ -r /data/adb/sdcardfs_restore.log ]; then
+    grep -a 'режим пути:' /data/adb/sdcardfs_restore.log | tail -n 4 | sed 's/^/  /'
+    [ -n "$(grep -a 'режим пути:' /data/adb/sdcardfs_restore.log)" ] || \
+        echo "  (строк «режим пути:» нет — журнал от сборки до v3.2.0)"
+else
+    echo "  журнала нет"
 fi
