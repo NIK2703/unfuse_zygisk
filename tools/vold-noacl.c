@@ -1,196 +1,71 @@
 /*
- * vold-noacl — сделать vold::SetDefaultAcl() пустышкой в работающем vold,
- *              не привязываясь к сборке этого vold.
+ * vold-noacl — make vold::SetDefaultAcl() a no-op in a running vold, without
+ *              depending on how that vold was built.
  *
- * ================================================================== зачем
+ * ============================== why
  *
- * При подготовке CE-хранилища пользователя vold вызывает
- * (vold-16/FsCrypt.cpp:1027)
+ * Preparing a user's CE storage, vold calls SetDefaultAcl(...) (FsCrypt.cpp:1027)
+ * and sets a default ACL on /data/media/<user> naming group 1023 (media_rw). The
+ * module grants shared-storage access via a named entry for 9997 (AID_EVERYBODY);
+ * new dirs inherit whatever wrote the default ACL last, and vold writes later (CE
+ * prep, after post-fs-data), so dirs created by anything but the app inherit 1023
+ * and apps cannot see them. The other two call sites (Utils.cpp:406, :1889) hurt too.
  *
- *     SetDefaultAcl(media_ce_path, 02770, AID_MEDIA_RW, AID_MEDIA_RW, {AID_MEDIA_RW})
+ * AOSP already has a no-op branch (vold-16/Utils.cpp:142): `if (IsSdcardfsUsed())
+ * return OK;`, gated by the property external_storage.sdcardfs.enabled (0 here in
+ * /vendor/build.prop, and not re-enableable — it gates a dozen other vold paths). So
+ * the module restores behaviour AOSP intended.
  *
- * и тот ставит на /data/media/<user> default-ACL, в котором additionalGid
- * превращается в ИМЕНОВАННУЮ запись для группы 1023 (media_rw). Модуль же
- * выдаёт доступ к общему хранилищу именованной записью для 9997
- * (AID_EVERYBODY). Что унаследуют новые каталоги, решает тот, кто записал
- * default-ACL последним, — а vold пишет позже (при подготовке CE, уже после
- * post-fs-data). В итоге каталог, созданный не приложением (vold, MTP,
- * root-демон), наследует запись для 1023, и приложения его не видят.
+ * ------------------------- why the ELF tables
  *
- * SetDefaultAcl зовётся из трёх мест, и все три портят картину:
+ * SetDefaultAcl's whole job is one setxattr call, and across all of vold-16 setxattr
+ * appears EXACTLY ONCE (Utils.cpp:195, inside SetDefaultAcl; getxattr never). So
+ * "setxattr does nothing" == "SetDefaultAcl returns OK without writing the ACL".
+ * setxattr is an imported libc symbol, so its address comes from vold's OWN ELF
+ * tables, not a build-specific byte signature (the old patch anchored on
+ * `tbz w0,#0,<ACL block>` in .text).
  *
- *   FsCrypt.cpp:1027   /data/media/<user>              запись для 1023  <- главная
- *   Utils.cpp:406      Android/{data,obb,media}/<pkg>  запись для uid пакета
- *   Utils.cpp:1889     Android/obb                     GROUP_OBJ = AID_EXT_OBB_RW
+ * ------------------------- how it is found
  *
- * ================================================================ что патчим
+ * 1. Load base: /proc/<pid>/maps, first entry with offset=0 (the PIE image is mapped
+ *    whole, so ELF addresses are offsets from this base).
+ * 2. GOT slot: in PT_DYNAMIC take DT_JMPREL (.rela.plt); find the R_AARCH64_JUMP_SLOT
+ *    whose .dynsym index names the UNDEF symbol "setxattr"; its r_offset is the VA.
+ * 3. Stub: one pass over executable PT_LOADs collects every canonical
+ *    adrp x16,<page> / ldr x17,[x16,#imm12*8] / add x16,x16,#imm12*8 / br x17
+ *    whose ldr lands exactly on that GOT slot (self-check that the stub is
+ *    setxattr's). The relocation index is NOT used: lld puts two service entries
+ *    before the first symbol, so "rela.plt[i] -> plt+16*(i+1)" is off by one (on
+ *    device setxattr is rela.plt[185], its stub #187). --selftest checks the mapping is one-to-one for ALL symbols.
+ * 4. Repeat run / --check: the patch overwrote `ldr`, so the stub is no longer
+ *    findable via the GOT slot. But .plt layout is linear: for any other pair
+ *    "relocation i -> stub v", C = v - 16*i is constant (lld's numbering shift).
+ *    Derive C from foreign pairs; setxattr's stub is C + 16*i_setxattr (v2.9.0 hardcoded this C as 0x54ea0).
+ * 5. Patch writes 8 bytes: `mov w0,#0` (0x52800000) then `ret` (0xd65f03c0). Eight,
+ *    not sixteen: the /proc/<pid>/mem write is a memcpy into the page and 8 bytes at
+ *    an aligned address land as one word — atomically; the trailing `add`/`br` stay
+ *    but are unreachable. Return 0, not -1, because FsCrypt.cpp:1027 checks `if (ret != android::OK) return false;`.
  *
- * В AOSP у SetDefaultAcl есть готовая ветка «ничего не делать»
- * (vold-16/Utils.cpp:142):
+ * The .plt page is file-mapped r-x (RELRO covers only .got/.got.plt, later), so writing
+ * via /proc/<pid>/mem triggers COW: only the process's private copy changes. The patch
+ * lives in memory only, so it must be reinstalled after every boot; a fresh vold takes path 3.
  *
- *     status_t SetDefaultAcl(...) {
- *         if (IsSdcardfsUsed()) {
- *             return OK;            // «sdcardfs magically takes care of this»
- *         }
- *         ... строит ACL и зовёт setxattr(path, XATTR_NAME_POSIX_ACL_DEFAULT, ...)
- *     }
+ * ============================== when it refuses
  *
- * На устройствах с sdcardfs vold этих ACL не ставит вовсе — то есть модуль не
- * изобретает поведение, а возвращает ветку, которую AOSP и так предусмотрел.
+ * Two premises are checked; if EITHER fails the tool refuses (code 2) and writes
+ * NOTHING — refusing beats a false success that leaves the race while the log denies
+ * it. (1) setxattr is called EXACTLY ONCE (--dry-run prints "calls N"); 0 calls would
+ * report success changing nothing, >1 would disarm unrelated code. (2) Stubs are 16-byte
+ * spaced and shaped as above (lld without BTI/PAC); with -mbranch-protection=bti they are
+ * 32 bytes and C stops being constant, caught on the second pair.
  *
- * IsSdcardfsUsed() — это `IsFilesystemSupported("sdcardfs") &&
- * GetBoolProperty("external_storage.sdcardfs.enabled", true)`. На этой прошивке
- * sdcardfs в /proc/filesystems ЕСТЬ, а свойство выставлено в 0 в
- * /vendor/build.prop, поэтому проверка даёт false. Включить свойство обратно
- * нельзя: им гейтится полтора десятка других мест vold.
+ * Return codes (--file answers --check/--dry-run as on a live process and is never
+ * modified): 0 patch present; 1 vold absent or --check saw an intact stub; 2 could not parse
+ * the ELF, find the symbol or the stub; 3 could not write.
  *
- * Первая версия этого патча (v2.9.0) переписывала саму ветку: в
- * /system/bin/vold по трёхсловному якорю (f2ee6cc8 f80213e8 940016d0) искалась
- * инструкция `tbz w0, #0, <блок ACL>` и заменялась на `b <return OK>`. Это
- * работало, но было привязано к конкретной сборке: на другом vold якорь не
- * находится, и патч просто отказывался вставать.
- *
- * ------------------------------------------------------ почему это надёжнее
- *
- * В SetDefaultAcl вся работа сводится к одному вызову setxattr. Проверено по
- * исходникам: во всём vold-16 setxattr встречается РОВНО ОДИН раз —
- * Utils.cpp:195, внутри SetDefaultAcl (getxattr нет вовсе). Значит,
- *
- *     «setxattr в vold ничего не делает»  ==  «SetDefaultAcl возвращает OK,
- *                                              не записав ACL»
- *
- * то есть в точности то же самое, что делал патч v2.9.0, — только привязки к
- * сборке нет: setxattr — импортируемый символ libc, и его адрес берётся ИЗ
- * ТАБЛИЦ САМОГО vold, а не из подписи байтов.
- *
- * ------------------------------------------------------------- как ищется
- *
- * 1. База загрузки: /proc/<pid>/maps, первая запись с offset=0 (PIE-образ
- *    отображён целиком, поэтому все адреса в ELF — смещения от этой базы).
- *
- * 2. Смещение GOT-слота setxattr: в PT_DYNAMIC берётся DT_JMPREL
- *    (таблица .rela.plt), в ней ищется R_AARCH64_JUMP_SLOT, чей индекс символа
- *    в .dynsym указывает на UNDEF-символ с именем "setxattr". r_offset этой
- *    релокации и есть виртуальный адрес GOT-слота.
- *
- * 3. Трамплин PLT. Сначала одним проходом по исполняемым PT_LOAD собираются
- *    все записи канонического вида
- *
- *        adrp x16, <страница>
- *        ldr  x17, [x16, #<imm12*8>]     <- обязан попасть ровно в GOT-слот
- *        add  x16, x16, #<imm12*8>
- *        br   x17
- *
- *    Совпадение адреса из `ldr` с r_offset из релокации — это самопроверка:
- *    она доказывает, что найденный трамплин принадлежит именно setxattr.
- *    Индекс релокации для этого НЕ используется: у lld перед первым символом
- *    стоят две служебные записи, поэтому «rela.plt[i] -> plt + 16*(i+1)» даёт
- *    промах на одну запись (проверено на устройстве: setxattr — это
- *    rela.plt[185], а трамплин у него #187). Режим --selftest проверяет, что
- *    сопоставление взаимно однозначное для ВСЕХ символов сразу.
- *
- * 4. Повторный запуск (патч уже стоит). Патч затирает `ldr`, поэтому найти
- *    трамплин по GOT-слоту во второй раз нельзя. Но раскладка .plt линейна:
- *    для любой ДРУГОЙ пары «релокация i -> трамплин v» величина
- *
- *        C = v - 16 * i
- *
- *    одна и та же (это и есть смещение, на которое lld сдвинул нумерацию).
- *    C выводится из чужих пар, после чего адрес setxattr считается как
- *    C + 16 * i_setxattr. Так повторный запуск и --check работают, хотя
- *    собственный ldr символа уже затёрт. Именно эту величину v2.9.0
- *    ЗАШИВАЛА в код как «0x54ea0» — здесь она вычисляется из самого бинарника.
- *
- * 5. Патч: в трамплин пишутся 8 байт
- *
- *        mov w0, #0      ; 0x52800000  ->  setxattr «успешно» вернула 0
- *        ret             ; 0xd65f03c0
- *
- *    Восемь, а не шестнадцать: запись через /proc/<pid>/mem идёт memcpy в
- *    страницу, и восемь байт по выровненному адресу ложатся одним словом —
- *    то есть атомарно. Хвостовые `add`/`br` остаются на месте, но недостижимы:
- *    `ret` стоит раньше. Так исключено состояние, в котором поток, попавший в
- *    трамплин ровно во время записи, прыгнул бы по мусорному x17.
- *
- *    Возврат именно 0, а не -1: в FsCrypt.cpp:1027 результат проверяется —
- *    `if (ret != android::OK) return false;` — и ненулевой код сорвал бы всю
- *    подготовку хранилища пользователя.
- *
- * Страница .plt отображена из файла как r-x (RELRO покрывает только .got и
- * .got.plt, они идут позже), запись в неё через /proc/<pid>/mem вызывает COW:
- * правится приватная копия процесса, файл на диске и другие процессы не
- * затронуты. Ровно так же писал патч v2.9.0. Патч живёт только в памяти
- * процесса, поэтому после каждой перезагрузки его надо ставить заново — и на
- * свежем vold трамплин снова цел, так что первый запуск всегда идёт по п. 3.
- *
- * ===================================== на чём держится патч и когда он откажет
- *
- * Патч — не универсальная затычка, а утверждение о конкретном бинарнике. Две
- * посылки проверяются явно, и при невыполнении ЛЮБОЙ из них утилита отказывается
- * (код 2) и НИЧЕГО не пишет. Отказ здесь лучше ложного успеха: молча
- * «поставивший» патч оставил бы гонку, а журнал говорил бы, что её нет.
- *
- *  1. setxattr вызывается в vold РОВНО ОДИН раз (--dry-run печатает
- *     «вызовов N»). Так в vold-16: единственный вызов — из
- *     vold::SetDefaultAcl (Utils.cpp:195), getxattr не вызывается вовсе.
- *     Если вызовов 0 — мы бы отчитались об успехе, ничего не изменив. Если
- *     больше одного — обезвредили бы заодно чужой код. Оба случая — отказ.
- *
- *  2. Трамплины .plt идут шагом ровно 16 байт и имеют вид
- *     adrp x16 / ldr x17,[x16,#imm] / add x16,x16,#imm / br x17.
- *     Это раскладка lld без BTI/PAC. При сборке с -mbranch-protection=bti
- *     записи становятся 32-байтовыми, и постоянная C перестаёт быть
- *     постоянной — проверка ловит это на второй же паре («раскладка .plt
- *     нелинейна») и отказывается. Проверено на своём бинарнике: без BTI
- *     разбирается, с BTI — отказ с кодом 2.
- *
- * Проверить конкретный vold, не трогая устройство:
- *
- *     adb pull /system/bin/vold /tmp/vold
- *     vold-noacl --file /tmp/vold --selftest   # раскладка: 473 из 473 без пропусков
- *     vold-noacl --file /tmp/vold --check      # 0 — патч есть, 1 — нет, 2 — отказ
- *
- * ============================================================== как позвать
- *
- *     vold-noacl [--wait СЕК] [--pid PID] [--check] [--dry-run]
- *                [--file ELF] [--selftest] [--quiet]
- *
- *     без флагов      найти vold, поставить патч (повторный запуск — no-op)
- *     --check         ничего не писать; 0 — патч на месте, 1 — нет
- *     --dry-run       найти и показать адреса, ничего не писать
- *     --file ELF      работать с файлом, а не с процессом (для проверок);
- *                     файл не меняется никогда, но --check и --dry-run
- *                     отвечают здесь ровно так же, как на живом процессе
- *     --selftest      с --file: сверить сопоставление релокаций и трамплинов
- *     --wait СЕК      ждать появления vold до СЕК секунд
- *     --pid PID       не искать vold, взять этот процесс
- *     --quiet         не печатать ничего, кроме ошибок
- *
- * Коды возврата:
- *     0  патч на месте (поставлен сейчас или стоял раньше)
- *     1  vold не найден / не запущен, либо --check увидел целый трамплин
- *     2  не удалось разобрать ELF, найти символ или трамплин
- *     3  не удалось записать
- *
- * ==================================================== где запускать и где нет
- *
- * Запись идёт через /proc/<pid>/mem, а он требует PTRACE_MODE_ATTACH к vold.
- * Отсюда требование к окружению, которое легко нарушить незаметно:
- *
- *     su -c 'vold-noacl'              работает: домен u:r:ksu:s0
- *     su -c 'a; vold-noacl'           НЕ работает: домен u:r:shell:s0
- *     su -c 'sh -c "vold-noacl"'      работает: домен u:r:ksu:s0
- *
- * KernelSU, увидев в -c составную команду, выполняет её через шелл, а шелл
- * оказывается в домене shell, которому ptrace к vold не разрешён. Отличить
- * это от «нет базы загрузки» помогает сообщение: при отказе по домену
- * печатается «/proc/<pid>/maps не читается — скорее всего нет
- * PTRACE_MODE_READ». Поэтому вызывать утилиту надо ОДНОЙ простой командой;
- * редирект (`>>журнал 2>&1`) домен не меняет, он делается тем же шеллом.
- * Именно так её и зовут post-fs-data.sh и service.sh.
- *
- * Сборка: cc -std=c11 -Oz -o vold-noacl vold-noacl.c
- *         (на хосте проверялось clang -std=c11 -O2 -Wall -Wextra)
+ * /proc/<pid>/mem needs PTRACE_MODE_ATTACH on vold: invoke the tool as ONE simple
+ * su -c command (a compound command lands in the shell domain, which may not ptrace vold;
+ * a redirect does not change the domain). Build: cc -std=c11 -Oz -o vold-noacl vold-noacl.c
  */
 
 #define _GNU_SOURCE
@@ -210,10 +85,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* Имя символа, который надо обезвредить. */
 #define TARGET_SYM "setxattr"
 
-/* Что пишем в трамплин: mov w0, #0 ; ret */
+/* Bytes written into the stub: mov w0, #0 ; ret */
 #define PATCH_MOV0  0x52800000u
 #define PATCH_RET   0xd65f03c0u
 static const uint32_t PATCH_WORDS[2] = { PATCH_MOV0, PATCH_RET };
@@ -222,8 +96,6 @@ static const uint32_t PATCH_WORDS[2] = { PATCH_MOV0, PATCH_RET };
 #define EXIT_NO_VOLD    1
 #define EXIT_NO_RESOLVE 2
 #define EXIT_NO_WRITE   3
-
-/* ------------------------------------------------------------------ вывод */
 
 static bool g_quiet = false;
 
@@ -235,25 +107,19 @@ static void info(const char *fmt, ...) {
     vprintf(fmt, ap);
     fputc('\n', stdout);
     va_end(ap);
-    /* stdout может быть перенаправлен в журнал, stderr — нет: без сброса
-     * строки перемешиваются. */
+    /* stdout may be a log while stderr is not; flush so lines don't interleave. */
     fflush(stdout);
 }
 
 static void warn(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    /* Вся строка целиком в stderr. Если префикс писать в stderr, а текст через
-     * vprintf — в stdout, то при `2>&1` в файл или канал строки расходятся:
-     * stdout буферизуется блоками, stderr нет, и в журнале появляется
-     * «vold-noacl: » отдельно от сообщения. */
+    /* Whole line to stderr: mixing a stderr prefix with stdout text splits lines under `2>&1`. */
     fputs("vold-noacl: ", stderr);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
 }
-
-/* ------------------------------------------------------------------ мелкое */
 
 static int read_all(const char *path, void *buf, size_t len, size_t *got) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -279,21 +145,15 @@ static const char *base_name(const char *p) {
     return s ? s + 1 : p;
 }
 
-/* ------------------------------------------------------- источник ELF-образа
- *
- * Один и тот же разбор работает и по файлу (--file), и по живой памяти
- * процесса. Разница только в том, как читается «виртуальный адрес»:
- *
- *   файл     — VA переводится в смещение по таблице программных заголовков;
- *   процесс  — VA читается прямо из /proc/<pid>/mem как base + VA.
- */
+/* Same parse for a file (--file) and a live process; only VA->byte differs: a file
+ * uses PT_LOAD, a process reads base+VA from /proc/<pid>/mem. */
 
 typedef struct {
     bool      is_proc;
-    int       fd;          /* файл или /proc/<pid>/mem */
-    uint64_t  base;        /* база загрузки (только для процесса) */
+    int       fd;
+    uint64_t  base;
     pid_t     pid;
-    const char *label;     /* для сообщений */
+    const char *label;
 
     Elf64_Ehdr eh;
     Elf64_Phdr *ph;
@@ -317,8 +177,7 @@ static int src_pread(Src *s, uint64_t va, void *buf, size_t len) {
         return 0;
     }
 
-    /* Файл: VA -> смещение. Пробуем PT_LOAD, иначе считаем VA смещением
-     * (так устроена шапка ELF и таблица программных заголовков). */
+    /* File: VA -> offset via PT_LOAD; else VA is already the offset (header, phdrs). */
     uint64_t off = va;
     for (int i = 0; i < s->phnum; i++) {
         const Elf64_Phdr *p = &s->ph[i];
@@ -349,7 +208,6 @@ static void src_close(Src *s) {
     s->ph = NULL;
 }
 
-/* Разбор шапки и программных заголовков. */
 static int src_open_header(Src *s) {
     if (src_pread(s, 0, &s->eh, sizeof(s->eh)) != 0) {
         warn("%s: не читается шапка ELF", s->label);
@@ -385,12 +243,10 @@ static int src_open_header(Src *s) {
     return 0;
 }
 
-/* ------------------------------------------------------------- PT_DYNAMIC */
-
 typedef struct {
     uint64_t symtab, strtab, strsz;
     uint64_t jmprel, pltrelsz, pltrel, relaent;
-    uint64_t reladyn, relasz;   /* нужны, чтобы заметить «взятие адреса» */
+    uint64_t reladyn, relasz;   /* needed to detect "address taken" */
 } Dyn;
 
 static int read_dynamic(Src *s, Dyn *d) {
@@ -486,19 +342,9 @@ static int sym_name(Src *s, const Dyn *d, uint32_t idx, char *out, size_t outlen
     return 0;
 }
 
-/* ---------------------------------------------------- декодирование трамплина
- *
- * Канонический трамплин AArch64:
- *
- *     30 00 00 d0   adrp x16, <page>
- *     11 5a 41 f9   ldr  x17, [x16, #imm12*8]
- *     10 c2 0a 91   add  x16, x16, #imm12*8
- *     20 02 1f d6   br   x17
- *
- * Возвращает адрес, откуда читает `ldr`. Проверка формы намеренно строгая
- * (все четыре инструкции, регистры x16/x17) — чтобы исключить ложные
- * совпадения при сканировании.
- */
+/* Canonical AArch64 stub: adrp x16,<page> / ldr x17,[x16,#imm12*8] /
+ * add x16,x16,#imm12*8 / br x17. Returns the address `ldr` reads from; the strict
+ * form check (all four insns, x16/x17) avoids false scan matches. */
 static bool decode_stub(const uint8_t *p, uint64_t va, uint64_t *ldr_target) {
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p + 0, 4);
@@ -517,7 +363,7 @@ static bool decode_stub(const uint8_t *p, uint64_t va, uint64_t *ldr_target) {
     uint32_t immlo = (w0 >> 29) & 0x3u;
     uint32_t immhi = (w0 >> 5) & 0x7ffffu;
     uint32_t v = (immhi << 2) | immlo;
-    int64_t sv = (int64_t)(int32_t)(v << 11) >> 11;       /* знак, 21 бит */
+    int64_t sv = (int64_t)(int32_t)(v << 11) >> 11;       /* sign-extend 21 bits */
     uint64_t page = (va & ~0xfffULL) + (uint64_t)(sv << 12);
 
     uint32_t imm12 = (w1 >> 10) & 0xfffu;
@@ -525,8 +371,8 @@ static bool decode_stub(const uint8_t *p, uint64_t va, uint64_t *ldr_target) {
     return true;
 }
 
-/* Уже пропатченная запись: mov w0, #0 / ret / add x16,x16,#imm / br x17.
- * `ldr` затёрт, но `add` и `br` на месте — по ним запись и опознаётся. */
+/* Already-patched stub: mov w0,#0 / ret / add / br — `ldr` is gone, recognised by
+ * the surviving `add` and `br`. */
 static bool looks_patched(const uint8_t *p) {
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p + 0, 4);
@@ -539,14 +385,12 @@ static bool looks_patched(const uint8_t *p) {
     return w3 == 0xd61f0220u;
 }
 
-/* --------------------------------------------- карта трамплинов одного прохода */
-
 typedef struct {
-    uint64_t *target;   /* адрес, откуда читает ldr */
-    uint64_t *va;       /* сам трамплин */
+    uint64_t *target;
+    uint64_t *va;
     size_t    n;
     size_t    cap;
-    uint64_t *patched;  /* трамплины, уже несущие патч */
+    uint64_t *patched;
     size_t    npatched;
     size_t    pcap;
 } Stubs;
@@ -604,8 +448,7 @@ static bool stubs_is_patched(const Stubs *st, uint64_t va) {
     return false;
 }
 
-/* Один проход по исполняемым PT_LOAD: собрать все канонические трамплины и
- * отметить те, что уже несут патч. */
+/* One pass over executable PT_LOADs: collect canonical stubs, note patched ones. */
 static int collect_stubs(Src *s, Stubs *st) {
     memset(st, 0, sizeof(*st));
     for (int i = 0; i < s->phnum; i++) {
@@ -643,22 +486,10 @@ static int collect_stubs(Src *s, Stubs *st) {
     return 0;
 }
 
-/* ------------------------------------------------------------ база загрузки */
-
-/* Первая запись /proc/<pid>/maps с offset=0 — это отображение шапки ELF, её
- * начало и есть база загрузки PIE.
- *
- * Ищется отображение ИМЕННО того файла, который нам нужен (want_exe), а не
- * просто минимальный адрес среди всех: рядом лежат линкер, libc и прочее, и
- * любое из них может оказаться ниже. Раньше брался минимум — на проверенном
- * устройстве он случайно совпадал с vold, но это везение, а не свойство:
- * промах дал бы чужую базу, и дальше утилита читала бы не тот код. Минимум
- * оставлен запасным вариантом, когда want_exe неизвестен (--pid без опознания).
- *
- * Возврат: 0 — база найдена; -1 — maps не читается; -2 — читается, но
- * подходящих записей нет. Разные коды нужны, чтобы в журнале было видно, что
- * именно случилось: это разные поломки с разным лечением.
- */
+/* First /proc/<pid>/maps entry with offset=0 is the ELF header mapping; its start
+ * is the PIE load base. Match the wanted file (want_exe), not the lowest address
+ * overall (linker/libc may lie below); lowest is only a fallback when want_exe is
+ * unknown. Returns 0 found, -1 maps unreadable, -2 no usable entry. */
 static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
                           char *exe_out, size_t exelen) {
     char path[64];
@@ -680,10 +511,9 @@ static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
         char *sp = strstr(line, " /");
-        if (!sp) continue;            /* анонимное отображение не подходит */
+        if (!sp) continue;
         char *mp = sp + 1;
-        /* У заменённого на диске файла ядро дописывает " (deleted)" — при
-         * сравнении с /proc/<pid>/exe этот хвост надо отбросить. */
+        /* Kernel appends " (deleted)" to a replaced file's path — strip it before comparing. */
         char *del = strstr(mp, " (deleted)");
         if (del) *del = '\0';
 
@@ -710,15 +540,8 @@ static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
     return -2;
 }
 
-/* ------------------------------------------------------------- поиск vold */
-
-/* Опознание vold.
- *
- * По comm его опознать НЕЛЬЗЯ: vold зовёт joinThreadPool() из главного потока,
- * и драйвер binder переименовывает этот поток в "binder:<pid>_<n>". На
- * проверенном устройстве /proc/<pid>/comm у vold — "binder:913_2", при том что
- * exe указывает на /system/bin/vold. Поэтому главный признак — exe.
- */
+/* Identify vold by exe, not comm: vold calls joinThreadPool() from the main thread
+ * and binder renames it to "binder:<pid>_<n>". */
 static bool pid_is_vold(pid_t pid, char *exe, size_t exelen) {
     char path[64];
     char buf[4096];
@@ -731,11 +554,9 @@ static bool pid_is_vold(pid_t pid, char *exe, size_t exelen) {
             if (exe) snprintf(exe, exelen, "%s", buf);
             return true;
         }
-        /* exe читается и это не vold — дальше смотреть нечего. */
         return false;
     }
 
-    /* exe недоступен (нет PTRACE_MODE_READ) — пробуем cmdline. */
     size_t got = 0;
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_all(path, buf, sizeof(buf) - 1, &got) == 0 && got > 0) {
@@ -750,8 +571,6 @@ static bool pid_is_vold(pid_t pid, char *exe, size_t exelen) {
         }
     }
 
-    /* Последняя попытка — comm (годится, если vold собран без binder-пула на
-     * главном потоке). */
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     if (read_all(path, buf, sizeof(buf) - 1, &got) == 0 && got > 0) {
         buf[got] = '\0';
@@ -785,8 +604,6 @@ static pid_t find_vold(int wait_sec, char *exe, size_t exelen) {
         usleep(100 * 1000);
     }
 }
-
-/* --------------------------------------------------------- чтение/запись памяти */
 
 static int mem_read(pid_t pid, uint64_t addr, void *buf, size_t len) {
     char path[64];
@@ -826,20 +643,17 @@ static int mem_write(pid_t pid, uint64_t addr, const void *buf, size_t len) {
     return 0;
 }
 
-/* ------------------------------------------------------------------- разбор */
-
 typedef struct {
     uint64_t got_slot;
     uint64_t stub_va;
     uint32_t sym_index;
     int      reloc_index;
     int      call_sites;
-    int      plt_delta;          /* C / 16, посчитан из раскладки .plt */
+    int      plt_delta;          /* C/16 derived from the .plt layout */
     bool     already_patched;
 } Resolved;
 
-/* Считает `bl`/`b` на трамплин — просто чтобы отчитаться, сколько мест в vold
- * вообще зовут этот символ. */
+/* Count `bl`/`b` targets pointing at the stub — report how many vold sites call it. */
 static int count_call_sites(Src *s, uint64_t stub_va) {
     int hits = 0;
     for (int i = 0; i < s->phnum; i++) {
@@ -859,7 +673,7 @@ static int count_call_sites(Src *s, uint64_t stub_va) {
             uint32_t op = w & 0xfc000000u;
             if (op != 0x94000000u && op != 0x14000000u) continue;
             int32_t imm = (int32_t)(w & 0x03ffffffu);
-            if (imm & 0x02000000) imm |= (int32_t)0xfc000000u;  /* знак, 26 бит */
+            if (imm & 0x02000000) imm |= (int32_t)0xfc000000u;  /* sign-extend 26 bits */
             uint64_t pc = p->p_vaddr + off;
             if ((uint64_t)((int64_t)pc + (int64_t)imm * 4) == stub_va) hits++;
         }
@@ -868,8 +682,8 @@ static int count_call_sites(Src *s, uint64_t stub_va) {
     return hits;
 }
 
-/* Взят ли адрес символа (любая релокация в .rela.dyn). Если да, патч одного
- * трамплина не покроет такое использование — об этом надо сказать вслух. */
+/* Is the symbol's address taken (any .rela.dyn reloc)? Then one patched stub won't
+ * cover that use. */
 static bool is_address_taken(Src *s, const Dyn *d, uint32_t sym_index) {
     if (!d->reladyn || !d->relasz) return false;
     size_t n = d->relasz / sizeof(Elf64_Rela);
@@ -889,8 +703,8 @@ static bool is_address_taken(Src *s, const Dyn *d, uint32_t sym_index) {
     return found;
 }
 
-/* Раскладка .plt: для каждой релокации, чей трамплин найден, величина
- * C = va - 16*i обязана быть одной и той же. Возвращает C/16 или -1. */
+/* .plt layout: for every relocation whose stub was found, C = va - 16*i must be
+ * identical. Returns C/16 or -1. */
 static int plt_delta(const Stubs *st, const Elf64_Rela *rel, size_t nrel) {
     bool have = false;
     int64_t delta = 0;
@@ -929,7 +743,7 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
     size_t nrel = 0;
     if (load_relocs(s, &d, &rel, &nrel) != 0) return EXIT_NO_RESOLVE;
 
-    /* 1. Релокация символа: её индекс и адрес GOT-слота. */
+    /* 1. The symbol's relocation: index and GOT slot. */
     for (size_t i = 0; i < nrel; i++) {
         if ((uint32_t)(rel[i].r_info & 0xffffffffu) != R_AARCH64_JUMP_SLOT)
             continue;
@@ -953,15 +767,14 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
              "покроет только вызовы", s->label, TARGET_SYM);
     }
 
-    /* 2. Все трамплины образа одним проходом. */
+    /* 2. All stubs in one pass. */
     Stubs st;
     if (collect_stubs(s, &st) != 0) {
         free(rel);
         return EXIT_NO_RESOLVE;
     }
 
-    /* 3. Раскладка .plt — по чужим парам, поэтому работает и когда
-     *    собственный ldr символа уже затёрт патчем. */
+    /* 3. .plt layout from foreign pairs — works even when the symbol's own ldr is gone. */
     r->plt_delta = plt_delta(&st, rel, nrel);
     free(rel);
     if (r->plt_delta < 0) {
@@ -969,8 +782,7 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
         return EXIT_NO_RESOLVE;
     }
 
-    /* 4. Трамплин символа: сначала прямой поиск по GOT-слоту (свежий vold),
-     *    затем — по выведенной раскладке (повторный запуск). */
+    /* 4. The stub: direct GOT-slot lookup (fresh vold), else the derived layout. */
     int hits = 0;
     uint64_t va = stubs_lookup(&st, r->got_slot, &hits);
     if (hits == 1) {
@@ -1005,19 +817,10 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
     if (want_call_sites) {
         r->call_sites = count_call_sites(s, r->stub_va);
 
-        /* Здесь проверяется ПРЕДПОСЫЛКА всего патча, а не раскладка.
-         *
-         * Патч имеет смысл ровно потому, что в vold setxattr вызывается один
-         * раз — из vold::SetDefaultAcl. Если это не так, обезвреживать символ
-         * нельзя:
-         *   - при 0 вызовов мы отчитались бы «патч поставлен», ничего не
-         *     изменив: гонка осталась бы, а журнал говорил бы, что её нет;
-         *   - при нескольких вызовах мы сломали бы заодно чужой код, который
-         *     к default-ACL отношения не имеет.
-         * Оба случая — отказ, а не «поставлю и посмотрю».
-         *
-         * На уже пропатченном vold проверка работает: `bl` в .text патч не
-         * трогает, у трамплина пропадает только `ldr`. */
+        /* The patch's PREMISE, not the layout: it only makes sense because vold calls
+         * setxattr once, from SetDefaultAcl. 0 calls would report success changing
+         * nothing; >1 would also break unrelated code — both refuse. Works on an
+         * already-patched vold: `bl` in .text is untouched, only the stub's `ldr` is gone. */
         if (r->call_sites != 1) {
             warn("%s: \"%s\" вызывается %d раз(а), а ожидался ровно один — "
                  "отказываюсь (патч рассчитан на единственный вызов из "
@@ -1030,18 +833,10 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
     return EXIT_OK;
 }
 
-/* --------------------------------------------------- самопроверка сопоставления
- *
- * Для КАЖДОЙ релокации JUMP_SLOT требует, чтобы трамплин нашёлся ровно один и
- * чтобы разным символам достались разные трамплины. Если это выполняется,
- * значит «релокация -> трамплин» разрешается однозначно, и никакой адресной
- * арифметики в стиле «rela.plt[i] -> plt + 16*(i+1)» не нужно.
- *
- * На уже пропатченном образе полной биекции быть не может: у пропатченного
- * трамплина нет `ldr`, и декодирование его не находит. Такой пропуск не
- * считается дефектом, но только если их ровно столько, сколько пропатчено, —
- * иначе это была бы настоящая дыра, замаскированная под наш патч.
- */
+/* Require exactly one stub per JUMP_SLOT relocation and distinct stubs for distinct
+ * symbols, so no arithmetic like "rela.plt[i] -> plt+16*(i+1)" is needed. On a patched
+ * image a patched stub has no `ldr` and is not decoded, so misses are tolerated only
+ * if their count equals the number we patched. */
 static int selftest(Src *s) {
     Dyn d;
     if (read_dynamic(s, &d) != 0) return EXIT_NO_RESOLVE;
@@ -1087,10 +882,6 @@ static int selftest(Src *s) {
     size_t npatched = st.npatched;
     stubs_free(&st);
 
-    /* Трамплин, несущий наш патч, по построению теряет `ldr` — декодировать
-     * его нельзя, поэтому он и попадает в «без трамплина». Это не дефект
-     * раскладки: пропатченных трамплинов ровно столько, сколько записали мы
-     * сами. Поэтому пропуск засчитывается, только если он им и объясняется. */
     bool explained = ((size_t)missing == npatched);
     bool ok = (matched + missing == (int)n) && ambiguous == 0 &&
               badtype == 0 && dupes == 0 && explained;
@@ -1100,8 +891,6 @@ static int selftest(Src *s) {
             : "НЕПОЛНОЕ");
     return ok ? EXIT_OK : EXIT_NO_RESOLVE;
 }
-
-/* --------------------------------------------------------------------- main */
 
 static void usage(void) {
     fputs("usage: vold-noacl [--wait SEC] [--pid PID] [--check] [--dry-run]\n"
@@ -1142,7 +931,6 @@ int main(int argc, char **argv) {
     char exe[4096] = {0};
 
     if (file) {
-        /* ---- офлайн: разбираем файл, ничего не пишем ---- */
         s.is_proc = false;
         s.label = file;
         s.fd = open(file, O_RDONLY | O_CLOEXEC);
@@ -1168,10 +956,9 @@ int main(int argc, char **argv) {
                      (unsigned long long)r.stub_va, r.plt_delta, r.call_sites,
                      r.already_patched ? ", УЖЕ ПРОПАТЧЕН" : "");
 
-                /* Файл не меняется никогда — писать имеет смысл только в
-                 * живой процесс. Но --check и --dry-run обязаны отвечать
-                 * одинаково и здесь, и там: иначе офлайн-проверка (в том
-                 * числе на хосте, до прошивки) врала бы про «патча нет». */
+                /* The file is never modified, so only a live process is worth writing.
+                 * But --check/--dry-run must answer identically here and there, or an
+                 * offline check would lie about "no patch". */
                 uint8_t cur[16];
                 if (src_pread(&s, r.stub_va, cur, sizeof(cur)) == 0) {
                     info("%s: сейчас в трамплине %02x %02x %02x %02x "
@@ -1224,7 +1011,6 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    /* ---- живой процесс ---- */
     pid_t pid;
     if (pid_opt > 0) {
         pid = (pid_t)pid_opt;
@@ -1239,8 +1025,7 @@ int main(int argc, char **argv) {
     }
 
     uint64_t base = 0;
-    /* exe уже заполнен опознанием (или пуст при --pid) — он же служит и
-     * фильтром, и местом для записи найденного пути. */
+    /* exe is filled by identification (or empty for --pid); it is both filter and output. */
     int lb = find_load_base(pid, exe, &base, exe, sizeof(exe));
     if (lb == -1) {
         warn("pid %d: /proc/%d/maps не читается — скорее всего нет "
@@ -1284,9 +1069,7 @@ int main(int argc, char **argv) {
          (unsigned long long)r.got_slot, (unsigned long long)r.stub_va,
          (unsigned long long)run_addr, r.plt_delta, r.call_sites);
 
-    /* Читаем весь трамплин целиком: сравнивать достаточно первых восьми байт,
-     * но разбирать надо все шестнадцать — decode_stub проверяет и `add`, и
-     * `br`. */
+    /* Read the whole stub: 8 bytes suffice to compare, but decode_stub also checks `add` and `br`. */
     uint8_t cur[16];
     if (mem_read(pid, run_addr, cur, sizeof(cur)) != 0) {
         warn("pid %d: не читается 0x%llx", (int)pid,
@@ -1310,9 +1093,7 @@ int main(int argc, char **argv) {
         return EXIT_OK;
     }
 
-    /* Перед записью убеждаемся, что в трамплине действительно то, что мы
-     * разобрали: adrp + ldr + add + br, и ldr читает именно наш GOT-слот.
-     * Иначе адрес вычислен неверно, и писать нельзя. */
+    /* Before writing, confirm the stub is adrp+ldr+add+br and its ldr reads our GOT slot. */
     uint64_t tgt = 0;
     if (!decode_stub(cur, r.stub_va, &tgt) || tgt != r.got_slot) {
         warn("в трамплине по 0x%llx не то, что ожидалось "

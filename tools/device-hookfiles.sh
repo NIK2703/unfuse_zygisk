@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Инвентаризация файлов, относящихся к Zygisk-хукам, на устройстве.
-# Ничего не меняет — только читает.
+# Inventory of Zygisk-hook files on the device. Read-only.
 
 echo "########## 1. модули /data/adb/modules ##########"
 ls -la /data/adb/modules 2>/dev/null

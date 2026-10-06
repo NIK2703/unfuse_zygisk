@@ -1,11 +1,5 @@
 #!/system/bin/sh
-# Зонд 4: проверка, что драйвер sdcardfs на этом ядре вообще монтируется,
-# и какие метки получает корень маунта.
-#
-# Безопасно: монтируем в пустой каталог в /data/local/tmp и сразу отмонтируем.
-# Ничего из живых маунтов не трогаем.
-#
-# Запуск:  su -c /data/local/tmp/probe4.sh
+# Probe 4: does sdcardfs mount at all here, and what labels does the mount root get? Mounts into an empty /data/local/tmp dir, unmounts immediately.
 
 T=/data/local/tmp/sdfstest
 

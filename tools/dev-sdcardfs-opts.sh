@@ -1,17 +1,9 @@
 #!/system/bin/sh
-#
-# dev-sdcardfs-opts.sh — что ядро показывает про sdcardfs-маунты модуля.
-#
-# Нужно, чтобы решить, можно ли проверить основной путь по факту: видно ли в
-# /proc/mounts те mask/gid, которые модуль просил у mount(2), и различаются ли
-# суперблоки у четырёх точек (/proc/self/mountinfo, поле major:minor).
-#
-# Временно ставит path=sdcardfs, снимает показания, возвращает path=raw.
-#
-# Запуск: su -c 'sh /data/local/tmp/dev-sdcardfs-opts.sh'
+# dev-sdcardfs-opts.sh — what the kernel reports for the module's sdcardfs mounts
+# (requested mask/gid visible? superblocks distinct?). Sets path=sdcardfs then back to raw.
 
-M=/data/adb/modules/sdcardfs_restore
-CONF=/data/adb/sdcardfs_restore.conf
+M=/data/adb/modules/unfuse_zygisk
+CONF=/data/adb/modules/unfuse_zygisk/unfuse_zygisk.conf
 
 echo "############ поднимаю основной путь ############"
 printf 'path=sdcardfs\n' > "$CONF"

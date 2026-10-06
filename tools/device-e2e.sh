@@ -1,19 +1,7 @@
 #!/system/bin/sh
-#
-# device-e2e.sh — сквозная проверка модуля из namespace НАСТОЯЩЕГО приложения.
-#
-# Запускается на устройстве от root. Находит живой процесс приложения, заходит в
-# его mount namespace и проверяет две вещи:
-#
-#   1. Что /storage/emulated/0 отдаёт сырое дерево, а не FUSE — то есть что
-#      подмена точки монтирования, которую делает модуль, действительно видна
-#      приложению. В корневом namespace там FUSE, поэтому сравнение обязательно.
-#
-#   2. Что правка входов libc работает на тех путях, которыми пользуется
-#      приложение (/storage/emulated/0/...), а не только на /data/media.
-#
-# Использование:  su -c sh /data/local/tmp/device-e2e.sh
-#
+# device-e2e.sh — end-to-end check from a REAL app's namespace (as root): (1)
+# /storage/emulated/0 is the raw tree, not FUSE (root namespace has FUSE, so the
+# comparison matters); (2) the libc hook works on the app's own /storage paths.
 
 T=/data/local/tmp/hookselftest
 
@@ -51,9 +39,8 @@ nsenter --mount="/proc/$PID/ns/mnt" "$T" acl /storage/emulated/0/Download
 
 echo
 echo "=== 3. Создание файла из namespace приложения, от uid приложения ==="
-# Файл создаётся процессом, который сам поставил хуки (у toybox-nsenter нет
-# --setuid, поэтому сброс прав делает сам инструмент). Режим 0600 — тот самый
-# случай, который на сыром дереве обнулял маску ACL и закрывал файл от чужих.
+# Created by the hooking process itself (toybox-nsenter lacks --setuid, so the tool
+# drops privileges). Mode 0600 zeroed the ACL mask on the raw tree, shutting others out.
 nsenter --mount="/proc/$PID/ns/mnt" "$T" writeas "$UID_APP" \
     /storage/emulated/0/Download/.e2e_appwrite 0600
 
@@ -63,14 +50,8 @@ echo "--- каким файл видит корневой namespace (снару�
 
 echo
 echo "--- доступен ли он ДРУГОМУ uid (10998 вместо $UID_APP) ---"
-#
-# ВАЖНО: проверка делается В namespace приложения, и это не придирка.
-# В корневом namespace /storage/emulated — это FUSE, и открытие обычного файла
-# посторонним uid там законно падает с EFAULT (Bad address): демон
-# MediaProvider не обслуживает uid, не принадлежащие этому пространству имён.
-# Проверено на файле, которого модуль никогда не касался, — значит к модулю это
-# отношения не имеет. Ради этого модуль и существует: в сыром дереве тот же uid
-# читает чужой файл без всяких препятствий.
+# Must run IN the app namespace: root-namespace /storage/emulated is FUSE, where a
+# foreign uid legitimately gets EFAULT; on the raw tree the same uid reads unimpeded.
 nsenter --mount="/proc/$PID/ns/mnt" "$T" readas 10998 \
     /storage/emulated/0/Download/.e2e_appwrite
 

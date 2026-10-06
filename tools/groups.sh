@@ -1,12 +1,6 @@
 #!/system/bin/sh
-#
-# groups.sh — какие группы у РЕАЛЬНЫХ процессов приложений.
-#
-# Вопрос, от которого зависит весь разбор с default-ACL /data/media/0:
-# AOSP ставит туда именованную запись для AID_MEDIA_RW (1023) и рассчитывает,
-# что приложения с доступом к внешней памяти её имеют. Наш модуль вместо 1023
-# ставит AID_EVERYBODY (9997). Если 1023 у приложений ЕСТЬ, то запись AOSP их
-# тоже покрывает, и гонка с vold куда менее страшна, чем кажется.
+# groups.sh — which groups real app processes carry. AOSP's default-ACL entry for
+# AID_MEDIA_RW (1023) covers apps that have it; our module uses 9997 instead.
 
 echo "--- группы процессов приложений (ищем 1023 и 9997) ---"
 printf '%-8s %-8s %-6s %-6s %s\n' PID UID 1023 9997 "группы"

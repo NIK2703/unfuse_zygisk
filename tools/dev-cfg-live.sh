@@ -1,18 +1,11 @@
 #!/system/bin/sh
-#
-# dev-cfg-live.sh — проверка шага 0 на живой загрузке, стадией нового кода.
-#
-# Прогоняет storage.sh из modules_update (новая сборка) в трёх сочетаниях
-# конфига и устаревшей метки и показывает, что модуль выбрал. Каждый прогон
-# реально применяет выбор, поэтому порядок подобран так, чтобы закончить на
-# path=raw — том режиме, который и нужен для осмотра альтернативного пути.
-#
-# Запуск: su -c 'sh /data/local/tmp/dev-cfg-live.sh'
+# dev-cfg-live.sh — live check of step 0 with the new build: runs storage.sh across
+# three config/legacy-marker combos; ends on path=raw for fallback inspection.
 
-M=/data/adb/modules_update/sdcardfs_restore
-CONF=/data/adb/sdcardfs_restore.conf
-LEGACY=/data/adb/sdcardfs_restore.force_raw
-LOG=/data/adb/sdcardfs_restore.log
+M=/data/adb/modules_update/unfuse_zygisk
+CONF=/data/adb/modules/unfuse_zygisk/unfuse_zygisk.conf
+LEGACY=/data/adb/unfuse_zygisk.force_raw
+LOG=/data/adb/unfuse_zygisk.log
 
 mark() { wc -l < "$LOG" 2>/dev/null || echo 0; }
 

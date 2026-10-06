@@ -1,21 +1,18 @@
 #!/system/bin/sh
-#
-# dev-boot-journal.sh — что модуль сделал за эту загрузку.
-#
-# Запуск: su -c 'sh /data/local/tmp/dev-boot-journal.sh'
+# dev-boot-journal.sh — what the module did this boot.
 
-LOG=/data/adb/sdcardfs_restore.log
-CONF=/data/adb/sdcardfs_restore.conf
-LEGACY=/data/adb/sdcardfs_restore.force_raw
+LOG=/data/adb/unfuse_zygisk.log
+CONF=/data/adb/modules/unfuse_zygisk/unfuse_zygisk.conf
+LEGACY=/data/adb/unfuse_zygisk.force_raw
 
 echo "=== uptime ==="
 uptime
 
 echo
 echo "=== какой модуль стоит (после перезагрузки) ==="
-ls -la /data/adb/modules/sdcardfs_restore/ 2>&1
+ls -la /data/adb/modules/unfuse_zygisk/ 2>&1
 echo "--- остался ли каталог modules_update ---"
-ls -d /data/adb/modules_update/sdcardfs_restore 2>&1
+ls -d /data/adb/modules_update/unfuse_zygisk 2>&1
 
 echo
 echo "=== настройка ==="

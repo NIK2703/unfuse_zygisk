@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Диагностика предпосылок sdcardfs-restore. Только чтение, ничего не меняет.
+# Prerequisites for Unfuse Zygisk. Read-only.
 
 echo "===== 1. ЯДРО И ДРАЙВЕР ====="
 echo "--- uname ---"

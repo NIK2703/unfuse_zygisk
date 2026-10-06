@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Что на самом деле лежит в /mnt/runtime/*/emulated и как оно помечено.
+# What actually lives in /mnt/runtime/*/emulated and how it is labeled.
 echo "===== getenforce ====="
 getenforce
 

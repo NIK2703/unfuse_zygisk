@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Диагностический зонд: состояние sdcardfs / FUSE на устройстве.
-# Запуск:  su -c 'sh /data/local/tmp/probe.sh'
+# Diagnostic probe: sdcardfs / FUSE state on the device.
 
 echo "===== probe: $(date) ====="
 echo "--- id ---"

@@ -1,11 +1,6 @@
-/* Стенд: бинарник, который зовёт setxattr ровно как vold — через .plt.
- *
- * Нужен, чтобы проверить vold-noacl на посторонней сборке: другой линкер,
- * другой набор символов, другое число релокаций. Собирается NDK-шным clang
- * под aarch64, в вариантах без BTI и с BTI (-mbranch-protection=bti).
- *
- * В модуль не входит.
- */
+/* Stand-in binary calling setxattr exactly like vold does — through .plt.
+ * Tests vold-noacl on a foreign build (different linker, symbols, relocations).
+ * NDK clang aarch64, with and without BTI. Not part of the module. */
 
 #include <sys/types.h>
 #include <sys/xattr.h>

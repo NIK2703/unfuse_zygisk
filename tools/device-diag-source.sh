@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Почему stat("/mnt/runtime/full/emulated") не сработал внутри preAppSpecialize.
+# Why stat("/mnt/runtime/full/emulated") failed inside preAppSpecialize.
 
 echo "########## 1. есть ли /mnt/runtime в namespace zygote ##########"
 ZY=$(pidof zygote64 2>/dev/null | awk '{print $1}')

@@ -1,8 +1,5 @@
 #!/system/bin/sh
-# Проверка sdcardfs с ПРАВИЛЬНЫМ источником (/data/media) и с проверкой
-# прав от лица приложения (uid 10123) и shell (2000).
-#
-# Всё в /data/local/tmp, после проверки снимается.
+# sdcardfs test with the correct source (/data/media); checks perms as an app (10123) and shell (2000).
 
 SRC=/data/media
 BASE=/data/local/tmp/sdtest

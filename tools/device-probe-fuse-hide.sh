@@ -1,11 +1,5 @@
 #!/system/bin/sh
-# probe-fuse-hide.sh <pid>
-# Проверяет, СКРЫВАЕТ ли слой FUSE каталог Android/data для обычного uid,
-# и что видит конкретный процесс (провайдер SAF, DocumentsUI и т.п.).
-#
-# Важно: nsenter сам личность не меняет. Чтобы получить осмысленный ответ,
-# команда выполняется через runas от имени uid процесса — иначе root
-# обходит и DAC, и проверки FUSE-демона.
+# probe-fuse-hide.sh <pid> — does FUSE hide Android/data from a normal uid? Runs via runas as the process's uid, else root bypasses DAC.
 
 PID="$1"
 [ -n "$PID" ] || { echo "usage: probe-fuse-hide.sh <pid>"; exit 2; }

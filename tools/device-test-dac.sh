@@ -1,23 +1,13 @@
 #!/system/bin/sh
-# Проверка DAC-модели sdcardfs от лица РЕАЛЬНОГО процесса приложения:
-# правильные uid/gid + дополнительные группы, как их ставит Zygote
-# (ProcessList.computeGidsForProcess): sharedAppGid, cacheAppGid,
-# userGid=9997 (AID_EVERYBODY), inet=3003.
-#
-# Маски передаются в ДЕСЯТИЧНОМ виде — ровно так, как их печатает
-# system/core/sdcard/sdcard.cpp через StringPrintf("mask=%d"):
-#   default → 0006 octal → "6"
-#   read    → 0027 octal → "23"
-#   write   → 0007 octal → "7"   (vold всегда передаёт -w)
-#   full    → 0007 octal → "7"
-#
-# Всё в /data/local/tmp, после проверки снимается.
+# sdcardfs DAC model as a REAL app process (Zygote uid/gid/groups: 9997 AID_EVERYBODY,
+# inet 3003...). Masks decimal, as sdcard.cpp prints: default 0006→"6", read 0027→"23",
+# write/full 0007→"7". All in /data/local/tmp, removed afterwards.
 
 SRC=/data/media
 BASE=/data/local/tmp/sdtest
 RUNAS=/data/local/tmp/runas
 
-# ai.qwenlm.chat.android — реально установленный пакет
+# ai.qwenlm.chat.android is a real installed package
 APPUID=10465
 APPGIDS="10465,20465,9997,3003"
 
@@ -29,7 +19,6 @@ echo "--- контроль: хелпер работает? ---"
 
 rm -rf "$BASE"; mkdir -p "$BASE"; chmod 755 "$BASE"; chmod 755 /data/local/tmp
 
-# uid/gid интересующего пакета и его каталога
 OWNPKG=ai.qwenlm.chat.android
 OTHERPKG=$(ls /data/media/0/Android/data 2>/dev/null | grep -v "^$OWNPKG$" | grep -v '^\.' | head -1)
 echo "OWNPKG=$OWNPKG  OTHERPKG=$OTHERPKG"
@@ -70,7 +59,6 @@ case_run() {
         tapp "ЧУЖОЙ Android/data ($OTHERPKG)" ls "$dst/0/Android/data/$OTHERPKG"
     fi
 
-    # уборка пробного файла
     rm -f "$dst/0/Download/.probe_$name" 2>/dev/null
 
     echo "--- SHELL uid=2000 gids=2000,9997,3003,1015 ---"

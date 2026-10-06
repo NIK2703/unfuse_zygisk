@@ -1,20 +1,10 @@
 /*
- * acl-break — стенд для проверки сторожа ACL (tools/storage-fix.c --guard).
- *
- * Воспроизводит ровно то, что делает vold::SetDefaultAcl (vold-16/Utils.cpp:142)
- * в вызове из FsCrypt.cpp:1027:
- *
- *   SetDefaultAcl(path, 02770, AID_MEDIA_RW, AID_MEDIA_RW, {AID_MEDIA_RW})
- *
- * то есть пишет default-ACL из пяти записей, где именованная запись — для
- * группы 1023 (media_rw). Именно так vold и стирает запись 9997, выставленную
- * модулем; никакого своего поведения стенд не добавляет.
- *
- * В модуль не входит и в архив не едет: это инструмент проверки, а не часть
- * решения. Собирается вручную, как acl-dump.c — см. README §6.3.
- *
- * Использование:
- *   acl-break <каталог>...   — переписать default-ACL так, как это делает vold
+ * acl-break — harness for the ACL guard (tools/storage-fix.c --guard).
+ * Reproduces vold::SetDefaultAcl (vold-16/Utils.cpp:142) as called from
+ * FsCrypt.cpp:1027: a 5-entry default ACL whose named entry is group 1023
+ * (media_rw) — exactly how vold wipes the module's 9997 entry. Test-only; build by
+ * hand like acl-dump.c (README §6.3).
+ * usage: acl-break <dir>...
  */
 
 #define _GNU_SOURCE
@@ -48,7 +38,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* mode 02770, как в FsCrypt.cpp:1027: владелец rwx, группа rwx, остальные — */
+    /* mode 02770 as in FsCrypt.cpp:1027: owner rwx, group rwx, other — */
     const uint16_t group_perm = 7;
 
     struct acl_entry e[5];

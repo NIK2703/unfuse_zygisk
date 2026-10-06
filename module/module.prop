@@ -1,6 +1,6 @@
-id=sdcardfs_restore
-name=sdcardfs Restore
-version=v3.2.1
-versionCode=32001
-author=marble
-description=Внутренняя память напрямую, без FUSE и без scoped storage — для всех приложений. Модуль делает три вещи: подкладывает источник памяти в приватный mount namespace каждого процесса, который запускает Zygote, отключает изоляцию Android/data и Android/obb, а на сыром /data/media дополнительно правит входы libc, чтобы режимы и ACL создаваемых файлов совпадали с тем, что отдавал sdcardfs. Источник выбирается на месте: sdcardfs с маской 0007 и gid 9997, а если ядро собрано без sdcardfs — сырое дерево /data/media с ACL на ту же группу 9997. Чтобы vold не перебивал эти ACL своей записью для группы 1023, в работающем vold обезвреживается setxattr: адрес трамплина выводится из таблиц самого vold, без привязки к сборке. Плюс перемаркировка корня /data/media, без которой /storage/emulated отдаёт EACCES. Каким путём идти, задаётся настройкой модуля /data/adb/sdcardfs_restore.conf (path=auto|sdcardfs|raw) — она переживает и перезагрузку, и переустановку; менять её удобно через path-mode.sh. В режиме auto приоритет у sdcardfs, но он принимается не по коду возврата mount(2), а после проверки по факту: что под точками лежит sdcardfs и что в опциях маунта стоят запрошенные mask и gid. Не прошёл — модуль уходит на сырое дерево. Требуется Zygisk/ZygiskNext.
+id=unfuse_zygisk
+name=Unfuse Zygisk
+version=v0.1
+versionCode=1
+author=NIK2703
+description=Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace and lifts Android/data and Android/obb isolation. Uses sdcardfs (mask 0007, gid 9997) when the kernel has it, otherwise raw /data/media with an ACL for group 9997. Mode is set by path=auto|sdcardfs|acl in the module's unfuse_zygisk.conf. Requires Zygisk.

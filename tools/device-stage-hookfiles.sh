@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Копирует целевые файлы хуков в /data/local/tmp/pull, чтобы их можно было
-# забрать через adb pull (который работает от shell, а не от root).
+# Stage hook files in /data/local/tmp/pull so shell (not root) can adb pull them.
 
 D=/data/local/tmp/pull
 mkdir -p "$D/zygisksu" "$D/state"
@@ -30,7 +29,7 @@ cp_one /data/adb/zygisksu/modules_info                   "$D/state/modules_info"
 cp_one /data/adb/zygisksu/znctx                          "$D/state/znctx"
 cp_one /data/adb/zygisksu/.magic                         "$D/state/magic"
 
-# карты памяти zygote64 — какие хуки реально подгружены
+# zygote64 maps — which hooks are actually loaded
 ZY=$(pidof zygote64 2>/dev/null)
 [ -n "$ZY" ] && grep -i -E 'zygisk|payload' /proc/$ZY/maps 2>/dev/null > "$D/state/zygote64.maps"
 chmod 644 "$D/state/"* 2>/dev/null

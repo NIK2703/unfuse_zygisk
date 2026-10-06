@@ -1,33 +1,18 @@
 /*
- * hookselftest.cpp — проверка правки входов libc на самом устройстве.
- *
- * Собирается как обычный динамический исполняемый файл под arm64 и запускается
- * на телефоне от root. Проверяет по порядку:
- *
- *   1. Что размеры целей, прочитанные движком из .dynsym НА УСТРОЙСТВЕ,
- *      совпадают с тем, что показал предполётный разбор копии libc на хосте
- *      (tools/verify-hook-targets.py). Это сверка двух независимых реализаций
- *      одного и того же чтения ELF.
- *
- *   2. Что байты входа libc действительно меняются на ldr x17,#8 / br x17.
- *
- *   3. Что режимы приводятся к sdcardfs-виду: 0600 -> 0660, 0700 -> 0770, и ACL
- *      получает именованную запись для группы 9997.
- *
- *   4. Что покрытие переходников через .plt работает НА САМОМ ДЕЛЕ. creat,
- *      mkstemp, mkstemps и mkdtemp сами не патчатся — они короче патча, — но
- *      обязаны получить приведённый режим, потому что их вызовы уходят через
- *      .plt на пропатченный корень. Это эмпирическая проверка того, что
- *      предполётный вывод о покрытии верен.
- *
- *   5. Что пути вне хранилища не трогаются: 0600 остаётся 0600.
- *
- *   6. Что созданное с узким режимом реально доступно ДРУГОМУ uid. Процесс
- *      сбрасывает права до прав приложения (uid 10398 с группой 9997) и пытается
- *      открыть созданное. Это и есть цель всей затеи.
- *
- * Запуск (на устройстве, от root):
- *     /data/local/tmp/hookselftest
+ * hookselftest.cpp — check the libc entry-patching on the device itself.
+ * Built as a normal arm64 dynamic executable, run as root on the phone. Checks:
+ *   1. target sizes from .dynsym ON DEVICE match the host preflight
+ *      (tools/verify-hook-targets.py) — two independent ELF readers agree;
+ *   2. entry bytes become ldr x17,#8 / br x17;
+ *   3. modes are coerced to sdcardfs form (0600->0660, 0700->0770) plus a 9997
+ *      ACL entry;
+ *   4. .plt thunk coverage works: creat, mkstemp(s), mkdtemp are not patched
+ *      (shorter than the patch) but get the coerced mode via .plt to the patched
+ *      root — empirical proof of the preflight coverage claim;
+ *   5. paths outside storage are untouched: 0600 stays 0600;
+ *   6. a narrow-mode file is really openable by ANOTHER uid: the process drops to
+ *      app rights (uid 10398, group 9997) and opens it — the whole point.
+ * Run (on device, as root): /data/local/tmp/hookselftest
  */
 
 #include <errno.h>
@@ -52,7 +37,7 @@ namespace {
 
 constexpr const char *kRoot = "/data/media/0/.hooktest";
 
-// Имена обязаны совпадать с kHooks[] в src/hook_libc.cpp.
+// Names must match kHooks[] in src/hook_libc.cpp.
 const char *const kNames[] = {
     "open", "open64", "openat", "openat64",
     "creat", "creat64", "__open_2", "__openat_2",
@@ -67,7 +52,7 @@ constexpr int kCount = static_cast<int>(sizeof(kNames) / sizeof(kNames[0]));
 int g_fail = 0;
 int g_pass = 0;
 
-// Всё созданное запоминается, чтобы убрать за собой уже после сброса прав.
+// Remember everything created so we can clean up after dropping privileges.
 char g_created[24][256];
 int g_created_n = 0;
 
@@ -155,8 +140,6 @@ mode_t mode_of(const char *path) {
     return st.st_mode & 07777;
 }
 
-// ------------------------------------------------------------------ 1
-
 void test_sizes() {
     printf("\n== 1. Размеры целей, прочитанные из .dynsym на устройстве ==\n");
 
@@ -179,8 +162,6 @@ void test_sizes() {
                sizes[i] == 0 ? "  <- патчить нельзя" : "");
     }
 }
-
-// ------------------------------------------------------------------ 2
 
 void test_patch_bytes() {
     printf("\n== 2. Байты входа до и после установки хуков ==\n");
@@ -211,8 +192,6 @@ void test_patch_bytes() {
         check(w[0] == 0x58000051u && w[1] == 0xd61f0220u, what);
     }
 }
-
-// ------------------------------------------------------------------ 3
 
 void test_modes() {
     printf("\n== 3. Приведение режимов на сыром /data/media ==\n");
@@ -246,12 +225,10 @@ void test_modes() {
     check((m3 & 0777) == 0660, "chmod(0600) не сужает режим");
 }
 
-// ------------------------------------------------------------------ 4
-
 void test_thunk_coverage() {
     printf("\n== 4. Покрытие переходников через .plt (они сами не патчатся) ==\n");
 
-    // creat — 12 байт, вплотную к open. Патчить нельзя, но режим обязан быть 0660.
+    // creat is 12 bytes, adjacent to open. Cannot be patched, but its mode must be 0660.
     const char *f1 = "/data/media/0/.hooktest/creat0600";
     const int fd = creat(f1, 0600);
     if (fd < 0) printf("      creat -> %s\n", strerror(errno));
@@ -261,7 +238,7 @@ void test_thunk_coverage() {
     printf("  creat(0600)     -> %03o\n", m1);
     check((m1 & 0777) == 0660, "creat(0600) покрыт через open@plt");
 
-    // mkstemp (16 байт) и mkstemps (12) идут в mktemp_internal -> open@plt.
+    // mkstemp (16 bytes) and mkstemps (12) go via mktemp_internal -> open@plt.
     char tmpl1[] = "/data/media/0/.hooktest/mkstempXXXXXX";
     const int fd2 = mkstemp(tmpl1);
     if (fd2 < 0) printf("      mkstemp -> %s\n", strerror(errno));
@@ -280,7 +257,7 @@ void test_thunk_coverage() {
     printf("  mkstemps()      -> %03o\n", m3);
     check((m3 & 0777) == 0660, "mkstemps() покрыт через mktemp_internal -> open@plt");
 
-    // mkdtemp — каталог: mktemp_internal -> mkdir@plt.
+    // mkdtemp is a directory: mktemp_internal -> mkdir@plt.
     char tmpl3[] = "/data/media/0/.hooktest/mkdtempXXXXXX";
     char *d = mkdtemp(tmpl3);
     if (d == nullptr) printf("      mkdtemp -> %s\n", strerror(errno));
@@ -289,8 +266,8 @@ void test_thunk_coverage() {
     printf("  mkdtemp()       -> %03o\n", m4);
     check((m4 & 0777) == 0770, "mkdtemp() покрыт через mktemp_internal -> mkdir@plt");
 
-    // rename — 28 байт, но тоже переходник на renameat2. Проверяем косвенно,
-    // через renameat2 напрямую и через rename.
+    // rename is 28 bytes but also a thunk onto renameat2; check it indirectly,
+    // through renameat2 directly and through rename.
     const char *src = "/data/media/0/.hooktest/rename_src";
     const char *dst = "/data/media/0/.hooktest/rename_dst";
     const int fd4 = open(src, O_CREAT | O_TRUNC | O_RDWR, 0660);
@@ -302,8 +279,6 @@ void test_thunk_coverage() {
     printf("  rename(в хранилище) -> %03o\n", m5);
     check((m5 & 0777) == 0660, "rename внутри хранилища сохраняет 0660");
 }
-
-// ------------------------------------------------------------------ 5
 
 void test_rename_in() {
     printf("\n== 5. rename из приватного каталога в хранилище ==\n");
@@ -336,16 +311,10 @@ void test_rename_in() {
     check(has_group_9997(dst), "rename-in дописывает ACL с группой 9997");
 }
 
-// ------------------------------------------------------------------ 6
-
-// Проверяет, что доступ не зависит от default ACL каталога.
-//
-// Так выглядит каталог, у которого vold переписал ACL: именованной записи для
-// 9997 в default ACL нет, наследовать нечего. На устройстве это не теория —
-// у /data/media/0 access ACL был с 9997, а default с 1023 (media_rw), и
-// созданный в корне хранилища файл приложениям был не виден.
-//
-// Спасает то, что хук дописывает ACL сам, а не полагается на наследование.
+// Access must not depend on the directory's default ACL: a dir whose ACL vold
+// rewrote has no named 9997 entry to inherit (/data/media/0 had 9997 in access but
+// 1023 in default, so files at the storage root were invisible). The hook survives
+// by writing the ACL itself rather than relying on inheritance.
 void test_no_inherit() {
     printf("\n== 6. Доступ, когда у каталога нет default ACL ==\n");
 
@@ -357,7 +326,7 @@ void test_no_inherit() {
     }
     remember(dir);
 
-    // Снимаем default ACL — теперь наследовать нечего.
+    // Remove the default ACL — nothing left to inherit.
     if (removexattr(dir, "system.posix_acl_default") != 0) {
         printf("      removexattr -> %s\n", strerror(errno));
     }
@@ -378,8 +347,6 @@ void test_no_inherit() {
           "хук дописал ACL с группой 9997 без наследования");
 }
 
-// ------------------------------------------------------------------ 7
-
 void test_non_storage() {
     printf("\n== 7. Гейт путей и поведение вне хранилища ==\n");
 
@@ -394,10 +361,10 @@ void test_non_storage() {
           "гейт: /sdcardfoo — НЕ хранилище");
     check(hooks_path_is_storage("/data/data/com.example/x") == 0,
           "гейт: /data/data/... — не хранилище");
-    // /storage/ — префикс по делу: под ним лежат и /storage/emulated, и карты
-    // памяти с именами вида /storage/XXXX-XXXX. Точный перечень томов знать не
-    // нужно, а лишнее совпадение безвредно: режим правится до сисколла, и на
-    // несуществующем пути он всё равно вернёт ENOENT.
+    // /storage/ is a deliberate prefix: it covers both /storage/emulated and
+    // removable volumes named /storage/XXXX-XXXX. We need not know the exact
+    // volume list — an extra match is harmless, since the mode is fixed before
+    // the syscall and a nonexistent path returns ENOENT anyway.
     check(hooks_path_is_storage("/storage/XXXX-XXXX/x") == 1,
           "гейт: /storage/<том>/... — хранилище");
     check(hooks_path_is_storage("/storagefoo") == 0,
@@ -413,11 +380,9 @@ void test_non_storage() {
     unlink(p);
 }
 
-// ------------------------------------------------------------------ 7
-
 void drop_to_app() {
-    // Так выглядит настоящий процесс приложения: свой uid и gid плюс группа
-    // 9997 (AID_EVERYBODY), которой и владеют записи ACL в хранилище.
+    // A real app process: its own uid/gid plus group 9997 (AID_EVERYBODY), which
+    // owns the storage ACL entries.
     gid_t groups[] = {9997, 10398, 20398, 50398};
     if (setgroups(4, groups) != 0) printf("  setgroups: %s\n", strerror(errno));
     if (setgid(10398) != 0) printf("  setgid: %s\n", strerror(errno));
@@ -448,8 +413,6 @@ void test_other_uid() {
     }
 }
 
-// ------------------------------------------------------------------ 9
-
 void cleanup() {
     printf("\n== 9. Уборка (уже из-под прав приложения) ==\n");
     for (int i = g_created_n - 1; i >= 0; i--) {
@@ -466,17 +429,11 @@ void cleanup() {
     else printf("  ВНИМАНИЕ: %s остался\n", kRoot);
 }
 
-// Диагностический режим: создать файл от имени ДРУГОГО uid, уже поставив хуки.
-//
-// Нужен для сквозной проверки из namespace приложения: у toybox-nsenter нет
-// --setuid, поэтому сброс прав делается здесь. Хуки ставятся ДО сброса, как в
-// настоящем процессе приложения: Zygisk вызывает postAppSpecialize уже после
-// специализации, но правка входов от uid не зависит, а нам важно, чтобы в момент
-// создания файла она была на месте.
-//
-// Смысл проверки: приложение, создающее файл с режимом 0600 на /storage/emulated,
-// должно получить 0660 с записью ACL для 9997 — иначе другой приложение его не
-// увидит. Это ровно то, ради чего затевался хук.
+// Diagnostic mode: create a file as a DIFFERENT uid with hooks already installed.
+// For end-to-end checks from an app namespace (toybox nsenter has no --setuid), we
+// drop privileges here, after installing hooks as in a real app process. An app
+// creating a 0600 file under /storage/emulated must get 0660 + a 9997 ACL entry, or
+// another app will not see it — exactly why the hook exists.
 int writeas_main(int argc, char **argv) {
     if (argc < 4) {
         printf("usage: writeas <uid> <path> [режим]\n");
@@ -491,8 +448,7 @@ int writeas_main(int argc, char **argv) {
     const int installed = hooks_install(&total);
     printf("хуки установлены: %d из %d\n", installed, total);
 
-    // Группы как у настоящего процесса приложения: 9997 (AID_EVERYBODY) плюс
-    // производные от appid.
+    // Groups like a real app process: 9997 (AID_EVERYBODY) plus appid derivatives.
     const unsigned appid = uid % 100000;
     gid_t groups[] = {9997, static_cast<gid_t>(appid),
                       static_cast<gid_t>(20000 + appid), static_cast<gid_t>(50000 + appid)};
@@ -520,8 +476,8 @@ int writeas_main(int argc, char **argv) {
     return 0;
 }
 
-// Диагностический режим: открыть файл от имени другого uid.
-// Ответ на главный вопрос: видит ли файл, созданный одним приложением, другое.
+// Diagnostic mode: open a file as another uid — answers whether a file created
+// by one app is visible to another.
 int readas_main(int argc, char **argv) {
     if (argc < 4) {
         printf("usage: readas <uid> <path>\n");
@@ -554,12 +510,10 @@ int readas_main(int argc, char **argv) {
 
 }  // namespace
 
-// Диагностический режим: какая файловая система лежит под путём.
-//
-// Нужен, чтобы из mount namespace НАСТОЯЩЕГО приложения (nsenter в его
-// /proc/<pid>/ns/mnt) убедиться, что /storage/emulated отдаёт сырое дерево, а не
-// FUSE. Это проверка работы модуля, а не хука: подмена точки монтирования — его
-// первая половина, и она должна быть видна именно из namespace приложения.
+// Diagnostic mode: which filesystem backs a path. Used from a REAL app's mount
+// namespace (nsenter into its /proc/<pid>/ns/mnt) to confirm /storage/emulated
+// serves the raw tree, not FUSE. This checks the module, not the hook: swapping
+// the mount point is its first half and must be visible from the app namespace.
 int fs_main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         struct statfs sf;
@@ -584,8 +538,8 @@ int fs_main(int argc, char **argv) {
     return 0;
 }
 
-// Диагностический режим: показать режим и оба ACL для перечисленных путей.
-// Нужен потому, что getfattr на устройстве печатает двоичный ACL пустой строкой.
+// Diagnostic mode: show the mode and both ACLs for the given paths — needed
+// because on-device getfattr prints the binary ACL as an empty string.
 int acl_main(int argc, char **argv) {
     for (int i = 2; i < argc; i++) {
         const char *path = argv[i];
@@ -646,9 +600,8 @@ int main(int argc, char **argv) {
     test_sizes();
     test_patch_bytes();
 
-    // Каталог создаётся ПОСЛЕ установки хуков — иначе он получил бы группу root,
-    // а не запись ACL для 9997, и проверка доступа из-под другого uid была бы
-    // бессмысленной.
+    // The dir is created AFTER installing hooks, else it would get group root
+    // instead of a 9997 ACL entry, making the other-uid access check meaningless.
     if (mkdir(kRoot, 0770) != 0 && errno != EEXIST) {
         printf("не создать %s: %s\n", kRoot, strerror(errno));
         return 2;

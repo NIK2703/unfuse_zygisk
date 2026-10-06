@@ -29,8 +29,8 @@ done
 sleep 6
 
 echo
-echo "===== logcat SdcardFsRestore ====="
-logcat -d -s SdcardFsRestore 2>/dev/null | tail -40
+echo "===== logcat UnfuseZygisk ====="
+logcat -d -s UnfuseZygisk 2>/dev/null | tail -40
 
 echo
 echo "===== конец ====="

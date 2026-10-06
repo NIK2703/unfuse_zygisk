@@ -1,10 +1,5 @@
 #!/system/bin/sh
-#
-# test-storage-fix.sh — проверка, что нормализация на загрузке обнуляет
-# «остальных», как это делает хук.
-#
-# До правки storage-fix сохранял бит «остальных» с диска, и файл 0664 получал
-# ACL с OTHER=4, то есть доступ в обход записи для 9997.
+# test-storage-fix.sh — verifies boot-time normalization zeroes OTHER like the hook; before the fix a 0664 file kept OTHER=4 (bypass read for 9997).
 
 SF=/data/local/tmp/storage-fix
 T=/data/local/tmp/hookselftest
@@ -13,7 +8,7 @@ D=/data/media/0/.sfixtest
 rm -rf "$D"
 mkdir -p "$D/sub"
 
-# Разные исходные режимы: важно, что у всех выставлены биты «остальных».
+# Mixed source modes; all have OTHER bits set.
 : > "$D/f664"; chmod 0664 "$D/f664"
 : > "$D/f644"; chmod 0644 "$D/f644"
 : > "$D/f600"; chmod 0600 "$D/f600"
@@ -35,7 +30,7 @@ ls -la "$D" "$D/sub" | grep -E 'f664|f644|f600|f755|sub'
 
 echo
 echo "=== проверка, что чужая группа НЕ получает доступ в обход ACL ==="
-# uid 10998 состоит в 9997 — должен читать. А вот «остальные» (вне 9997) — нет.
+# uid 10998 is in 9997 (should read); outsiders (outside 9997) should not.
 "$T" readas 10998 "$D/f664"
 
 rm -rf "$D"

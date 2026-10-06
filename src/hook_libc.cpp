@@ -1,51 +1,20 @@
 /*
- * hook_libc.cpp — userspace-эмуляция того, что sdcardfs делает с режимами.
+ * hook_libc.cpp — emulate sdcardfs mode handling in userspace.
  *
- * Зачем. На сыром /data/media доступ держится на POSIX ACL с именованной
- * записью для группы 9997 (AID_EVERYBODY), которую расставляет storage-fix.
- * Но ACL — не виртуализация: ядро применяет его ровно к тому режиму, который
- * запросило приложение. Если приложение создаёт файл с режимом 0600 (или каталог
- * 0700, или делает chmod 0600), posix_acl_create_masq() обнуляет маску ACL —
- * именованная запись 9997 перестаёт действовать, и чужие приложения получают
- * EACCES. sdcardfs такого не допускает: он вообще не показывает нижний режим,
- * а синтезирует каталогам 0770, файлам 0660 с gid 9997 (mount mask=0007).
+ * Raw /data/media access uses a POSIX ACL named entry for gid 9997
+ * (AID_EVERYBODY). ACLs are not virtualisation: the kernel applies them to the
+ * requested mode, so 0600 create/chmod zeroes the mask (posix_acl_create_masq)
+ * and the entry dies -> EACCES. sdcardfs instead synthesises 0770 dirs / 0660
+ * files, gid 9997 (mask=0007). Patch bionic entry points to shape the mode
+ * pre-syscall: open/creat group rw + other cleared; mkdir also group x; chmod
+ * never narrowed; rename/link into storage adds ACL (rename skips the default
+ * ACL); mkstemp 0600 -> 0660. Only roots are patched; 8-16 byte thunks are
+ * skipped (16 bytes would clobber the next function; they reach the root via
+ * .plt). Entry patching covers loaded/later-dlopen'd/dlsym'd calls and needs no
+ * trampoline (handlers syscall directly); handlers must be reentrant (syscalls
+ * only). arm64 only.
  *
- * Что делает этот файл. Правит входные точки bionic в процессе приложения,
- * чтобы запрошенный режим приводился к «sdcardfs-виду» ещё до сисколла:
- *
- *   open/openat/creat/...   режим получает rw для группы, other обнуляется
- *   mkdir/mkdirat           то же плюс x для группы
- *   chmod/fchmod/fchmodat   то же — sdcardfs делает chmod полным no-op, здесь
- *                           режим хотя бы не сужается
- *   rename/link             объект, принесённый из приватного каталога, получает
- *                           ACL: при rename default ACL не применяется вовсе, и
- *                           файл приходит вообще без него
- *   mkstemp и родня         0600 меняется на 0660
- *
- * Патчатся не все перечисленные имена, а только «корни» — функции, которые сами
- * выполняют работу: open, openat, __open_2, __openat_2, fchmod, fchmodat,
- * mkdirat, renameat2, linkat. Остальные (creat, mkdir, chmod, link, rename,
- * renameat, mkstemp, mkostemp, mkstemps, mkostemps) в libc — переходники в
- * 8–16 байт, и записывать в них 16 байт нельзя: патч затрёт начало следующей
- * функции. Патчить их и не нужно — они переходят через .plt на корень.
- * Разбор с адресами и таблицей релокаций — в комментарии к tail_call_target().
- *
- * Почему правится вход функции, а не адрес в PLT. Вход правится один раз,
- * поэтому хук ловит и вызовы из уже загруженных библиотек, и из тех, что
- * приложение подгрузит позже, и вызовы через указатель, полученный из dlsym.
- * Трамплин не нужен: обработчик не зовёт оригинал, а делает сисколл сам —
- * поэтому нет ни копирования инструкций, ни их релокации.
- *
- * Обработчики обязаны быть реентерабельными: только сисколлы, никаких блокировок,
- * выделения памяти и stdio. Стек — фиксированные буферы.
- *
- * Только arm64. Правка входа — это запись 16 байт машинного кода, у каждой
- * архитектуры своей; на остальных ABI модуль собирается, но хуки не ставятся.
- *
- * Перед выпуском набор целей проверяется на настоящей libc с устройства:
  *   tools/verify-hook-targets.py device/libc/libc-arm64.so
- * Инструмент сверяет размеры функций с шириной патча и доказывает покрытие
- * пропущенных имён через .plt по таблице релокаций.
  */
 
 #include "hook_libc.h"
@@ -67,21 +36,18 @@
 
 #include <android/log.h>
 
-#define LOG_TAG "SdcardFsRestore"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOG_TAG "UnfuseZygisk"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
 
-// AID_EVERYBODY из android_filesystem_config.h — общая группа всех приложений
-// одного профиля; ровно её используют маунты sdcardfs read/write/full.
+// AID_EVERYBODY: shared group of all apps in a profile (sdcardfs mounts).
 constexpr uint32_t kAidEverybody = 9997;
 
-// Переходник не бывает длиннее: это перестановки аргументов плюс один переход.
-// Нужен только на arm64 (см. tail_call_target), отсюда пометка.
+// A thunk is never longer. arm64 only (see tail_call_target).
 [[maybe_unused]] constexpr unsigned kThunkMax = 32;
 
-// xattr-имена POSIX ACL
+// POSIX ACL xattr names
 constexpr const char *kAclAccess = "system.posix_acl_access";
 constexpr const char *kAclDefault = "system.posix_acl_default";
 
@@ -99,12 +65,8 @@ struct acl_entry {
     uint32_t e_id;
 };
 
-// ------------------------------------------------------------------ пути
-
-// Префиксы, под которыми живёт общее хранилище. /storage/ покрывает и
-// /storage/emulated, и /storage/self, и карту памяти; /mnt/user и /mnt/runtime —
-// то же дерево, но до бинда Zygote; /mnt/pass_through — точка AOSP для FUSE;
-// /data/media — сырой том, которым пользуются привилегированные потребители.
+// Shared storage: /storage/ (emulated/self/removable), /mnt/user and /mnt/runtime
+// (same tree pre-Zygote bind), /mnt/pass_through (AOSP FUSE), /data/media (raw).
 constexpr const char *kStoragePrefixes[] = {
     "/storage/",
     "/mnt/user/",
@@ -113,8 +75,7 @@ constexpr const char *kStoragePrefixes[] = {
     "/data/media/",
 };
 
-// /sdcard — симлинк на /storage/self/primary, и он должен совпасть целиком,
-// иначе "/sdcardfoo" ложно попадёт в хранилище.
+// /sdcard -> /storage/self/primary; whole component, so "/sdcardfoo" does not match.
 bool sdcard_prefix(const char *path) {
     static constexpr char k[] = "/sdcard";
     if (strncmp(path, k, sizeof(k) - 1) != 0) return false;
@@ -129,7 +90,7 @@ bool absolute_is_storage(const char *path) {
     return sdcard_prefix(path);
 }
 
-// "/proc/self/fd/<n>" без snprintf: обработчик должен обходиться без stdio.
+// "/proc/self/fd/<n>" without snprintf (no stdio in handlers).
 void fd_link_path(int fd, char *out, size_t len) {
     static constexpr char kPfx[] = "/proc/self/fd/";
     size_t i = 0;
@@ -145,7 +106,7 @@ void fd_link_path(int fd, char *out, size_t len) {
     out[i] = '\0';
 }
 
-// Открыт ли дескриптор на общем хранилище. Нужно для fchmod/fchmodat.
+// fd on shared storage? For fchmod/fchmodat.
 bool fd_is_storage(int fd) {
     char link[32];
     fd_link_path(fd, link, sizeof link);
@@ -161,21 +122,15 @@ bool is_storage(int dirfd, const char *path) {
     if (path[0] == '/') return absolute_is_storage(path);
     if (dirfd != AT_FDCWD) return fd_is_storage(dirfd);
 
-    // Относительный путь от текущего каталога. Приложения почти всегда работают
-    // абсолютными путями, так что сюда попадаем редко; но нативный код с chdir()
-    // существует, и ошибиться в сторону «не хранилище» здесь нельзя.
+    // Relative to cwd; rare but native chdir() exists, so never guess wrong.
     char cwd[512];
     const long n = syscall(SYS_getcwd, cwd, sizeof cwd);
     if (n <= 0) return false;
     return absolute_is_storage(cwd);
 }
 
-// ------------------------------------------------------- приведение режима
-
-// Так выглядел бы запрошенный режим на sdcardfs: права владельца сохраняются,
-// группе гарантированы rw (и x для каталогов), other обнулён — sdcardfs делает
-// это своей маской 0007. Обнуление other важно не для доступа приложений (они
-// и так в группе 9997), а для точности: на sdcardfs файл 0666 виден как 0660.
+// sdcardfs view: owner kept, group rw (dirs +x), other cleared by mask 0007
+// (0666 reads as 0660).
 mode_t as_sdcardfs_file(mode_t m) {
     return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP;
 }
@@ -184,8 +139,7 @@ mode_t as_sdcardfs_dir(mode_t m) {
     return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP | S_IXGRP;
 }
 
-// Режим приводится по типу существующего объекта: у chmod каталог и файл
-// требуют разных битов группы.
+// chmod needs different group bits for dir vs file.
 mode_t widen_existing(int dirfd, const char *path, mode_t mode, int at_flags) {
     struct stat st;
     if (fstatat(dirfd, path, &st, at_flags) == 0 && S_ISDIR(st.st_mode)) {
@@ -194,15 +148,9 @@ mode_t widen_existing(int dirfd, const char *path, mode_t mode, int at_flags) {
     return as_sdcardfs_file(mode);
 }
 
-// ---------------------------------------------------------------- ACL
-
-// Собирает пять записей ACL так же, как vold::SetDefaultAcl (vold-16/Utils.cpp:142)
-// и как tools/storage-fix.c. mode задаёт права владельца, группы и остальных;
-// именованная запись для 9997 получает права группы, и они же идут в маску —
-// иначе маска обнулила бы выданный доступ.
-//
-// OTHER обнуляется всегда: sdcardfs делает это своей маской 0007, и на sdcardfs
-// файл 0666 виден как 0660.
+// Five entries as vold::SetDefaultAcl (vold-16/Utils.cpp:142) / tools/storage-fix.c.
+// The named 9997 entry and the mask take the group perms (else the mask revokes
+// the access); OTHER is always cleared, matching sdcardfs mask 0007.
 void acl_build(uint8_t *buf, size_t *len, mode_t mode) {
     const uint16_t g = static_cast<uint16_t>((mode & S_IRWXG) >> 3);
 
@@ -232,12 +180,9 @@ int acl_write_fd(int fd, const char *name, mode_t mode) {
     return static_cast<int>(syscall(SYS_fsetxattr, fd, name, buf, len, 0));
 }
 
-// Приводит в порядок объект по открытому дескриптору: сначала режим (он же
-// задаёт маску ACL), затем ACL. Порядок важен: chmod переписывает
-// USER_OBJ/GROUP_OBJ/MASK/OTHER, поэтому ACL должен лечь последним.
-//
-// Вариант через дескриптор предпочтителен там, где дескриптор уже есть: он не
-// зависит ни от текущего каталога, ни от гонки с подменой пути.
+// Mode first (it defines the ACL mask), then ACL: chmod rewrites
+// USER_OBJ/GROUP_OBJ/MASK/OTHER, so the ACL must land last. Preferred when an fd
+// exists (no cwd/path-race dependence).
 void fix_fd(int fd) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
@@ -251,7 +196,7 @@ void fix_fd(int fd) {
     if (dir) acl_write_fd(fd, kAclDefault, want);
 }
 
-// То же по пути — для rename и link, где дескриптора нет.
+// Same by path, for rename/link (no fd).
 void fix_object(const char *path) {
     struct stat st;
     if (fstatat(AT_FDCWD, path, &st, AT_SYMLINK_NOFOLLOW) != 0) return;
@@ -266,9 +211,7 @@ void fix_object(const char *path) {
     if (dir) acl_write(path, kAclDefault, want);
 }
 
-// Каталог только что создан нами, но дескриптора у нас нет: открываем его и
-// правим через дескриптор — так не нужен ни абсолютный путь, ни /proc, и
-// относительный путь от dirfd обрабатывается сам собой.
+// New dir, no fd: open it and fix via fd (no absolute path or /proc).
 void fix_created_dir(int dirfd, const char *path) {
     const int fd = static_cast<int>(
         syscall(SYS_openat, dirfd, path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0));
@@ -277,35 +220,24 @@ void fix_created_dir(int dirfd, const char *path) {
     syscall(SYS_close, fd);
 }
 
-// Существует ли объект — нужно, чтобы отличить создание от открытия уже
-// имеющегося файла: ACL правится только первому.
+// Create vs open-existing: only a new object gets an ACL.
 bool exists_at(int dirfd, const char *path) {
     struct stat st;
     return fstatat(dirfd, path, &st, 0) == 0;
 }
 
-// ------------------------------------------------------------- обработчики
-//
-// Все обработчики заменяют оригинал целиком и делают сисколл сами. Поэтому они
-// не зависят ни от порядка правки, ни от того, попал ли вызов через PLT.
+// Handlers replace the original and syscall directly: independent of patch order
+// and of the call going through the PLT.
 
 bool needs_mode(int flags) {
     return (flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE;
 }
 
-// Общий путь для всех «открыть с созданием»: привести режим, сделать сисколл и,
-// если объект действительно появился, дописать ему ACL.
-//
-// Почему одного режима мало. Доступ чужим приложениям даёт не режим, а
-// именованная запись ACL для группы 9997. Наследуется она из default ACL
-// каталога — а default ACL вещь хрупкая: vold пересобирает /data/media/<user>,
-// Android, Android/data, Android/obb и Android/media при каждой загрузке, и
-// порядок «скрипт модуля / vold» не гарантирован. Проверено на устройстве:
-// у /data/media/0 access ACL был с 9997, а default — с 1023 (media_rw), то есть
-// созданный в корне хранилища файл наследовал 1023 и приложениям был не виден.
-//
-// Дописывание ACL здесь делает гарантию локальной: что бы ни лежало в дереве,
-// созданное приложением сразу видно всем приложениям.
+// "Open with create": shape mode, syscall, ACL if new. A mode alone is not
+// enough: cross-app access needs the named 9997 ACL entry inherited from the dir
+// default ACL — fragile, since vold rebuilds /data/media/<user> and
+// Android/{data,obb,media} each boot and module/vold order is not guaranteed (on
+// device /data/media/0 default ACL was 1023, not 9997, hiding new root files).
 int open_and_fix(int dirfd, const char *path, int flags, mode_t mode) {
     const bool storage = needs_mode(flags) && is_storage(dirfd, path);
     const bool existed = storage && exists_at(dirfd, path);
@@ -328,10 +260,8 @@ extern "C" int h_creat(const char *path, mode_t mode) {
     return open_and_fix(AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode);
 }
 
-// __open_2/__openat_2 — варианты без режима, которые fortify подставляет, когда
-// режим заведомо не нужен. Если O_CREAT всё-таки пришёл (это ошибка вызывающего,
-// bionic в таком случае падает), берём безопасный 0660, а не нулевой режим:
-// нулевой обнулил бы маску ACL и сломал бы доступ.
+// Mode-less fortify variants. If O_CREAT still arrives (caller error; bionic
+// aborts), use 0660, not 0, which would zero the ACL mask.
 extern "C" int h_open_2(const char *path, int flags) {
     return open_and_fix(AT_FDCWD, path, flags, needs_mode(flags) ? 0666 : 0);
 }
@@ -375,9 +305,9 @@ extern "C" int h_fchmod(int fd, mode_t mode) {
     return static_cast<int>(syscall(SYS_fchmod, fd, mode));
 }
 
-// rename/link правятся после операции и только когда объект пришёл в хранилище
-// извне: default ACL при rename не применяется, поэтому файл 0600 из
-// /data/data/<pkg> оказался бы в /sdcard без ACL вообще.
+// rename/link fixed after the op, only when entering storage from outside:
+// rename skips the default ACL, so a 0600 file from /data/data/<pkg> would land
+// in /sdcard with no ACL.
 void fix_after_move(int dirfd, const char *dst, int src_dirfd, const char *src) {
     if (dst == nullptr) return;
     if (!is_storage(dirfd, dst)) return;
@@ -416,12 +346,9 @@ extern "C" int h_linkat(int olddirfd, const char *oldp, int newdirfd, const char
     return r;
 }
 
-// ------------------------------------------------------------- mkstemp
-//
-// mkstemp создаёт файл с 0600 — ровно тот случай, который обнуляет маску ACL.
-// Вызвать оригинал нельзя (его вход затёрт, а трамплин здесь был бы лишним
-// риском), поэтому алгоритм повторён: подстановка случайных символов в шесть
-// «X» и open(O_CREAT|O_EXCL) с повтором на EEXIST. Контракт тот же.
+// mkstemp creates 0600 — exactly what zeroes the ACL mask. The original cannot
+// be called (entry overwritten), so reimplement: fill six "X" randomly and
+// open(O_CREAT|O_EXCL), retrying on EEXIST. Same contract.
 
 constexpr char kLetters[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -429,7 +356,7 @@ uint64_t rand64() {
     uint64_t v = 0;
     if (syscall(SYS_getrandom, &v, sizeof v, 0) == static_cast<long>(sizeof v)) return v;
 
-    // getrandom недоступен — берём монотонное время и tid.
+    // getrandom unavailable — monotonic time + tid.
     struct {
         long sec;
         long nsec;
@@ -474,8 +401,7 @@ int mkstemp_impl(char *tmpl, int suffixlen, int extra_flags, mode_t mode) {
     return -1;
 }
 
-// 0600 сохраняется вне хранилища: там файл приватный по делу, и режим трогать
-// нельзя. В хранилище он всё равно был бы виден как 0660.
+// 0600 kept outside storage (private there); in storage it reads as 0660 anyway.
 mode_t mkstemp_mode(const char *tmpl) {
     return is_storage(AT_FDCWD, tmpl) ? as_sdcardfs_file(0600) : 0600;
 }
@@ -494,16 +420,11 @@ extern "C" int h_mkostemps(char *tmpl, int suffixlen, int flags) {
     return mkstemp_impl(tmpl, suffixlen, flags, mkstemp_mode(tmpl));
 }
 
-// ------------------------------------------------------------- установка
-
 #if defined(__aarch64__)
 
-// 16 байт: ldr x17, #8; br x17; .quad <обработчик>.
-//
-// Выбрана именно эта последовательность, потому что литерал читается
-// PC-относительно, а сам переход — по регистру: ни дальности, ни релокации
-// инструкций оригинала не требуется. Запись литерала идёт первой, чтобы в момент
-// появления перехода адрес обработчика уже лежал на месте.
+// 16 bytes: ldr x17,#8; br x17; .quad <handler>. Literal PC-relative, branch
+// register-indirect -> no range/instruction relocation; literal written first so
+// the handler is in place before the branch appears.
 constexpr uint32_t kLdrX17 = 0x58000051u;  // ldr x17, #8
 constexpr uint32_t kBrX17 = 0xd61f0220u;   // br  x17
 constexpr size_t kPatchSize = 16;
@@ -519,14 +440,13 @@ bool patch_entry(void *target, void *handler) {
     if (ps <= 0) return false;
     const uintptr_t page = addr & ~(static_cast<uintptr_t>(ps) - 1);
 
-    // Патч может пересечь границу страницы — тогда нужны обе.
+    // Patch may straddle a page boundary; map both pages.
     const size_t span = static_cast<size_t>(addr - page) + kPatchSize;
     const size_t mlen = (span + static_cast<size_t>(ps) - 1) & ~(static_cast<size_t>(ps) - 1);
 
-    // PROT_EXEC не снимается: отображение .text уже имеет VM_EXEC, и добавление
-    // записи не считается «созданием исполняемой памяти» (иначе SELinux потребовал
-    // бы process execmem). Запись ложится в приватную копию страницы — на диске
-    // библиотека не меняется.
+    // PROT_EXEC kept: .text already has VM_EXEC, so adding write is not creating
+    // executable memory (else SELinux needs process execmem). Write lands in the
+    // private page copy; the on-disk lib is unchanged.
     if (mprotect(reinterpret_cast<void *>(page), mlen,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         LOGE("mprotect(%p, %zu) -> %s", reinterpret_cast<void *>(page), mlen, strerror(errno));
@@ -543,54 +463,31 @@ bool patch_entry(void *target, void *handler) {
     return true;
 }
 
-// Если вход функции — «переходник» (короткое тело из перестановок аргументов и
-// одного хвостового перехода на настоящую реализацию), возвращает адрес цели
-// перехода, иначе nullptr.
+// Thunk = short body of arg shuffles + one tail branch to the real impl ->
+// return the branch target, else nullptr.
 //
-// Признак переходника — сочетание двух свойств: функция КОРОТКА и заканчивается
-// безусловным переходом. По отдельности ни одно не годится:
+// Short AND ends in an unconditional branch; neither alone suffices (a large
+// function may tail-call; a short one may be the real impl). bionic thunks
+// shuffle args first, branch last, so the first instruction proves nothing.
 //
-//   * один хвостовой b ничего не значит: большая функция вправе закончиться
-//     хвостовым вызовом (open заканчивается переходом на внутренний __openat);
-//   * одна короткость ничего не значит: короткая функция может быть настоящей
-//     реализацией, и тогда её как раз надо патчить.
+// A 12-byte thunk vs a 16-byte patch would clobber the next function, so no
+// patch: the branch goes via .plt and bionic libc lacks -Bsymbolic, so
+// intra-library calls use the GOT pointing at the already-patched entry
+// (libc-16 R_AARCH64_JUMP_SLOT: creat/creat64 -> open@plt -> open; renameat ->
+// renameat2@plt -> renameat2; mkstemps/mkostemps -> mktemp_internal -> open@plt).
 //
-// У переходников bionic перестановки аргументов стоят в НАЧАЛЕ, а переход — в
-// конце, поэтому проверять первую инструкцию бесполезно. Вот creat (12 байт):
-//
-//     84f68: mov w2, w1        ; аргументы
-//     84f6c: mov w1, #0x241
-//     84f70: b   open@plt      ; хвостовой переход
-//
-// Ровно такие функции и опасны: 12 байт, а патч — 16, и он затрёт начало open.
-// Патчить их и не нужно: переход идёт через .plt, а bionic собирает libc без
-// -Bsymbolic, поэтому внутрибиблиотечные вызовы идут через GOT, и GOT указывает
-// на ту самую точку входа, которую мы уже пропатчили. Проверено по таблице
-// релокаций libc-16 (R_AARCH64_JUMP_SLOT):
-//
-//   creat/creat64 -> open@plt       -> open      (0x84f74)
-//   renameat      -> renameat2@plt  -> renameat2 (0xe2180)
-//   mkstemps/mkostemps -> mktemp_internal -> open@plt
-//
-// Эта функция нужна дважды: по ней движок пропускает переходники (см.
-// hooks_install) и по ней же в отчёте видно, какие имена пропущены осознанно.
-//
-// Решающее условие БЕЗОПАСНОСТИ — всё равно размер: патч шириной 16 байт можно
-// писать только в функцию не короче 16 байт. Переходник длиннее патча (mkdir —
-// ровно 16 байт) патчить МОЖНО, но не нужно: вызовы к нему и так придут на
-// пропатченный корень через .plt, а лишняя правка — лишний риск. Тем же
-// условием пользуется предварительная проверка tools/verify-hook-targets.py,
-// поэтому оба инструмента называют одни и те же девять корней.
+// Safety is size: a 16-byte patch needs >=16 bytes, so a long thunk (mkdir = 16)
+// may be patched but need not be; tools/verify-hook-targets.py uses the same rule.
 void *tail_call_target(const void *fn, unsigned size) {
     if (size < 4 || size > kThunkMax) return nullptr;
 
     const uint32_t insn = static_cast<const uint32_t *>(fn)[size / 4 - 1];
 
-    // Ищем именно B (0010 0110 imm26), а не BL: вызов с возвратом в конце
-    // функции — это обычное тело, а не хвостовой переход.
+    // Match B (imm26), not BL: a call that returns is a normal body, not a tail
+    // branch.
     if ((insn & 0xfc000000u) != 0x14000000u) return nullptr;
 
-    // imm26 — смещение в инструкциях (то есть в 4 байтах), со знаком.
+    // imm26 is a signed instruction-count offset (4 bytes each).
     int32_t off = static_cast<int32_t>(insn & 0x03ffffffu);
     if ((off & 0x02000000) != 0) off -= 0x04000000;
 
@@ -617,13 +514,10 @@ struct HookDef {
     void *handler;
 };
 
-// Патчатся только корни — функции, которые сами выполняют работу. Переходники
-// (creat, mkdir, chmod, link, rename, renameat, mkstemp и родня) в таблице
-// остаются, но будут распознаны как переходники и пропущены: их вызовы идут
-// через .plt на уже пропатченный корень. Держать их в таблице, а не вычеркнуть,
-// стоит по двум причинам: на другой прошивке переходник может оказаться
-// настоящей реализацией, и тогда его полезно пропатчить; и в отчёте видно, что
-// про каждое имя решение принято осознанно.
+// Only roots are patched; thunks (creat, mkdir, chmod, link, rename, renameat,
+// mkstemp...) stay listed but are detected and skipped — their calls reach the
+// root via .plt. Listing them patches a ROM where a thunk is the real impl and
+// makes each name's fate explicit.
 const HookDef kHooks[] = {
     {"open", reinterpret_cast<void *>(h_open)},
     {"open64", reinterpret_cast<void *>(h_open)},
@@ -654,8 +548,7 @@ constexpr int kHookCount = static_cast<int>(sizeof(kHooks) / sizeof(kHooks[0]));
 State g_state[kHookCount];
 bool g_installed = false;
 
-// open64 на 64-битных платформах — тот же адрес, что open: второй раз патчить
-// нечего, помечаем как синоним.
+// open64 is the same address as open on 64-bit: alias, not re-patch.
 void *g_patched[kHookCount];
 int g_patched_n = 0;
 
@@ -679,25 +572,19 @@ int hooks_install(int *total) {
     }
     g_installed = true;
 
-    // Шаг 1: адреса. dlsym(RTLD_DEFAULT, ...) ищет в глобальной области, то есть
-    // находит именно те определения, к которым придут вызовы из приложения.
+    // Step 1: addresses (global scope, i.e. what app calls reach).
     void *fns[kHookCount];
     for (int i = 0; i < kHookCount; i++) fns[i] = dlsym(RTLD_DEFAULT, kHooks[i].name);
 
-    // Шаг 2: размеры. Без них патчить нельзя: 16 байт, записанные в 8- или
-    // 12-байтовую функцию, затрут начало следующей. На libc-16 таких целей
-    // пять, и все они — переходники, покрытые через .plt (см. tail_call_target).
+    // Step 2: sizes — 16 bytes into an 8/12-byte function clobbers the next.
     unsigned sizes[kHookCount];
     func_sizes(fns, kHookCount, sizes);
 
-    // Шаг 3: решение. Патчим только то, что не короче патча и не является
-    // переходником. Переходник тоже не короче патча может оказаться (mkdir —
-    // ровно 16 байт), и его можно было бы пропатчить, но незачем: вызовы и так
-    // придут на пропатченный корень, а лишняя правка — лишний риск.
+    // Step 3: patch only >= patch size and not a thunk (a long thunk like mkdir
+    // is patchable but pointless — its calls already reach the patched root).
+    // Only the ok count is returned; the other outcomes live in g_state, which
+    // hooks_report() prints.
     int ok = 0;
-    int thunk = 0;
-    int small = 0;
-    int unknown = 0;
     for (int i = 0; i < kHookCount; i++) {
         void *fn = fns[i];
         if (fn == nullptr) {
@@ -711,17 +598,14 @@ int hooks_install(int *total) {
         }
         if (sizes[i] == 0) {
             g_state[i] = State::Unknown;
-            unknown++;
             continue;
         }
         if (sizes[i] < kPatchSize) {
             g_state[i] = State::Small;
-            small++;
             continue;
         }
         if (tail_call_target(fn, sizes[i]) != nullptr) {
             g_state[i] = State::Thunk;
-            thunk++;
             continue;
         }
         if (patch_entry(fn, kHooks[i].handler)) {
@@ -733,9 +617,8 @@ int hooks_install(int *total) {
         }
     }
 
-    LOGI("хуки libc: установлено %d из %d (переходников %d, короче патча %d, "
-         "размер неизвестен %d)",
-         ok, kHookCount, thunk, small, unknown);
+    // No log here: the caller prints the same tally once per boot. This runs on
+    // every app launch, so a line here would flood the tag.
     return ok;
 }
 

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Диагностика: почему vold-noacl не находит базу загрузки.
+# Diagnose why vold-noacl can't find the boot base.
 T=/data/local/tmp/vold-noacl-new
 P=$(for d in /proc/[0-9]*; do
         p=${d#/proc/}

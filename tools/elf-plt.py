@@ -36,7 +36,7 @@ def decode_stub(d, off, expect_got):
         ok = False
     if w3 != 0xd61f0220:
         ok = False
-    pc = off  # file offset == VA for the first LOAD segment here
+    pc = off  # file offset == VA in the first LOAD segment
     # adrp x16, #imm
     immlo = (w0 >> 29) & 3
     immhi = (w0 >> 5) & 0x7ffff
@@ -94,7 +94,6 @@ def main():
         p = s['off'] + x
         return d[p:d.index(b'\0', p)].decode()
 
-    # --- dynamic tags -----------------------------------------------------
     dyn = sh('.dynamic')
     tags = {}
     if dyn:
@@ -109,7 +108,6 @@ def main():
           % (flags, bool(flags & DF_BIND_NOW), flags1, bool(flags1 & DF_1_NOW)))
     print('FLAGS_1 0x6ffffffb present:', 0x6ffffffb in tags)
 
-    # --- program headers: RELRO ------------------------------------------
     relro = None
     for i in range(e_phnum):
         o = e_phoff + i * e_phentsize
@@ -119,7 +117,6 @@ def main():
             relro = (p_vaddr, p_memsz)
     print('PT_GNU_RELRO:', ('VA=0x%x size=0x%x' % relro) if relro else 'none')
 
-    # --- find symbol ------------------------------------------------------
     idx = None
     for i in range(dynsym['size'] // 24):
         st_name, st_info, st_other, st_shndx, st_value, st_size = \
@@ -132,7 +129,6 @@ def main():
     if idx is None:
         raise SystemExit('symbol %r not in .dynsym' % sym)
 
-    # --- relocation -------------------------------------------------------
     slot_va = slot_idx = None
     for i in range(relaplt['size'] // 24):
         r_offset, r_info, r_addend = struct.unpack_from('<QQq', d,
@@ -157,7 +153,6 @@ def main():
           % (info['ok'], info['ldr_matches'],
              ' '.join('%08x' % w for w in info['raw'])))
 
-    # --- RELRO overlap ----------------------------------------------------
     if relro:
         lo, hi = relro[0], relro[0] + relro[1]
         inrelro = lo <= slot_va < hi
@@ -169,7 +164,6 @@ def main():
     else:
         print('  GOT slot writable (no RELRO)')
 
-    # --- call sites -------------------------------------------------------
     text = sh('.text')
     hits = []
     for off in range(text['off'], text['off'] + text['size'], 4):
@@ -183,7 +177,6 @@ def main():
     for off, kind in hits:
         print('    %s at VA=0x%x (file 0x%x)' % (kind, off, off))
 
-    # --- other relocations referencing the same symbol --------------------
     for sname in ('.rela.dyn',):
         s = sh(sname)
         if not s:

@@ -1,11 +1,5 @@
 #!/system/bin/sh
-#
-# bitness.sh — сколько процессов приложений 32-битные, а сколько 64-битные.
-#
-# Это важно для альтернативного пути: правка входов libc реализована только для
-# arm64 (src/hook_libc.cpp, ветка #else). Если 32-битные процессы на устройстве
-# есть, то на них хук не ставится, и режимы/ACL у создаваемых ими файлов
-# остаются такими, какими их сделало ядро.
+# bitness.sh — counts 32- vs 64-bit app processes; the libc hook is arm64-only, so 32-bit-created files keep kernel modes/ACL.
 
 echo "--- зиготы ---"
 ps -A -o PID,NAME | grep -i zygote

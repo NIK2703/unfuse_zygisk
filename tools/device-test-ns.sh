@@ -1,11 +1,5 @@
 #!/system/bin/sh
-# Живая проверка механизма варианта B на устройстве.
-#
-#  1. поднять sdcardfs на /mnt/runtime/*/emulated с правильными опциями
-#  2. baseline: что видит приложение БЕЗ подмены (FUSE)
-#  3. вариант B: приватный namespace + bind sdcardfs поверх /mnt/user/0/emulated
-#     + bind /mnt/user/0 -> /storage (как Zygote)
-#  4. откат
+# Live test of variant B: bring up sdcardfs; baseline FUSE; bind sdcardfs over /mnt/user/0/emulated and /mnt/user/0 -> /storage; rollback.
 
 SRC=/mnt/runtime/full/emulated
 DST=/mnt/user/0/emulated

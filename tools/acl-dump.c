@@ -1,18 +1,11 @@
 /*
- * acl-dump — печатает POSIX ACL пути в читаемом виде.
- *
- * Диагностический инструмент для проверки работы модуля. В самом модуле не
- * нужен и в архив не попадает: build.sh его не собирает, запускается он руками
- * с хоста. Штатный getfattr здесь не годится — toybox-овский печатает значение
- * как C-строку и обрывается на первом же NUL, то есть на поле версии ACL.
- *
- *   acl-dump <путь>...
- *
- * Формат строки:
- *   <путь> <access|default> <TAG> <rwx> id=<N>
- *
- * Запись с TAG=GROUP и id=9997 — та самая, которой модуль выдаёт доступ к
- * общему хранилищу; id=1023 (media_rw) в default-ACL — то, что дописывает vold.
+ * acl-dump — print a path's POSIX ACL in readable form.
+ * Diagnostic tool, not shipped (built by hand, not by build.sh). toybox getfattr
+ * prints the value as a C string and stops at the first NUL (the ACL version
+ * field), so it is useless here.
+ *   acl-dump <path>...
+ * Output: <path> <access|default> <TAG> <rwx> id=<N>; GROUP id=9997 is the module's
+ * grant, id=1023 (media_rw) in the default ACL is vold's.
  */
 
 #define _GNU_SOURCE
@@ -61,7 +54,7 @@ static void show(const char *path, const char *xattr, const char *label)
         return;
     }
 
-    /* uint32 version, дальше записи по 8 байт: u16 tag, u16 perm, u32 id */
+    /* uint32 version, then 8-byte entries: u16 tag, u16 perm, u32 id */
     for (off = 4; off + 8 <= n; off += 8) {
         uint16_t tag, perm;
         uint32_t id;

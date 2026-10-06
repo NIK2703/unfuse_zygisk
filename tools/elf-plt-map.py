@@ -93,7 +93,6 @@ def main():
             '<QQq', d, relaplt['off'] + i * 24)
         jmpslots[r_offset] = (r_info >> 32, i, r_info & 0xffffffff)
 
-    # decode every candidate entry in .plt
     by_target = {}
     nstubs = 0
     base = plt['addr']
@@ -139,7 +138,6 @@ def main():
                   '  (rela.plt[%d], dynsym shndx=%d)'
                   % (e['slot'], e['k'], e['va'], e['off'], e['reloc'],
                      e['shndx']))
-            # call sites
             text = sh('.text')
             hits = []
             for off in range(text['off'], text['off'] + text['size'], 4):
@@ -151,7 +149,6 @@ def main():
             print('  call sites in .text: %d' % len(hits))
             for off, kind in hits:
                 print('    %s VA=0x%x' % (kind, off))
-            # address-taken?
             rd = sh('.rela.dyn')
             n = 0
             if rd:

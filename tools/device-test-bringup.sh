@@ -1,9 +1,5 @@
 #!/system/bin/sh
-# Проверка: можно ли поднять sdcardfs на ШТАТНЫХ точках /mnt/runtime/*/emulated
-# ровно так, как это делает vold (EmulatedVolume::doMount).
-#
-# Тест обратимый: в конце все четыре маунта снимаются, система возвращается
-# в исходное состояние (пустые каталоги, как и было).
+# Can sdcardfs be raised on the stock /mnt/runtime/*/emulated points exactly as vold does? Reversible: all four mounts are unmounted at the end.
 
 echo "===== 0. ДО ====="
 for d in default read write full; do

@@ -1,6 +1,6 @@
 #!/system/bin/sh
-# Проверка: действительно ли конкретное приложение видит внутреннюю память через sdcardfs.
-# Использование: sh verify-app.sh <пакет>
+# Does a given app really see internal storage through sdcardfs?
+# Usage: sh verify-app.sh <package>
 
 PKG="$1"
 [ -n "$PKG" ] || { echo "укажите пакет"; exit 1; }

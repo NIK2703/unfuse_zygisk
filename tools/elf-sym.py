@@ -86,7 +86,6 @@ def main():
         if s['name']:
             by_name.setdefault(s['name'], []).append(i)
 
-    # relocation tables
     relocs = []
     for sh, kind in ((relaplt, 'JMP_SLOT'), (rela_dyn, 'GLOB_DAT')):
         if not sh:

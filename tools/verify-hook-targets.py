@@ -54,13 +54,11 @@ import subprocess
 import sys
 import tempfile
 
-# ------------------------------------------------------------------ константы
-
 LDR_X17 = 0x58000051  # ldr x17, #8
 BR_X17 = 0xD61F0220   # br  x17
 PATCH_SIZE = 16
 
-# Таблица хуков обязана совпадать с kHooks[] в src/hook_libc.cpp.
+# Must match kHooks[] in src/hook_libc.cpp.
 HOOK_NAMES = [
     "open", "open64", "openat", "openat64",
     "creat", "creat64", "__open_2", "__openat_2",
@@ -86,11 +84,7 @@ MACHINE_AARCH64 = 0xB7
 MACHINE_ARM = 0x28
 
 
-# --------------------------------------------------------------- ELF: разбор
-#
-# Свой минимальный разбор вместо pyelftools: нужен точный доступ к st_value,
-# st_size, st_info, к порядку символов в .dynsym (на него ссылаются релокации) и
-# к .rela.plt. Заодно снимается зависимость от внешнего пакета.
+# Minimal parser (no pyelftools): exact symbol fields and .dynsym order (relocations index it).
 
 class Sym:
     __slots__ = ("name", "value", "size", "info", "shndx", "bind", "type",
@@ -170,9 +164,9 @@ class Elf:
             })
 
         self.symbols = []
-        self.dynsym = []          # в порядке индексов — на него ссылаются релокации
+        self.dynsym = []          # index order — relocations reference it
         self._read_symbols()
-        self.rela_plt = {}        # адрес GOT-слота -> имя символа
+        self.rela_plt = {}        # GOT slot address -> symbol name
         self._read_rela_plt()
 
         self.plt_ranges = [(s["addr"], s["addr"] + s["size"])
@@ -230,8 +224,6 @@ class Elf:
             if sym_idx < len(self.dynsym):
                 self.rela_plt[r_offset] = self.dynsym[sym_idx].name
 
-    # ------------------------------------------------------------ утилиты
-
     def machine_name(self):
         return {MACHINE_AARCH64: "AArch64", MACHINE_ARM: "ARM",
                 0x3E: "x86-64"}.get(self.machine, "0x%x" % self.machine)
@@ -274,10 +266,7 @@ class Elf:
         return None
 
 
-# ------------------------------------------------- декодирование инструкций
-#
-# Ровно те же правила, что в src/hook_libc.cpp: маска 0x7c000000 ловит и B, и BL
-# (различаются только битом 31), а imm26 — смещение в инструкциях, со знаком.
+# Same rules as src/hook_libc.cpp: mask 0x7c000000 matches B and BL; imm26 is a signed offset.
 
 def decode_branch(insn, addr):
     if (insn & 0x7C000000) != 0x14000000:
@@ -319,23 +308,13 @@ def plt_stub_symbol(elf, stub_addr):
     if d is None:
         return None
     rn, rt, off = d
-    if rn != 16 or rt != 17:      # ожидаем adrp x16 / ldr x17
+    if rn != 16 or rt != 17:      # expect adrp x16 / ldr x17
         return None
     return elf.rela_plt.get(page + off)
 
 
-# ---------------------------------------------------------------- анализ
-#
-# Правило, по которому принимается решение о патче, намеренно простое и
-# безусловно безопасное: патчим тогда и только тогда, когда функция не короче
-# ширины патча (16 байт). Всё остальное — диагностика.
-#
-# Отдельно стоит про «переходники». Хвостовой b в конце функции сам по себе
-# ничего не значит: большая функция вправе закончиться хвостовым вызовом
-# (так, open заканчивается переходом на внутренний __openat). Признак
-# переходника — сочетание: функция КОРОТКА (не длиннее THUNK_MAX) И заканчивается
-# безусловным переходом. Только такие функции имеет смысл «разматывать» в
-# поисках корня.
+# Patch only when the function is >= PATCH_SIZE; everything else is diagnostics.
+# A thunk is short (<= THUNK_MAX) and ends in an unconditional branch — only those get unwrapped.
 
 THUNK_MAX = 32
 
@@ -409,7 +388,7 @@ def body_calls_root(elf, addr, size, roots_by_addr):
         w = elf.word(addr + off)
         if w is None:
             return None
-        if (w & 0xFC000000) != 0x94000000:      # только BL
+        if (w & 0xFC000000) != 0x94000000:      # BL only
             continue
         tgt = addr + off + ((w & 0x03FFFFFF) - 0x04000000
                             if (w & 0x02000000) else (w & 0x03FFFFFF)) * 4
@@ -446,8 +425,7 @@ def chase(elf, addr, roots_by_addr, depth=0, trail=None, seen=None):
         return "unreadable", None, trail
 
     if size > THUNK_MAX:
-        # Цепочка пришла в настоящую функцию. Дальше разматывать нечего, но
-        # проверим, не зовёт ли она корень внутри тела.
+        # Real function reached: nothing to unwind, but check for a call to a root.
         root = body_calls_root(elf, addr, size, roots_by_addr)
         if root is not None:
             return "indirect", root, trail
@@ -475,7 +453,7 @@ def chase(elf, addr, roots_by_addr, depth=0, trail=None, seen=None):
 
 def analyse(elf, arch64=True):
     """Возвращает (записи по именам, набор корней, есть ли непокрытая цель)."""
-    # Карта «следующий символ в той же секции» — запасной источник размера.
+    # "next symbol in same section" map — fallback size source.
     by_sec = {}
     for s in elf.symbols:
         if s.type in (STT_FUNC, STT_GNU_IFUNC) and s.value:
@@ -494,7 +472,6 @@ def analyse(elf, arch64=True):
                      if s.name == name and s.value
                      and s.type in (STT_FUNC, STT_GNU_IFUNC)), None)
 
-    # --- проход 1: кто патчится (не короче патча), кто пропускается
     entries = {}
     for name in HOOK_NAMES:
         s = find(name)
@@ -524,7 +501,6 @@ def analyse(elf, arch64=True):
         if e["role"] == "root" and e["sym"]:
             addr_name.setdefault(e["sym"].value, name)
 
-    # --- проход 2: классификация каждого имени + покрытие
     rows = []
     bad = False
     for name in HOOK_NAMES:
@@ -569,9 +545,7 @@ def analyse(elf, arch64=True):
             row["verdict"] = "BAD"
             bad = True
         elif e["role"] in ("short", "thunk"):
-            # Ни то, ни другое не патчится, и обоим нужен пропатченный корень,
-            # до которого вызов дойдёт сам: short — короче патча, thunk — длиннее,
-            # но всё равно переходник.
+            # Neither is patched; both rely on the call reaching a patched root on its own.
             kind, _ = classify_tail(elf, s.value, e["eff"])
             if e["role"] == "short" and kind != "thunk":
                 notes.append("короче %d байт и не переходник — патч затрёт соседнюю"
@@ -599,7 +573,6 @@ def analyse(elf, arch64=True):
 
         rows.append(_finish(row, notes))
 
-    # --- проход 3: не наезжают ли патчи друг на друга
     collisions = []
     addrs = sorted(roots_by_addr)
     for a, b in zip(addrs, addrs[1:]):
@@ -614,8 +587,6 @@ def _finish(row, notes):
     row["note"] = "; ".join(notes)
     return row
 
-
-# ---------------------------------------------------------------- дизассемблер
 
 def triple_for(elf):
     if elf.machine == MACHINE_AARCH64:
@@ -650,8 +621,7 @@ def patch_and_show(elf, rows, patch_copy):
         if off is None:
             continue
         before = bytes(data[off:off + PATCH_SIZE])
-        # Литерал пишется первым, чтобы к моменту появления перехода адрес
-        # обработчика уже лежал на месте (тот же порядок, что в patch_entry()).
+        # Literal first so the handler address is set before the branch (same order as patch_entry()).
         struct.pack_into(elf.endian + "Q", data, off + 8, addr + 8)
         struct.pack_into(elf.endian + "I", data, off + 4, BR_X17)
         struct.pack_into(elf.endian + "I", data, off + 0, LDR_X17)
@@ -664,8 +634,6 @@ def patch_and_show(elf, rows, patch_copy):
             fh.write(data)
     return patched
 
-
-# ------------------------------------------------------------------- вывод
 
 def report(path, elf, rows, roots, addr_name, collisions, bad, patched, tool,
            verbose, disasm_path=None):

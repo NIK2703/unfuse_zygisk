@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Зонд 2: почему sdcardfs не смонтирован.
-# Запуск:  su -c /data/local/tmp/probe2.sh
+# Probe 2: why sdcardfs is not mounted.
 
 echo "===== probe2: $(date) ====="
 

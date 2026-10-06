@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Зонд 3: состояние unfuse_auto, ядра и ZygiskNext.
-# Запуск:  su -c /data/local/tmp/probe3.sh
+# Probe 3: state of unfuse_auto, the kernel and ZygiskNext.
 
 echo "===== probe3: $(date) ====="
 
@@ -46,7 +45,7 @@ grep -c sdcardfs_splice_read /proc/kallsyms
 
 echo
 echo "--- наши модули уже стоят? ---"
-ls -la /data/adb/modules/sdcardfs_restore 2>&1
+ls -la /data/adb/modules/unfuse_zygisk 2>&1
 ls -la /data/adb/sdcardfs-apps.conf 2>&1
 
 echo

@@ -1,73 +1,41 @@
 /*
- * storage-fix — права на сыром дереве /data/media для ядер без sdcardfs.
+ * storage-fix — permissions on the raw /data/media tree for kernels without sdcardfs.
  *
- * Зачем. sdcardfs сам переписывает права: он берёт маску и gid из опций маунта и
- * отдаёт любой процесс из группы 9997 (AID_EVERYBODY) каталоги 0770 и файлы 0660,
- * независимо от того, что лежит на нижней ФС. Без sdcardfs ничего этого нет, а
- * дерево /data/media принадлежит 1023:1023 (media_rw) с режимами 0550/2770/0670 —
- * то есть приложения (в группах которых нет 1023) не могут даже войти в каталог.
+ * sdcardfs synthesises rights: from the mount's mask/gid it gives any process in
+ * group 9997 (AID_EVERYBODY) 0770 dirs and 0660 files regardless of the lower FS.
+ * Without it, /data/media is 1023:1023 (media_rw) with modes 0550/2770/0670, so apps
+ * (which lack 1023) cannot even enter. We place a POSIX ACL with a named entry for
+ * group 9997 — the same gid the sdcardfs read/write/full mounts use
+ * (system-core-16/sdcard/sdcard.cpp:182-206); 9997 is shared by all apps
+ * (android_filesystem_config.h:166).
  *
- * Что делает. Расставляет POSIX ACL с именованной записью для группы 9997 —
- * ровно тот же gid, который используют sdcardfs-маунты read/write/full
- * (system-core-16/sdcard/sdcard.cpp:182-206). Группа 9997 по определению общая
- * для всех приложений (system-core-16/libcutils/include/private/
- * android_filesystem_config.h:166), поэтому доступ получают все приложения.
+ * Why ACL, not chmod: a mode is system-wide; an ACL entry sits on top without
+ * disturbing MediaProvider or vold.
+ *   - vold resets owner+mode of /data/media and Android/ each boot
+ *     (fs_prepare_dir → chown+chmod); chmod rewrites only USER_OBJ/GROUP_OBJ/MASK/
+ *     OTHER and leaves named entries, so the grant survives.
+ *   - app umask 0077 would give 0600, but a dir's default ACL makes the kernel skip
+ *     umask (vfs_create() omits `mode &= ~current_umask()`; posix_acl_create()
+ *     intersects with the ACL), so an app-created file is 0660 with the inherited
+ *     9997 entry.
+ * Dirs get access + default ACL: the first opens the dir, the second is inherited by
+ * everything created inside (incl. by vold and MediaProvider).
  *
- * Почему ACL, а не chmod. Режим файла — один на всю систему, а ACL-запись
- * действует поверх него и не мешает ни MediaProvider, ни vold. Кроме того:
+ * Modes: <dir>... grant group 9997 rwx/rw recursively; --traverse <dir> r-x on the
+ * dir only (volume root: traverse, no write); --check <dir>... verify the 9997 entry
+ * (0 ok, 1 not).
  *
- *   - vold при каждой загрузке сбрасывает владельца и режим /data/media и
- *     Android/ (fs_prepare_dir → chown+chmod). chmod правит в ACL только
- *     USER_OBJ/GROUP_OBJ/MASK/OTHER и НЕ трогает именованные записи, поэтому
- *     выданный здесь доступ переживает перезагрузку и повторный chown/chmod.
- *   - umask приложений равен 0077, из-за чего новые файлы получались бы 0600.
- *     Но если у каталога есть default ACL, ядро не применяет umask вообще:
- *     vfs_create() пропускает `mode &= ~current_umask()`, а posix_acl_create()
- *     считает режим пересечением с ACL. Поэтому файл, созданный приложением,
- *     выходит 0660 с унаследованной записью для 9997 — и его сразу видят все.
- *
- * Каталогам ставится и access-, и default-ACL: первая открывает сам каталог,
- * вторая наследуется всем, что в нём создадут (в том числе vold и MediaProvider).
- *
- * ---------------------------------------------------------------------------
- * Режимы:
- *
- *   storage-fix <каталог>...          — выдать группе 9997 rwx/rw рекурсивно
- *   storage-fix --traverse <каталог>  — только r-x на сам каталог (для корня
- *                                       тома: его нужно пройти, но не писать в него)
- *   storage-fix --check <каталог>...  — проверить, что запись 9997 есть в ACL
- *                                       (код 0 — всё на месте, 1 — нет)
- *
- * ---------------------------------------------------------------------------
- * Гонка с vold.
- *
- * Одного прохода мало, и это не теория. vold пишет СВОИ default-ACL уже после
- * скриптов модуля: подготовку CE-хранилища пользователя заказывает фреймворк
- * (в post-fs-data vold делает только DE, vold-16/FsCrypt.cpp:657), а каталоги
- * пакетов создаются вообще когда угодно, вплоть до установки приложения через
- * час после загрузки.
- *
- * Каждый такой вызов — setxattr(system.posix_acl_default), а он ЗАМЕНЯЕТ ACL
- * целиком, вместе с нашей записью для 9997 (vold::SetDefaultAcl собирает ACL с
- * нуля, vold-16/Utils.cpp:142). Мест ровно три:
- *
- *   /data/media/<user>                     FsCrypt.cpp:1027  запись для 1023
- *   /data/media/<user>/Android/obb         Utils.cpp:1889    записи нет вовсе
- *   /data/media/<user>/Android/{data,obb,media}/<pkg>
- *                                          Utils.cpp:406     запись для uid пакета
- *
- * Следствие: каталог, созданный в таком месте процессом, на который хуки libc
- * не распространяются (vold, MTP, root-демон), унаследует чужую запись вместо
- * 9997 — и приложения его не увидят.
- *
- * Закрывает эту гонку не сам storage-fix, а патч vold: tools/vold-noacl.c
- * обезвреживает в работающем vold единственный вызов setxattr, из-за которого
- * vold и переписывает ACL. Тогда SetDefaultAcl возвращает OK, ничего не записав,
- * и наши ACL остаются в силе. Ставится патч из post-fs-data.sh и service.sh.
- *
- * Раньше здесь вместо патча работали два обходных пути: повторные проходы по
- * таймеру (v2.8.0) и сторож на inotify (v3.0.0). Оба убраны: патч устраняет
- * причину, а не догоняет следствие.
+ * Race with vold. vold writes its own default ACL after the module's scripts (the
+ * framework orders CE prep; post-fs-data only does DE, vold-16/FsCrypt.cpp:657, and
+ * package dirs appear at any time). Each setxattr(system.posix_acl_default) replaces
+ * the ACL wholesale, wiping our 9997 entry (vold::SetDefaultAcl builds from scratch,
+ * vold-16/Utils.cpp:142): /data/media/<user> (FsCrypt.cpp:1027, 1023 entry);
+ * .../Android/obb (Utils.cpp:1889, no entry); .../Android/{data,obb,media}/<pkg>
+ * (Utils.cpp:406, package uid entry). A dir created there by a process the libc hooks
+ * do not cover (vold, MTP, a root daemon) inherits the wrong entry and stays invisible
+ * to apps. Closed not by storage-fix but by tools/vold-noacl.c, which neutralises the
+ * one setxattr call behind vold's rewrite (SetDefaultAcl then returns OK without
+ * writing) so our ACLs hold; installed from post-fs-data.sh and service.sh.
  */
 
 #define _GNU_SOURCE
@@ -96,10 +64,10 @@
 #define ACL_MASK 0x10
 #define ACL_OTHER 0x20
 
-/* android_filesystem_config.h: общая группа всех приложений одного профиля */
+/* android_filesystem_config.h: shared group of all apps in a profile */
 #define AID_EVERYBODY 9997
 
-/* Сколько записей ACL готовы разобрать. Больше пяти не пишет ни vold, ни мы. */
+/* ACL entries we will parse; neither vold nor we write more than five. */
 #define ACL_MAX_ENTRIES 32
 
 struct acl_entry {
@@ -110,16 +78,8 @@ struct acl_entry {
 
 static unsigned long stat_dirs, stat_files, stat_skipped, stat_errors;
 
-/* ==========================================================================
- * Разбор и проверка ACL
- * ========================================================================== */
-
-/*
- * Читает ACL в массив записей.
- *   >= 0 — число записей;
- *   -1   — ошибка (errno сохранён);
- *   -2   — атрибута нет вовсе (для вызывающего это не ошибка, а «ACL не задана»).
- */
+/* Read an ACL into entries: >=0 count, -1 error (errno set), -2 no attribute
+ * (not an error for the caller — just "no ACL set"). */
 static int acl_read(const char *path, const char *name, struct acl_entry *out, size_t maxn) {
     uint8_t buf[sizeof(uint32_t) + ACL_MAX_ENTRIES * sizeof(struct acl_entry)];
 
@@ -143,11 +103,8 @@ static int acl_read(const char *path, const char *name, struct acl_entry *out, s
     return (int)n;
 }
 
-/*
- * Есть ли в ACL именованная запись для 9997 и не срезана ли она маской.
- * Маска — не формальность: именно она решает, сколько от именованной записи
- * реально достанется процессу, и на диск она попадает из режима каталога.
- */
+/* Is there a named 9997 entry, and is it not cut by the mask? The mask decides
+ * how much of the named entry a process actually gets; it comes from the dir mode. */
 static int acl_allows_everybody(const char *path, const char *name, uint16_t *perm_out) {
     struct acl_entry e[ACL_MAX_ENTRIES];
 
@@ -172,16 +129,9 @@ static int acl_allows_everybody(const char *path, const char *name, uint16_t *pe
     return 1;
 }
 
-/* ==========================================================================
- * Правка ACL
- * ========================================================================== */
-
-/*
- * Собирает ACL из пяти записей — так же, как vold::SetDefaultAcl
- * (vold-16/Utils.cpp:142). mode задаёт права владельца, группы и остальных;
- * именованная запись для 9997 получает права группы, и они же идут в маску,
- * иначе маска обнулила бы выданный доступ.
- */
+/* Build a 5-entry ACL like vold::SetDefaultAcl (vold-16/Utils.cpp:142): mode sets
+ * owner/group/other; the 9997 named entry gets group rights, which also go into
+ * the mask (otherwise the mask would null the grant). */
 static int acl_apply(const char *path, const char *name, mode_t mode) {
     struct acl_entry e[5];
     const uint16_t group_perm = (mode & S_IRWXG) >> 3;
@@ -218,32 +168,25 @@ static int acl_apply(const char *path, const char *name, mode_t mode) {
 }
 
 /*
- * Бит «остальных» (S_IRWXO) здесь СОЗНАТЕЛЬНО отбрасывается во всех трёх
- * функциях — и это не мелочь, а условие совместимости с хуком.
- *
- * Доступ к общему хранилищу выдаёт именованная запись ACL для группы 9997, а
- * не бит «остальных». Если оставить «остальных» как было на диске, то объекты,
- * поправленные на загрузке, и объекты, созданные приложением (их режим считает
- * as_sdcardfs_file/as_sdcardfs_dir в src/hook_libc.cpp, а ACL пишет acl_build с
- * ACL_OTHER=0), выглядели бы по-разному. Хуже того, «остальные» получили бы
- * доступ В ОБХОД записи для 9997 — то есть шире, чем было на Android 10, где
- * sdcardfs пускал только процессы из группы 9997.
- *
- * Ровно поэтому же вызовы ниже передают в acl_apply уже обнулённые «остальные»,
- * и `mode & S_IRWXO` внутри acl_apply даёт 0. Сама acl_apply остаётся точным
- * повтором vold::SetDefaultAcl (vold-16/Utils.cpp:142) — vold всегда зовёт её с
- * режимом 0770, где «остальные» и так нулевые.
+ * S_IRWXO (the "other" bits) is DELIBERATELY dropped in all three functions below.
+ * Access is granted by the named 9997 ACL entry, not by the other bits: keeping
+ * the on-disk other bits would make boot-fixed objects differ from app-created
+ * ones (src/hook_libc.cpp's acl_build writes ACL_OTHER=0) and would let "other"
+ * bypass the 9997 entry — wider than Android 10, where sdcardfs admitted only
+ * group 9997. That is why the calls below pass already-zeroed other bits, so
+ * `mode & S_IRWXO` in acl_apply yields 0; acl_apply itself stays an exact replica
+ * of vold::SetDefaultAcl (vold-16/Utils.cpp:142), which is always called with 0770.
  */
 
-/* Каталог: владелец сохраняется, группе — rwx. */
+/* Dir: keep owner, group gets rwx. */
 static mode_t dir_mode(mode_t m) { return (m & S_IRWXU) | S_IRWXG; }
 
-/* Файл: владельцу — как было, группе — rw, плюс x, если он был исполняемым. */
+/* File: owner as-is, group rw, plus x if it was executable. */
 static mode_t file_mode(mode_t m) {
     return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP;
 }
 
-/* Корень тома: группе только r-x — его надо пройти, но не менять. */
+/* Volume root: group r-x only — traverse but do not write. */
 static mode_t traverse_mode(mode_t m) {
     return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IXGRP;
 }
@@ -299,7 +242,7 @@ static void walk(const char *dir) {
             fprintf(stderr, "storage-fix: %s: %s\n", child, strerror(errno));
             stat_errors++;
         } else if (S_ISLNK(st.st_mode)) {
-            stat_skipped++; /* на симлинк ACL не поставить, и он не нужен */
+            stat_skipped++; /* no ACL on a symlink, and none is needed */
         } else if (S_ISDIR(st.st_mode)) {
             fix_dir(child, st.st_mode, 0);
             walk(child);
@@ -312,10 +255,6 @@ static void walk(const char *dir) {
     }
     closedir(d);
 }
-
-/* ==========================================================================
- * Режим --check
- * ========================================================================== */
 
 static void perm_str(uint16_t p, char out[4]) {
     out[0] = (p & 4) ? 'r' : '-';
@@ -352,10 +291,6 @@ static int check_paths(int argc, char **argv, int first) {
 
     return bad;
 }
-
-/* ==========================================================================
- * main
- * ========================================================================== */
 
 static int usage(const char *argv0) {
     fprintf(stderr,

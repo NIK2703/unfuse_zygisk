@@ -12,7 +12,7 @@ ksud sepolicy check "typeattribute media_userdir_file mlstrustedobject" 2>&1
 echo "rc=$?"
 echo
 echo "=== apply sepolicy.rule ==="
-ksud sepolicy apply /data/adb/modules/sdcardfs_restore/sepolicy.rule 2>&1
+ksud sepolicy apply /data/adb/modules/unfuse_zygisk/sepolicy.rule 2>&1
 echo "rc=$?"
 echo
 echo "=== готово ==="

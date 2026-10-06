@@ -1,16 +1,8 @@
 #!/system/bin/sh
-#
-# ab-probe.sh — снятие показаний A/B по гонке за default-ACL у /data/media/0.
-#
-# Запуск:  su -c 'sh /data/local/tmp/ab-probe.sh'
-#
-# Печатает ровно то, что решает спор:
-#   1) default-ACL у /data/media/0        — 9997 (патч есть) или 1023 (vold переписал);
-#   2) состояние патча в vold             — коды vold-noacl;
-#   3) наследование новым файлом          — что реально получат приложения.
+# ab-probe.sh — A/B readout of the default-ACL race at /data/media/0 (9997 patched vs 1023 rewritten by vold).
 
-M=/data/adb/modules/sdcardfs_restore
-LOG=/data/adb/sdcardfs_restore.log
+M=/data/adb/modules/unfuse_zygisk
+LOG=/data/adb/unfuse_zygisk.log
 DUMP=/data/local/tmp/acl-dump
 
 echo "=== 1. default-ACL у /data/media/0 ==="

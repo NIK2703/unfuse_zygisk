@@ -1,23 +1,11 @@
 #!/system/bin/sh
-#
-# final-verify.sh — итоговая проверка модуля на устройстве.
-#
-# Запуск:  su -c 'sh /data/local/tmp/final-verify.sh'
-#
-# Проверяет всё, что можно проверить без ожидания:
-#
-#   A. самопроверка хука libc — 28 проверок;
-#   B. сквозная проверка из namespace живого приложения (плюс самопроверка);
-#   C. обнуление «остальных» в ACL у storage-fix;
-#   D. патч vold: стоит ли, и на чём сошёлся инвариант ACL.
-#
-# Требует, чтобы на устройстве уже лежали hookselftest и device-e2e.sh:
-#   adb push out/hookselftest-arm64 /data/local/tmp/hookselftest
-#   adb push tools/device-e2e.sh    /data/local/tmp/
+# final-verify.sh — final on-device check: (A) libc hook self-test (28 checks);
+# (B) end-to-end from a live app's namespace; (C) storage-fix zeroing OTHER;
+# (D) vold patch state. Requires hookselftest and device-e2e.sh at /data/local/tmp.
 
 T=/data/local/tmp/hookselftest
-M=/data/adb/modules/sdcardfs_restore
-LOG=/data/adb/sdcardfs_restore.log
+M=/data/adb/modules/unfuse_zygisk
+LOG=/data/adb/unfuse_zygisk.log
 
 if [ ! -x "$T" ]; then
     echo "нет $T — сначала: adb push out/hookselftest-arm64 $T && adb shell chmod 755 $T"
@@ -37,8 +25,7 @@ sh /data/local/tmp/test-storage-fix.sh 2>&1 | grep -E '^/data.*OTHER|откры�
 
 echo
 echo "=== D. Патч vold ==="
-# Коды vold-noacl: 0 — патч на месте, 1 — трамплин цел (патча нет),
-# 2 — не разобрался, 3 — не записалось.
+# vold-noacl codes: 0 patched, 1 trampoline intact (no patch), 2 parse fail, 3 write fail.
 "$M/tools/vold-noacl" --check >/dev/null 2>&1
 rc=$?
 case "$rc" in

@@ -1,10 +1,10 @@
 #!/system/bin/sh
 echo "===== активные строки config ====="
-grep '^!' /data/adb/modules/sdcardfs_restore/config 2>&1
+grep '^!' /data/adb/modules/unfuse_zygisk/config 2>&1
 
 echo
 echo "===== relax в логе модуля ====="
-grep -a "relax:" /data/adb/sdcardfs_restore.log 2>&1 | tail -10
+grep -a "relax:" /data/adb/unfuse_zygisk.log 2>&1 | tail -10
 
 echo
 echo "===== права ====="
@@ -18,8 +18,8 @@ echo "===== точки sdcardfs ====="
 grep -E ' /mnt/runtime| /mnt/user/0| /storage' /proc/mounts 2>&1 | head -12
 
 echo
-echo "===== logcat SdcardFsRestore ====="
-logcat -d -s SdcardFsRestore 2>/dev/null | tail -60
+echo "===== logcat UnfuseZygisk ====="
+logcat -d -s UnfuseZygisk 2>/dev/null | tail -60
 
 echo
 echo "===== конец ====="

@@ -1,16 +1,9 @@
 /*
- * nsprobe — живая проверка механизма варианта B без установки модуля.
- *
- * Повторяет ровно то, что делает preAppSpecialize():
- *   1. unshare(CLONE_NEWNS)            — приватная копия таблицы монтирования
- *   2. make-rprivate на "/"            — чтобы ничего не утекло наружу
- *   3. bind <sdcardfs_src> -> <dst>    — подмена FUSE-ветки на sdcardfs
- *   4. bind /mnt/user/0 -> /storage    — как делает Zygote (MS_BIND|MS_REC)
- *   5. сброс привилегий до uid/gid/groups реального процесса приложения
- *   6. exec команды
- *
- * Пространство имён умирает вместе с процессом, поэтому откат не нужен.
- *
+ * nsprobe — live check of the variant-B mechanism without installing the module.
+ * Replays preAppSpecialize(): private mount namespace (make-rprivate so nothing
+ * leaks), bind sdcardfs over the FUSE branch, bind /mnt/user/0 onto /storage like
+ * Zygote, drop to app uid/gid/groups, exec. The namespace dies with the process, so
+ * no rollback is needed.
  * usage: nsprobe <sdcardfs_src> <dst> <uid> <gid> <gid,gid,...> <cmd> [args...]
  */
 
@@ -49,7 +42,7 @@ int main(int argc, char **argv) {
 
     if (unshare(CLONE_NEWNS) != 0) die("unshare(CLONE_NEWNS)");
 
-    /* Ничего не должно утекать в родительский namespace */
+    /* nothing must leak into the parent namespace */
     if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) die("make-rprivate /");
 
     if (mount(src, dst, NULL, MS_BIND | MS_REC, NULL) != 0) die("bind sdcardfs -> dst");

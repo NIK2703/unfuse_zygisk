@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Диагностика домена zygote. Пишем в файл, чтобы не терять вывод.
+# zygote-domain diagnostics; writes to a file to avoid losing output.
 OUT=/data/local/tmp/zygote-domain.txt
 : > "$OUT"
 say() { echo "$@" >> "$OUT"; }

@@ -1,7 +1,5 @@
 #!/system/bin/sh
-# Эмпирическая проверка драйвера sdcardfs на устройстве.
-# Всё делается в /data/local/tmp, после проверки маунт снимается.
-# Ничего в системе не меняется постоянно.
+# Empirical sdcardfs driver test. All in /data/local/tmp; mounts are removed after; nothing persists.
 
 SRC=/data/media/0
 BASE=/data/local/tmp/sdtest

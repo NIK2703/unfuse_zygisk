@@ -1,11 +1,7 @@
 /*
- * runas — запускает команду с заданными uid / gid / дополнительными группами.
- *
- * Нужен для корректной проверки DAC в sdcardfs: реальный процесс приложения
- * получает от Zygote набор дополнительных групп (ProcessList.computeGidsForProcess),
- * в который ВСЕГДА входит userGid = AID_EVERYBODY (9997). Команда `su <uid>`
- * такие группы не выставляет, поэтому проверка через неё даёт ложные отказы.
- *
+ * runas — run a command with given uid / gid / supplementary groups.
+ * Needed because `su <uid>` omits the extra groups Zygote always gives apps,
+ * including userGid = AID_EVERYBODY (9997), yielding false DAC denials.
  * usage: runas <uid> <gid> <gid,gid,...> <cmd> [args...]
  */
 

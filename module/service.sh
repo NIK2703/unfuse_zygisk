@@ -1,29 +1,32 @@
 #!/system/bin/sh
 #
-# service.sh — повтор подготовки после того, как vold смонтирует хранилища.
+# service.sh — repeat the preparation after vold mounts the storages.
 #
-# vold при подготовке /data/media мог вернуть ярлык media_userdir_file, поэтому
-# оба шага storage.sh повторяются уже после его старта. Шаги идемпотентны.
+# vold may have restored the media_userdir_file label while preparing
+# /data/media, so both storage.sh steps run again after it starts. They are
+# idempotent.
 #
 
 MODDIR=${MODDIR:-${0%/*}}
-LOG=/data/adb/sdcardfs_restore.log
+LOG=/data/adb/unfuse_zygisk.log
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
 sh "$MODDIR/storage.sh" service
 
-# --- патч vold: подтверждение -------------------------------------------------
+# --- vold patch: confirmation -------------------------------------------------
 #
-# Повтор: патч живёт только в памяти процесса, а на стадии post-fs-data vold
-# мог ещё не существовать. Шаг идемпотентен, поэтому повтор ничего не стоит: на
-# уже пропатченном vold утилита просто подтвердит, что патч на месте.
+# Repeated because the patch lives in process memory only, and at the
+# post-fs-data stage vold may not have existed yet. The step is idempotent, so
+# the repeat costs nothing: on an already patched vold the tool simply confirms
+# the patch is in place.
 #
-# Запасного пути «повторные проходы ACL» здесь намеренно нет. Он был нужен,
-# пока патч умел не вставать на чужой сборке vold: тогда приходилось втайне от
-# журнала догонять vold тремя проходами через 15/30/75 секунд после загрузки.
-# Теперь адрес трамплина выводится из таблиц самого vold (tools/vold-noacl.c),
-# отказываться не от чего, а молчаливые догоняющие проходы только маскировали
-# бы поломку. Если патч не встал — это видно в журнале, и это надо чинить.
+# There is deliberately no fallback of "repeated ACL passes" here. That was
+# needed while the patch could fail to install on a foreign vold build: vold had
+# to be chased with three passes at 15/30/75 seconds after boot, hidden from the
+# log. Now the trampoline address is derived from vold's own tables
+# (tools/vold-noacl.c), there is nothing to decline, and silent catch-up passes
+# would only mask a failure. If the patch does not install, the log says so, and
+# that is what needs fixing.
 #
 NOACL="$MODDIR/tools/vold-noacl"
 if [ ! -x "$NOACL" ]; then

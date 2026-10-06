@@ -1,8 +1,8 @@
 # shellcheck shell=sh
 #
-# customize.sh — вызывается установщиком Magisk/KernelSU при распаковке модуля:
-# проверяет, что сборка на месте, оставляет бинарник утилиты под свою
-# архитектуру и выставляет права.
+# customize.sh — called by the Magisk/KernelSU installer while unpacking the
+# module: checks the build is present, keeps the tool binary for this
+# architecture and sets permissions.
 #
 
 SKIPUNZIP=0
@@ -17,9 +17,8 @@ if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
     abort "! В модуле нет zygisk/$ABI.so — похоже, сборка не выполнялась (build.sh)"
 fi
 
-# В архиве лежат бинарники обеих утилит на все ABI: оставляем только свои и
-# переименовываем — под этими именами их ищут storage.sh, post-fs-data.sh и
-# service.sh.
+# The archive carries both tools for every ABI: keep only ours and rename them —
+# storage.sh, post-fs-data.sh and service.sh look for these names.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
     abort "! В модуле нет tools/$FIX — похоже, сборка не выполнялась (build.sh)"
 fi
@@ -40,29 +39,61 @@ set_perm "$MODPATH/post-fs-data.sh"    0 0 0755 2>/dev/null
 set_perm "$MODPATH/service.sh"         0 0 0755 2>/dev/null
 set_perm "$MODPATH/storage.sh"         0 0 0755 2>/dev/null
 set_perm "$MODPATH/path-mode.sh"       0 0 0755 2>/dev/null
+set_perm "$MODPATH/status.sh"          0 0 0755 2>/dev/null
 
-# --- конфиг модуля -----------------------------------------------------------
+# webroot is deliberately left alone beyond the set_perm_recursive above: the
+# loader sets its permissions and SELinux context at install time, and the
+# KernelSU docs advise against touching it by hand. Our set_perm calls change
+# owner and mode only, never the context.
+
+# Module id — so the paths below and the hints at the end point at the module
+# AFTER a reboot rather than at the install directory: $MODPATH points at
+# /data/adb/modules_update/ during install, which does not work until a reboot.
+MODID=$(sed -n 's/^id=//p' "$MODPATH/module.prop" 2>/dev/null | head -1)
+[ -n "$MODID" ] || MODID=unfuse_zygisk
+
+# --- module config -----------------------------------------------------------
 #
-# Настройка модуля (ключ path) живёт в /data/adb/sdcardfs_restore.conf, рядом с
-# журналом, а НЕ в каталоге модуля: тот при каждой установке перезаписывается
-# целиком, и настройка молча пропадала бы при обновлении. Из архива конфиг
-# копируется ровно один раз — если файла ещё нет. Поэтому режим, выставленный
-# пользователем, переживает и обновление модуля, и переустановку.
+# The setting (key path) ships inside the module and is read from there by
+# storage.sh and path-mode.sh. The module directory is rewritten whole on every
+# install, so the shipped default would wipe the user's choice: the mode is
+# carried over from the previous install, and once from the old
+# /data/adb/unfuse_zygisk.conf.
 #
-CONF=/data/adb/sdcardfs_restore.conf
-if [ -f "$MODPATH/sdcardfs_restore.conf" ] && [ ! -e "$CONF" ]; then
-    cp -f "$MODPATH/sdcardfs_restore.conf" "$CONF" 2>/dev/null \
-        && chmod 0644 "$CONF" 2>/dev/null
+CONF="$MODPATH/unfuse_zygisk.conf"
+
+# Mode found in a previous install: the module directory first, then the legacy
+# /data/adb location.
+prev_mode() {
+    for f in "/data/adb/modules/$MODID/unfuse_zygisk.conf" \
+             /data/adb/unfuse_zygisk.conf; do
+        [ -r "$f" ] || continue
+        m=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null \
+            | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
+        case "$m" in
+            auto|sdcardfs|acl) printf '%s\n' "$m"; return 0 ;;
+            raw)               printf 'acl\n';     return 0 ;;
+        esac
+    done
+    return 1
+}
+
+if [ -f "$CONF" ] && prev="$(prev_mode)"; then
+    sed -i "s|^[[:space:]]*path[[:space:]]*=.*|path=$prev|" "$CONF" 2>/dev/null
 fi
 
-# Что в итоге выбрано: значение конфига, а если его нет — auto.
+# The legacy copy is no longer read by anything.
+rm -f /data/adb/unfuse_zygisk.conf 2>/dev/null
+
+# What was chosen in the end: the config value, or auto if there is none.
 MODE=""
 if [ -r "$CONF" ]; then
     MODE=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null \
         | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
 fi
 case "$MODE" in
-    auto|sdcardfs|raw) ;;
+    auto|sdcardfs|acl) ;;
+    raw) MODE=acl ;;
     *) MODE=auto ;;
 esac
 
@@ -71,8 +102,8 @@ ui_print "  корень /storage/emulated, Android/data, Android/obb и кат�
 ui_print "  чужих пакетов — как на Android 10 и раньше."
 
 case "$MODE" in
-    raw)
-        ui_print "- Режим пути: raw — только сырое дерево /data/media с ACL на"
+    acl)
+        ui_print "- Режим пути: acl — только сырое дерево /data/media с ACL на"
         ui_print "  группу 9997 (AID_EVERYBODY); sdcardfs не поднимается."
         ;;
     sdcardfs)
@@ -89,12 +120,7 @@ case "$MODE" in
         ;;
 esac
 
-# Идентификатор модуля — чтобы подсказка указывала на путь ПОСЛЕ перезагрузки, а
-# не на каталог установки: $MODPATH на стадии установки смотрит в
-# /data/adb/modules_update/, который до перезагрузки не работает.
-MODID=$(sed -n 's/^id=//p' "$MODPATH/module.prop" 2>/dev/null | head -1)
-[ -n "$MODID" ] || MODID=sdcardfs_restore
-
-ui_print "- Настройка модуля: $CONF (ключ path). Сменить —"
-ui_print "  sh /data/adb/modules/$MODID/path-mode.sh raw|sdcardfs|auto"
+ui_print "- Режим и галочки состояния — в веб-интерфейсе модуля (WebUI в менеджере)."
+ui_print "- Сменить режим из терминала:"
+ui_print "  sh /data/adb/modules/$MODID/path-mode.sh acl|sdcardfs|auto"
 ui_print "- Отключить: создать /data/adb/modules/$MODID/disable и перезагрузиться."

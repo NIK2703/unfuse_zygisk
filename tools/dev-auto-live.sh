@@ -1,16 +1,9 @@
 #!/system/bin/sh
-#
-# dev-auto-live.sh — проверка автоматического выбора пути на живой загрузке.
-#
-# Прогоняет storage.sh из modules_update (новая сборка) в режиме auto и
-# показывает, что модуль выбрал и что при этом записал в журнал. Затем то же
-# для строгого sdcardfs.
-#
-# Запуск: su -c 'sh /data/local/tmp/dev-auto-live.sh'
+# dev-auto-live.sh — live check of auto path selection, then strict sdcardfs.
 
-M=/data/adb/modules_update/sdcardfs_restore
-CONF=/data/adb/sdcardfs_restore.conf
-LOG=/data/adb/sdcardfs_restore.log
+M=/data/adb/modules_update/unfuse_zygisk
+CONF=/data/adb/modules/unfuse_zygisk/unfuse_zygisk.conf
+LOG=/data/adb/unfuse_zygisk.log
 
 mark() { wc -l < "$LOG" 2>/dev/null || echo 0; }
 
@@ -61,9 +54,9 @@ done
 
 echo
 echo "############################################################"
-echo "# 3. возвращаю path=raw — то состояние, что было до проверки"
+echo "# 3. возвращаю path=acl — то состояние, что было до проверки"
 echo "############################################################"
-printf 'path=raw\n' > "$CONF"
+printf 'path=acl\n' > "$CONF"
 n=$(mark)
 sh "$M/storage.sh" back1 >/dev/null 2>&1
 echo "  rc=$?"

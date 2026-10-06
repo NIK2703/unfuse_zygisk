@@ -1,26 +1,16 @@
 /*
- * func_size.h — размеры функций по данным .dynsym того объекта, где они лежат.
+ * func_size.h — function sizes from the .dynsym of the object they live in.
  *
- * Нужно, чтобы не записать 16 байт поверх начала следующей функции: патчить
- * можно только то, что не короче патча. Это не теоретическая осторожность —
- * на libc-16 Android 16 четыре цели хука короче шестнадцати байт:
+ * Needed so 16 bytes never overwrite the next function's start: only functions
+ * >= patch size may be patched. On Android 16 libc-16 four hook targets are
+ * shorter (creat/creat64 12, renameat 8, mkstemps 12, mkostemps 12); all are
+ * thunks reaching the patched root via .plt, but only the sizes reveal it.
  *
- *     creat/creat64   12 байт, вплотную примыкает к open
- *     renameat         8 байт
- *     mkstemps        12 байт
- *     mkostemps       12 байт
- *
- * Запись в них 16 байт затёрла бы начало соседней функции. Хорошо ещё, что все
- * четыре — переходники, и их вызовы идут через .plt на уже пропатченный корень;
- * но узнать об этом заранее можно только из размеров.
- *
- * Проверяется на настоящей libc с устройства:
- *     tools/verify-hook-targets.py device/libc/libc-arm64.so
+ * Check: tools/verify-hook-targets.py device/libc/libc-arm64.so
  */
 
 #pragma once
 
-// Заполняет sizes[i] размером функции fns[i] в байтах; 0 — определить не
-// удалось (тогда функцию патчить нельзя). Все адреса должны принадлежать одному
-// объекту; адреса из другого объекта получают 0.
+// Fills sizes[i] with the byte size of fns[i]; 0 means unknown (do not patch).
+// All addresses must belong to one object; addresses from another object get 0.
 void func_sizes(void *const *fns, int n, unsigned *sizes);

@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Проверяем, принимает ли KernelSU наши sepolicy-правила.
+# Check whether KernelSU accepts our sepolicy rules.
 OUT=/data/local/tmp/sepolicy-check.txt
 : > "$OUT"
 say() { echo "$@" >> "$OUT"; }

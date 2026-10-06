@@ -1,17 +1,14 @@
 /*
  * aclprobe — experiment harness for the sdcardfs-free storage fallback.
- *
- * Q1: with a POSIX *default* ACL on a directory, does a process running with
- *     umask 0077 still produce files other apps can open read-write?
- *     (vold-16/FsCrypt.cpp:1023 claims it does.)
- * Q2: does a named ACL_GROUP entry for AID_EVERYBODY (9997) give every app
- *     access, given that every app carries 9997 in its supplementary groups?
- * Q3: what does it take to fix *pre-existing* entries (the tree is 0670/2770
- *     gid=1023 and apps are not in group 1023)?
+ * Q1: with a POSIX *default* ACL on a dir, does a process under umask 0077 still
+ *     create files other apps can open rw? (vold-16/FsCrypt.cpp:1023 says yes.)
+ * Q2: does a named ACL_GROUP entry for AID_EVERYBODY (9997) grant every app access,
+ *     since every app carries 9997 in its supplementary groups?
+ * Q3: what fixes *pre-existing* entries (tree is 0670/2770 gid=1023; apps are not
+ *     in group 1023)?
  * Q4: does a later chmod() destroy a named ACL entry?
- *
- * Run as root on the device. All mutations happen inside /data/media/0/.aclprobe,
- * which the program creates and removes itself.
+ * Run as root on device; all mutations are inside /data/media/0/.aclprobe, which the
+ * program creates and removes itself.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -306,8 +303,7 @@ static int run_as(enum act a, const char *path, mode_t mode, uid_t uid, gid_t gi
 
 #define S "/data/media/0/.aclprobe"
 
-/* Normalise one directory: grant named group 9997 access on the directory
- * itself (access ACL) and on everything created inside it (default ACL). */
+/* Grant named group 9997 on the dir (access ACL) and on new children (default ACL). */
 static void grant_dir(const char *path, mode_t mode) {
     write_acl(path, XATTR_ACL_ACCESS, mode, (const gid_t[]){AID_EVERYBODY}, 1);
     write_acl(path, XATTR_ACL_DEFAULT, mode, (const gid_t[]){AID_EVERYBODY}, 1);
@@ -335,8 +331,8 @@ static int cmd_verify(const char *dir) {
     return 0;
 }
 
-/* Isolate: does an access ACL written by setxattr() onto an *existing* inode
- * take effect, or is the inode's cached ACL stale? */
+/* Does an access ACL written by setxattr() onto an *existing* inode take effect,
+ * or is the inode's cached ACL stale? */
 static int cmd_dbg3(void) {
     printf("=== /data/media as app1, BEFORE ===\n");
     AS_APP(ACT_OPEN_RDWR, "/data/media", 0);
@@ -573,17 +569,12 @@ static int cmd_bind(void) {
 }
 
 /*
- * Q5: what can sdcardfs do that the raw path cannot?
- *
- * sdcardfs synthesises the *visible* mode and owner on every lookup: a file an
- * app created with 0600 still reads as 0660 to every other app, because the
- * mount's mask/gid decide what callers see, not the lower inode. The raw path
- * has no such synthesis — whatever mode the app asks for lands on disk, and the
- * kernel masks the inherited ACL by that mode (posix_acl_create_masq).
- *
- * This battery performs the same operations as one app uid and then checks what
- * a *different* app uid may do, so a raw tree and an sdcardfs mount of the same
- * tree can be compared operation by operation.
+ * Q5: what can sdcardfs do that the raw path cannot? It synthesises the *visible*
+ * mode/owner on every lookup — an app's 0600 file reads as 0660 to other apps,
+ * because the mount's mask/gid decide what callers see, not the lower inode. The
+ * raw path synthesises nothing, so the kernel masks the inherited ACL by the
+ * requested mode (posix_acl_create_masq). This battery acts as one app uid then
+ * checks a *different* uid, to compare a raw tree with an sdcardfs mount of it.
  */
 static int cmd_gap(const char *base) {
     char f[512], d[512];
@@ -648,18 +639,16 @@ static int cmd_gap(const char *base) {
     g_new_gid = APP2_GID;
     AS_APP(ACT_CHOWN, f, 0);
     g_new_uid = (uid_t)-1;
-    g_new_gid = 3003; /* группа, в которой app1 состоит */
+    g_new_gid = 3003; /* a group app1 belongs to */
     AS_APP(ACT_CHOWN, f, 0);
     stat_line(f);
     AS_APP2(ACT_OPEN_RDWR, f, 0);
 
     /*
-     * 6. Гипотеза для патча: доступ ломает не сам режим, а обнулённая ядром
-     *    маска ACL. Если ACL переписать ЗАНОВО уже после создания, именованная
-     *    запись перестаёт глушиться маской и доступ возвращается. Ровно это
-     *    делает storage-fix — и именно поэтому он лечит дерево, созданное до
-     *    него. Здесь проверяется, работает ли это для файла, созданного
-     *    приложением только что.
+     * 6. Patch hypothesis: access is broken by the kernel-zeroed ACL mask, not the
+     *    mode. Rewriting the ACL *after* creation un-mutes the named entry and
+     *    restores access — exactly what storage-fix does, hence it heals trees
+     *    created before it. Checked here on a just-created file.
      */
     printf("\n-- 6. повторное применение ACL к уже созданному (как storage-fix)\n");
     snprintf(f, sizeof(f), "%s/f0600", base);

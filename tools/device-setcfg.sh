@@ -1,5 +1,5 @@
 #!/system/bin/sh
-C=/data/adb/modules/sdcardfs_restore/config
+C=/data/adb/modules/unfuse_zygisk/config
 [ -f "$C" ] || { echo "НЕТ $C"; exit 1; }
 grep -q '^!enabled='      "$C" || echo '!enabled=1'      >> "$C"
 grep -q '^!android_dirs=' "$C" || echo '!android_dirs=raw' >> "$C"

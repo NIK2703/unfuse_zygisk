@@ -1,29 +1,21 @@
 /*
- * hook_libc.h — правка входных точек bionic в процессе приложения.
+ * hook_libc.h — patch bionic entry points in the app process.
  *
- * Ставит хуки на функции libc, создающие и меняющие объекты в общем хранилище,
- * и приводит запрошенный режим к тому виду, который показал бы sdcardfs
- * (группе rw/rwx, other обнуляется), а файлам, принесённым в хранилище откуда-то
- * извне, дописывает ACL.
- *
- * Вызывать ТОЛЬКО из postAppSpecialize: preAppSpecialize выполняется до
- * специализации процесса, и правка входов libc утекла бы в zygote (а обработчики
- * ссылаются на код модуля, который в zygote тоже есть, — то есть это была бы
- * порча libc всем последующим процессам).
+ * Shapes modes into the sdcardfs view (group rw/rwx, other cleared) and adds
+ * ACLs to objects entering storage. Call ONLY from postAppSpecialize, else the
+ * patch leaks into zygote and corrupts libc for every later process.
  */
 
 #pragma once
 
 #include <stddef.h>
 
-// Ставит хуки в текущем процессе. Возвращает число установленных;
-// в *total — сколько всего было попыток (часть символов может отсутствовать
-// в данной версии bionic и тогда пропускается). Повторный вызов — no-op.
+// Installs hooks here; returns count installed, *total = attempts (absent symbols
+// are skipped). Repeat calls are no-ops.
 int hooks_install(int *total);
 
-// Отчёт вида "open=ok open64=alias renameat2=skip ..." — для self-теста.
+// Report like "open=ok open64=alias renameat2=skip ..." — for the self-test.
 void hooks_report(char *buf, size_t len);
 
-// Относится ли путь к общему хранилищу. В модуле это внутренняя деталь,
-// наружу выставлено ради self-теста.
+// Whether a path is on shared storage. Internal detail, exposed for the self-test.
 int hooks_path_is_storage(const char *path);

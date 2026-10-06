@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Второй этап разведки: почему sdcardfs выключен и есть ли всё нужное.
+# Recon stage 2: why sdcardfs is off and whether everything needed is present.
 
 echo "===== A. /system/bin/sdcard ====="
 ls -la /system/bin/sdcard 2>&1

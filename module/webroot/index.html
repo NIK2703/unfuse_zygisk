@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ru">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Unfuse Zygisk</title>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/beercss@3.11.20/dist/cdn/beer.min.css">
+    <script type="module" src="https://cdn.jsdelivr.net/npm/beercss@3.11.20/dist/cdn/beer.min.js"></script>
+    <script src="i18n.js"></script>
+    <style>
+        @font-face {
+            font-family: "Google Sans";
+            font-style: normal;
+            font-weight: 400;
+            font-display: swap;
+            src: url(https://fonts.gstatic.com/s/googlesans/v27/4UaGrENHsxJlGDuGo1OIlL3Kwp5MKg.woff2) format("woff2");
+            unicode-range: U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116
+        }
+
+        @font-face {
+            font-family: "Google Sans";
+            font-style: normal;
+            font-weight: 400;
+            font-display: swap;
+            src: url(https://fonts.gstatic.com/s/googlesans/v27/4UaGrENHsxJlGDuGo1OIlL3Owp4.woff2) format("woff2");
+            unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD
+        }
+
+        body {
+            user-select: none;
+            font-family: "Google Sans";
+        }
+
+        /* The three toggle buttons sit flush: this is one choice out of three,
+           not three separate actions, and the default beercss gap (1rem) pulls
+           them apart. */
+        #modes {
+            gap: .25rem;
+        }
+
+        /* The button shape is identical in every state and never changes on
+           selection. beercss gives the selected button radius .5rem, and
+           left/right-round give the outer buttons different corners — so the
+           shape jumped on selection and the outer buttons looked clipped. One
+           radius is pinned for all states; colours are untouched (unselected
+           stays --surface-container, selected stays --primary). 2.5rem is the
+           stock beercss button radius. */
+        #modes button,
+        #modes button:hover,
+        #modes button:active,
+        #modes button:focus,
+        #modes button.active,
+        #modes button[disabled] {
+            border-radius: 2.5rem !important;
+        }
+
+        /* Checkmark labels must not wrap: the strings are short, and wrapping
+           breaks the even column of icons. */
+        #checks li>div {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* "Change waits for a reboot" banner, below the checkmarks. */
+        #pending_note {
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+            margin-top: 1rem;
+            padding: .75rem 1rem;
+            border-radius: .75rem;
+            background: var(--surface-container);
+            color: var(--on-surface-container);
+            font-size: .875rem;
+        }
+
+        #pending_note[hidden] {
+            display: none;
+        }
+    </style>
+    <script type="module">
+        import { exec, toast } from './kernelsu.js';
+
+        const MODDIR = '/data/adb/modules/unfuse_zygisk';
+        const MODES = ['auto', 'sdcardfs', 'acl'];
+
+        // What the checkmarks render. The sets differ because the two paths do
+        // different work: the main path has four mounts and their options, the
+        // fallback has ACLs, the vold patch and the libc patch. The keys are
+        // the ones status.sh prints.
+        const SETS = {
+            sdcardfs: ['mount_default', 'mount_read', 'mount_write', 'mount_full',
+                       'mount_opts', 'label_media'],
+            acl: ['label_media', 'acl_access', 'acl_default', 'vold_patched', 'libc_hooks']
+        };
+
+        let busy = false;
+
+        // status.sh prints one key=value per line — parse without JSON.
+        function status() {
+            return exec(`sh ${MODDIR}/status.sh`).then(({ errno, stdout }) => {
+                if (errno !== 0) throw new Error('status.sh');
+                const out = {};
+                (stdout || '').split('\n').forEach(line => {
+                    const i = line.indexOf('=');
+                    if (i > 0) out[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+                });
+                return out;
+            });
+        }
+
+        function render(s) {
+            const mode = MODES.includes(s.mode) ? s.mode : 'auto';
+            const kernel = s.kernel_sdcardfs === '1';
+
+            // The current mode is pressed; sdcardfs is disabled without kernel
+            // support.
+            modes.querySelectorAll('button').forEach(b => {
+                const m = b.dataset.mode;
+                b.classList.toggle('active', m === mode);
+                b.disabled = busy || (m === 'sdcardfs' && !kernel);
+            });
+
+            // In auto the set is whichever path the module actually settled on:
+            // auto itself promises nothing beyond choosing between the two.
+            const set = mode === 'auto'
+                ? (s.effective === 'sdcardfs' ? 'sdcardfs' : 'acl')
+                : mode;
+
+            checks.replaceChildren(...SETS[set].map(key => {
+                const ok = s[key] === '1';
+                const li = document.createElement('li');
+                const icon = document.createElement('i');
+                icon.className = ok ? 'green-text' : 'red-text';
+                icon.textContent = ok ? 'check_circle' : 'cancel';
+                const text = document.createElement('div');
+                text.className = 'max';
+                text.textContent = t(key);
+                li.append(icon, text);
+                return li;
+            }));
+
+            // The setting is written immediately; the module applies it at boot.
+            // Mounts can only be raised and ACLs placed there, and busy mount
+            // points cannot be torn down on a live system anyway. So while the
+            // selected mode is not the running one, the change waits for a
+            // reboot — and that has to be said.
+            //
+            //   sdcardfs, acl — compared against the actual path directly;
+            //   auto          — chooses no path: it means "sdcardfs first". It
+            //                   counts as unapplied only when the kernel has
+            //                   sdcardfs but we are still on the raw tree, i.e.
+            //                   the preference has not taken effect yet.
+            const pending = mode === 'auto'
+                ? (kernel && s.effective !== 'sdcardfs')
+                : (mode !== s.effective);
+            pending_note.hidden = !pending;
+        }
+
+        function load() {
+            if (busy) return;
+            status().then(render).catch(() => {
+                checks.replaceChildren();
+                pending_note.hidden = true;
+                modes.querySelectorAll('button').forEach(b => {
+                    b.classList.remove('active');
+                    b.disabled = true;
+                });
+            });
+        }
+
+        // Switching mode writes the module setting (path-mode.sh). It is not
+        // applied now: see the banner note above.
+        function setMode(mode) {
+            if (busy) return;
+            busy = true;
+            modes.querySelectorAll('button').forEach(b => b.disabled = true);
+
+            exec(`sh ${MODDIR}/path-mode.sh ${mode}`)
+                .then(({ errno }) => {
+                    if (errno !== 0) toast(t('failed'));
+                })
+                .catch(() => toast(t('failed')))
+                .finally(() => {
+                    busy = false;
+                    load();
+                });
+        }
+
+        modes.addEventListener('click', e => {
+            const b = e.target.closest('button[data-mode]');
+            if (b && !b.disabled) setMode(b.dataset.mode);
+        });
+
+        // The page lives in a WebView: after being backgrounded and coming back,
+        // state may have changed — apps started, vold rewrote the ACLs.
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) load();
+        });
+
+        pending_note.querySelector('span').textContent = t('pending');
+        load();
+    </script>
+</head>
+
+<body>
+    <main class="responsive">
+        <nav class="group" id="modes">
+            <button class="max" data-mode="auto">auto</button>
+            <button class="max" data-mode="sdcardfs">sdcardfs</button>
+            <button class="max" data-mode="acl">acl</button>
+        </nav>
+        <ul class="list" id="checks"></ul>
+        <div id="pending_note" hidden>
+            <i>info</i>
+            <span></span>
+        </div>
+    </main>
+</body>
+
+</html>

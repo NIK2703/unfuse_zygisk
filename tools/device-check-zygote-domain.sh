@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Проверка: может ли домен zygote делать unshare(CLONE_NEWNS) и mount().
-# Именно это делает наш модуль в preAppSpecialize.
+# Can the zygote domain unshare(CLONE_NEWNS) and mount()? That's what preAppSpecialize does.
 
 echo "########## 1. SELinux ##########"
 echo -n "getenforce: "; getenforce 2>/dev/null
@@ -33,7 +32,7 @@ done
 
 echo
 echo "########## 5. пробуем unshare -m из домена zygote ##########"
-# runcon может быть запрещён — это тоже результат.
+# runcon may be denied — that is also a result.
 echo -n "runcon -> zygote: "
 runcon u:r:zygote:s0 /system/bin/sh -c 'echo запущено; id -Z 2>/dev/null' 2>&1 | head -3
 

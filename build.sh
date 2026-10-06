@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 #
-# build.sh — сборка Zygisk-модуля sdcardfs-restore.
+# build.sh — build the Unfuse Zygisk module.
 #
-# Собирает три вещи:
-#   module/zygisk/<abi>.so            — сам модуль (C++, NDK, clang++);
-#   module/tools/storage-fix-<abi>    — утилита, которая расставляет ACL на сыром
-#                                       дереве (C; нужна альтернативному пути,
-#                                       когда в ядре нет sdcardfs);
-#   module/tools/vold-noacl-<abi>     — патчер vold: делает vold::SetDefaultAcl()
-#                                       пустышкой, чтобы vold не перебивал эти
-#                                       ACL своей записью для группы 1023 (C).
-# Затем пакует module/ в out/sdcardfs_restore-<version>.zip.
+# Builds three things:
+#   module/zygisk/<abi>.so          — the module itself (C++, NDK, clang++);
+#   module/tools/storage-fix-<abi>  — the tool that places ACLs on the raw tree
+#                                     (C; needed by the fallback path when the
+#                                     kernel has no sdcardfs);
+#   module/tools/vold-noacl-<abi>   — the vold patcher: turns
+#                                     vold::SetDefaultAcl() into a no-op so vold
+#                                     stops overwriting those ACLs with its own
+#                                     group 1023 entry (C).
+# Then packs module/ into out/unfuse_zygisk-<version>.zip.
 #
-# Использование:
-#   ./build.sh                  # arm64-v8a + armeabi-v7a, затем zip в out/
-#   ./build.sh arm64-v8a        # только один ABI
-#   API=30 ./build.sh           # другой android API level (по умолчанию 26)
-#   ZIP=0 ./build.sh            # не паковать zip
-#   NDK=/path/to/ndk ./build.sh # явный путь к NDK
-#   STRIP=0 ./build.sh          # не стрипать (для отладки)
+# Usage:
+#   ./build.sh                  # arm64-v8a + armeabi-v7a, then a zip in out/
+#   ./build.sh arm64-v8a        # a single ABI
+#   API=30 ./build.sh           # another android API level (default 26)
+#   ZIP=0 ./build.sh            # do not pack a zip
+#   NDK=/path/to/ndk ./build.sh # explicit NDK path
+#   STRIP=0 ./build.sh          # no stripping (debugging)
 #
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$HERE/src/sdcardfs_restore.cpp"
+SRC="$HERE/src/unfuse_zygisk.cpp"
 HOOK_SRC="$HERE/src/hook_libc.cpp"
 SIZE_SRC="$HERE/src/func_size.cpp"
 TOOLS_SRC="$HERE/tools/storage-fix.c"
@@ -39,7 +40,7 @@ DEBUG="${DEBUG:-0}"
 
 DEFAULT_ABIS=(arm64-v8a armeabi-v7a)
 
-# --------------------------------------------------------------- поиск NDK
+# --------------------------------------------------------------- NDK lookup
 find_ndk() {
     if [[ -n "${NDK:-}" && -x "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
         printf '%s\n' "$NDK"; return 0
@@ -61,11 +62,11 @@ find_ndk() {
     local r sub
     for r in "${roots[@]}"; do
         [[ -d "$r" ]] || continue
-        # сам каталог уже является NDK?
+        # is the directory itself an NDK?
         if [[ -x "$r/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
             printf '%s\n' "$r"; return 0
         fi
-        # каталог-контейнер с версиями: берём самую свежую
+        # version container directory: take the newest
         while IFS= read -r sub; do
             if [[ -x "$sub/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
                 printf '%s\n' "$sub"; return 0
@@ -75,7 +76,7 @@ find_ndk() {
     return 1
 }
 
-# --------------------------------------------------------------- утилиты
+# --------------------------------------------------------------- helpers
 die()  { printf 'ошибка: %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ok\033[0m %s\n' "$*"; }
@@ -90,12 +91,11 @@ triple_for() {
     esac
 }
 
-# abi -> имя бинарника утилиты в module/tools/.
+# abi -> utility binary name in module/tools/.
 #
-# Утилита — нативный исполняемый файл, один на архитектуру (в отличие от
-# zygisk/*.so, которые Zygisk сам выбирает по ABI). Поэтому в архиве лежат все
-# варианты, а customize.sh на устройстве оставляет нужный и переименовывает его
-# в tools/storage-fix.
+# The utility is a native executable, one per architecture (unlike the
+# zygisk/*.so, which Zygisk picks by ABI). So the archive carries every variant
+# and customize.sh keeps the right one, renaming it to tools/storage-fix.
 tool_name_for() {
     case "$1" in
         arm64-v8a)   echo "storage-fix-arm64" ;;
@@ -105,9 +105,9 @@ tool_name_for() {
     esac
 }
 
-# abi -> имя бинарника патчера vold в module/tools/. По той же причине, что и у
-# storage-fix: в архиве лежат все варианты, customize.sh оставляет нужный и
-# переименовывает его в tools/vold-noacl.
+# abi -> vold patcher binary name in module/tools/. Same reason as storage-fix:
+# the archive carries every variant and customize.sh keeps the right one,
+# renaming it to tools/vold-noacl.
 noacl_name_for() {
     case "$1" in
         arm64-v8a)   echo "vold-noacl-arm64" ;;
@@ -138,7 +138,7 @@ mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 ABIS=("$@")
 [[ ${#ABIS[@]} -eq 0 ]] && ABIS=("${DEFAULT_ABIS[@]}")
 
-# --------------------------------------------------------------- флаги
+# --------------------------------------------------------------- flags
 COMMON=(
     -std=c++20
     -fPIC
@@ -178,10 +178,10 @@ LDFLAGS=(
     -llog
 )
 
-# Утилита линкуется как обычный бинарник Android (динамически, через bionic):
-# она запускается из post-fs-data.sh/service.sh, когда /system уже смонтирован,
-# ровно как mount(1) и chcon(1) в тех же скриптах. Статическая сборка дала бы
-# 420 КБ вместо 10 КБ и утроила бы вес архива ради ничего.
+# The utility links as a normal Android binary (dynamically, via bionic): it runs
+# from post-fs-data.sh/service.sh when /system is already mounted, just like
+# mount(1) and chcon(1) in those scripts. A static build would give 420 KB
+# instead of 10 KB and triple the archive size for nothing.
 CFLAGS=(
     -std=c11
     -Oz
@@ -192,7 +192,7 @@ CFLAGS=(
     -Wno-unused-parameter
 )
 
-# --------------------------------------------------------------- сборка
+# --------------------------------------------------------------- build
 built=()
 for abi in "${ABIS[@]}"; do
     prefix="$(triple_for "$abi")" || die "неизвестный ABI: $abi"
@@ -212,9 +212,9 @@ for abi in "${ABIS[@]}"; do
     size="$(wc -c < "$out")"
     ok "$abi: $size байт"
 
-    # Точка входа обязана быть экспортирована и немагленная.
-    # zygisk_companion_entry не обязателен: модулю он не нужен (компаньон
-    # существует только для чтения конфига из недоступных zygote мест).
+    # The entry point must be exported and unmangled. zygisk_companion_entry is
+    # optional: the module does not need it (a companion exists only for reading
+    # config from places zygote cannot reach).
     if ! "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$out" 2>/dev/null | grep -qw zygisk_module_entry; then
         die "в $out отсутствует экспортируемая точка входа zygisk_module_entry"
     fi
@@ -226,7 +226,7 @@ for abi in "${ABIS[@]}"; do
 
     built+=("$out")
 
-    # --------------------------------------------- утилита альтернативного пути
+    # --------------------------------------------- fallback-path utility
     cc="$TOOLCHAIN/bin/${prefix}${API}-clang"
     [[ -x "$cc" ]] || die "нет компилятора $cc (проверьте API=$API)"
 
@@ -245,12 +245,12 @@ for abi in "${ABIS[@]}"; do
     ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
     built+=("$tout")
 
-    # ------------------------------------------------ патчер vold
+    # ------------------------------------------------ vold patcher
     #
-    # Патчер трогает только память процесса vold, поэтому ABI бинарника не
-    # обязан совпадать с ABI vold: он читает и пишет /proc/<pid>/mem, а ELF
-    # разбирает сам. Собираем под ту же архитектуру, что и storage-fix, — просто
-    # чтобы в архиве не было ничего лишнего.
+    # The patcher touches only vold's process memory, so its ABI need not match
+    # vold's: it reads and writes /proc/<pid>/mem and parses ELF itself. Built
+    # for the same architecture as storage-fix, simply so the archive holds
+    # nothing extra.
     ntool="$(noacl_name_for "$abi")" || die "нет имени патчера для $abi"
     nout="$TOOLS_DIR/$ntool"
     info "сборка $abi -> $(basename "$nout")"
@@ -271,19 +271,19 @@ done
 if [[ "$ZIP" == "1" ]]; then
     version="$(sed -n 's/^version=//p' "$HERE/module/module.prop" 2>/dev/null | head -1)"
     [[ -z "$version" ]] && version="dev"
-    zipname="sdcardfs_restore-${version}.zip"
+    zipname="unfuse_zygisk-${version}.zip"
     zippath="$OUT_DIR/$zipname"
 
-    # Все shell-скрипты модуля должны быть исполняемыми уже в архиве:
-    # customize.sh вызывается установщиком, остальные — загрузчиком модулей.
-    # Бинарники утилиты — тоже.
+    # Every module shell script must already be executable in the archive:
+    # customize.sh is invoked by the installer, the rest by the module loader.
+    # Same for the utility binaries.
     chmod 0755 "$HERE/module"/*.sh 2>/dev/null || true
     chmod 0755 "$HERE/module"/tools/* 2>/dev/null || true
 
     info "упаковка $zipname"
 
-    # Собираем через python: детерминированно, с сохранением прав, без внешнего
-    # zip и без предварительного удаления старого архива.
+    # Packed through python: deterministic, permissions preserved, no external
+    # zip and no need to delete an old archive first.
     python3 - "$HERE/module" "$zippath" <<'PYEOF'
 import os, sys, zipfile
 
@@ -301,9 +301,9 @@ with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
                 skipped.append(rel)
                 continue
             zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-            # Права берём из файловой системы, но .sh и утилиты всегда
-            # исполняемые: иначе при установке модуль может не запустить свои
-            # скрипты или не найти бинарник storage-fix.
+            # Permissions come from the filesystem, but .sh files and the tools
+            # are always executable: otherwise the module may fail to run its
+            # scripts or to find the storage-fix binary on install.
             mode = os.stat(full).st_mode & 0o7777
             if rel.endswith('.sh') or rel.startswith('tools/'):
                 mode |= 0o111

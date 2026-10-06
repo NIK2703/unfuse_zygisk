@@ -1,7 +1,5 @@
 #!/system/bin/sh
-# Внутренний скрипт: выполняется от лица процесса приложения
-# (uid/gid/группы как у реального приложения). Печатает то, что видно
-# приложению в /storage/emulated/0.
+# Runs as an app process (its uid/gid/groups); prints what the app sees in /storage/emulated/0.
 
 echo "id: $(id)"
 echo "mounts:"

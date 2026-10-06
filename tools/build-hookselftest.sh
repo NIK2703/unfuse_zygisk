@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-#
-# build-hookselftest.sh — сборка проверки правки входов libc под arm64.
-#
-# Отдельно от build.sh: это не часть модуля, а инструмент разработчика. Файл
-# собирается динамическим (иначе dlsym(RTLD_DEFAULT, "open") не нашёл бы libc) и
-# кладётся в out/.
-#
-# Использование:
-#   tools/build-hookselftest.sh              # -> out/hookselftest-arm64
-#   API=30 tools/build-hookselftest.sh
-#   NDK=/path/to/ndk tools/build-hookselftest.sh
-#
+# build-hookselftest.sh — build the arm64 libc-hook self-test. Developer tool, not
+# part of the module; built dynamic into out/. Usage: run it, or set API / NDK.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

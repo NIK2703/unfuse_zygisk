@@ -1,6 +1,5 @@
 #!/system/bin/sh
-# Зонд 5: группы реальных процессов приложений + метки текущего FUSE-хранилища.
-# Запуск:  su -c /data/local/tmp/probe5.sh
+# Probe 5: groups of real app processes + labels of the current FUSE storage.
 
 echo "===== probe5: $(date) ====="
 

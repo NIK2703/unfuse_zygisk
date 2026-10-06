@@ -1,11 +1,5 @@
 #!/system/bin/sh
-# probe-app.sh <pid> — проверка доступа ОТ ИМЕНИ uid приложения,
-# внутри ЕГО mount namespace (то есть с sdcardfs, а не с FUSE).
-#
-# nsenter сам по себе не меняет личность, поэтому DAC-проверка через него
-# ничего не доказывает: root обходит права. Здесь мы сначала заходим в
-# namespace приложения, а затем сбрасываем uid/gid/группы через runas —
-# ровно те, что Zygote выдал процессу (в группах обязательно есть 9997).
+# probe-app.sh <pid> — access check AS the app's uid inside its mount namespace (sdcardfs, not FUSE), dropping to its uid/gid/groups via runas.
 
 PID="$1"
 [ -n "$PID" ] || { echo "usage: probe-app.sh <pid>"; exit 2; }

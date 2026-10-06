@@ -1,15 +1,15 @@
 #!/system/bin/sh
-# Живой тест подмены: целевой пакет против нецелевого.
+# Live swap test: target package vs a non-target control.
 
 TARGET=com.mixplorer
 CONTROL=com.aimp.player
 
 echo "===== 0. синхронизируем конфиг в каталог модуля ====="
-cp -f /data/adb/sdcardfs-apps.conf /data/adb/modules/sdcardfs_restore/sdcardfs-apps.conf
-chmod 0644 /data/adb/modules/sdcardfs_restore/sdcardfs-apps.conf
-ls -la /data/adb/modules/sdcardfs_restore/sdcardfs-apps.conf
+cp -f /data/adb/sdcardfs-apps.conf /data/adb/modules/unfuse_zygisk/sdcardfs-apps.conf
+chmod 0644 /data/adb/modules/unfuse_zygisk/sdcardfs-apps.conf
+ls -la /data/adb/modules/unfuse_zygisk/sdcardfs-apps.conf
 echo "--- что теперь увидит модуль ---"
-grep -vE "^[[:space:]]*(#|$)" /data/adb/modules/sdcardfs_restore/sdcardfs-apps.conf
+grep -vE "^[[:space:]]*(#|$)" /data/adb/modules/unfuse_zygisk/sdcardfs-apps.conf
 
 echo
 echo "===== 1. перезапускаем целевое приложение: $TARGET ====="
@@ -47,7 +47,7 @@ show "$CONTROL" "КОНТРОЛЬНЫЙ (не в конфиге)"
 
 echo
 echo "===== 3. что модуль написал в logcat ====="
-logcat -d -s SdcardFsRestore 2>/dev/null | tail -40
+logcat -d -s UnfuseZygisk 2>/dev/null | tail -40
 
 echo
 echo "===== 4. сравнение магии ====="
