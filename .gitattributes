@@ -1,0 +1,14 @@
+# Line endings are part of the artifact here: the module's shell scripts are
+# unpacked onto the device and run by toybox sh, which treats a trailing CR as
+# part of the token — "case ... in\r" is a syntax error, and every `#!/system/bin/sh`
+# script would fail to install. The C/C++ sources are built by clang on this host
+# and never see the device, but keeping the whole tree one way is the only way the
+# next file added does not repeat this.
+#
+# So: LF everywhere, and let git stop rewriting on checkout.
+* text=auto eol=lf
+
+# Anything whose bytes matter verbatim.
+*.so   binary
+*.png  binary
+*.zip  binary
