@@ -34,8 +34,7 @@
  *
  * ============================== what this does instead
  *
- * Removes the FUSE mount at its source, in vold. MountUserFuse() has exactly
- * one mount(2) call for this purpose:
+ * MountUserFuse() has exactly one mount(2) call for this purpose:
  *
  *     result = TEMP_FAILURE_RETRY(mount("/dev/fuse", fuse_path.c_str(), "fuse",
  *                                       MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_LAZYTIME,
@@ -47,15 +46,44 @@
  * `mount` and, inside the handler, pass through every call EXCEPT this one:
  *
  *   - the first argument is the string "/dev/fuse";
- *   - the third is the string "fuse".
+ *   - the third is the string "fuse";
+ *   - the flags carry MS_LAZYTIME.
  *
- * When both match, the call is not performed. Instead the handler mirrors what
- * the non-FUSE branch of MountUserFuse does — BindMount(absolute_lower_path,
- * fuse_path) — except that it binds the raw tree, unmounting whatever sits on
- * the target first (which is exactly what vold's own BindMount() does:
- * UnmountTree(target) then mount(MS_BIND)). Unmounting first is the step the
- * old namespace-side approach could not perform, and the reason it never
- * worked.
+ * All three have to match, and the third is not optional — see "how the call is
+ * recognised". When they do, the handler makes TWO mounts instead of one:
+ *
+ *   1. the FUSE mount itself, with the caller's own arguments, untouched;
+ *   2. mount("/data/media", fuse_path, NULL, MS_BIND | MS_REC, NULL) — the raw
+ *      tree, on top of it.
+ *
+ * ============================== why the FUSE mount is still made
+ *
+ * The obvious version — suppress the FUSE mount and bind the raw tree in its
+ * place — does not work, in two separate ways. Both look like bugs in this tool
+ * and are not, so they are worth recording:
+ *
+ *   - MountUserFuse() does not end at the mount. It opened /dev/fuse before it,
+ *     and it returns that fd to its caller, which hands it to MediaProvider's
+ *     FUSE daemon; the caller then waits for the daemon to come up, and a
+ *     scope_guard unmounts the volume if it does not.
+ *   - With no FUSE superblock behind the fd the daemon cannot start:
+ *
+ *         E StorageManagerService: Failed to mount volume VolumeInfo{emulated;0}:
+ *           Caused by: java.lang.IllegalStateException: Failed to start FUSE
+ *
+ *     after which the volume lands in state "unmountable" and vold unmounts the
+ *     path again — no storage at all, and the bind is undone.
+ *
+ * So the FUSE mount has to exist for the volume to reach MOUNTED. Making it and
+ * then putting the raw tree on top satisfies the storage session while leaving
+ * the FUSE view unreachable: every lookup under /mnt/user/<user>/emulated
+ * resolves to the topmost mount, which is the bind, so apps read and write
+ * /data/media directly, and the Android/data and Android/obb bind mounts vold
+ * makes afterwards become self-binds.
+ *
+ * The cost is a live FUSE superblock and an idle MediaProvider daemon that
+ * nothing reads. That is the platform's design, not a choice made here: the fd
+ * is part of MountUserFuse()'s contract, and a bind mount cannot satisfy it.
  *
  * ============================== why not name MountUserFuse directly
  *
@@ -78,30 +106,47 @@
  *
  * The handler is deliberately small and does only what is needed:
  *
- *   1. save the four arguments we need (x0 = source, x1 = target, x2 = type,
- *      x3 = flags) and the link register's caller;
- *   2. compare x0's first 9 bytes with "/dev/fuse" and x2 with "fuse";
- *   3. if not equal -> tail-call the original mount (x16 = its real address);
- *   4. if equal:
- *        a. umount2(target, MNT_DETACH);
+ *   1. keep the target (x1) and the caller's return address;
+ *   2. compare x0 with "/dev/fuse", x2 with "fuse", and test x3 against
+ *      MS_LAZYTIME;
+ *   3. if any of the three fails -> tail-call the original mount with x0..x4
+ *      exactly as given, so no other caller can tell the stub was replaced;
+ *   4. if all three match:
+ *        a. mount("/dev/fuse", target, "fuse", flags, opts) — the call the
+ *           caller asked for, with its own x0..x4;
  *        b. mount("/data/media", target, NULL, MS_BIND|MS_REC, NULL);
  *        c. return 0.
  *
+ * Step (a) needs no setup at all: the handler is entered through the `mount`
+ * stub, so x0..x4 already hold exactly the arguments mount() wants. Only the
+ * target has to survive the call, and it is parked in x10 — a caller-saved
+ * temporary, NOT x19: the handler runs in place of a real call, so every
+ * callee-saved register must come back untouched, and there is no frame slot
+ * for one here.
+ *
  * ============================== where the handler goes
  *
- * vold's own anonymous rw-p mappings are unusable (no PROT_EXEC, and adding it
- * to a private anonymous region is allowed, so that is in fact what we do):
- * we find a private anonymous mapping with spare room at its end, mprotect it
- * to rwx through the process by writing to /proc/<pid>/mem after clearing... 
- * this is not possible either — mprotect on another process needs ptrace
- * injection.
+ * Two homes, in order of preference:
  *
- * So the handler is placed in vold's PLT area instead: the .plt is a
- * file-backed r-x mapping large enough to hold a few hundred bytes of unused
- * padding after the last stub, and it is writable through /proc/<pid>/mem
- * (COW). This is the same page vold-noacl.c already patches, and it needs no
- * new mapping, no mprotect, no syscall injection. The handler is appended into
- * the trailing zero padding of that page.
+ *   1. the trailing padding of the .plt page — a file-backed r-x mapping,
+ *      writable through /proc/<pid>/mem by COW, needing no new mapping, no
+ *      mprotect and no syscall injection. This is the same page vold-noacl.c
+ *      already patches.
+ *
+ *   2. a page taken from vold's own executable file, when the build has no
+ *      such padding: the linker can pack the PLT flush to the end of the
+ *      executable segment, leaving 0 bytes after the last stub and no zero run
+ *      anywhere in .text (measured on the device's vold). Anonymous executable
+ *      memory is not available on Android — mmap(PROT_EXEC, MAP_ANONYMOUS) and
+ *      mprotect(anon, PROT_EXEC) both come back -EACCES (W^X / execmem) — but a
+ *      private PROT_READ|PROT_EXEC mapping of vold's own binary IS allowed,
+ *      because vold already has execute permission on that file. So the tool
+ *      has vold open its own binary and mmap a page of it RX; the handler is
+ *      written into that page through /proc/<pid>/mem, which breaks COW into a
+ *      private page that keeps PROT_EXEC. See vold_exec_page.
+ *
+ * The handler is built for the address it will live at, so that address is
+ * chosen before build_handler() runs; it is absolute in both cases.
  *
  * ============================== which releases
  *
@@ -115,7 +160,7 @@
  *
  * Premises checked; if any fails the tool refuses (code 2) and writes NOTHING:
  *   (1) `mount` has exactly one .rela.plt JUMP_SLOT and one stub;
- *   (2) the .plt page has room for the handler after the last stub;
+ *   (2) the handler has a home — the .plt padding, or a page vold grants;
  *   (3) exactly one call site in vold's .text passes "/dev/fuse" as the source
  *       (counted by scanning for the string and the adrp/add pairs that build
  *       its address); more than one means the anchor is not what we think.
@@ -143,19 +188,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__aarch64__)
+#include <sys/ptrace.h>
+#include <asm/ptrace.h>   /* struct user_pt_regs, NT_PRSTATUS */
+#endif
 
 #include "android_ver.h"
 
 /* The imported symbol whose stub we replace. */
 #define TARGET_SYM "mount"
 
-/* Also imported, and needed by the handler to detach an existing mount. */
-#define UMOUNT2_SYM "umount2"
-
-/* The raw tree, and the type string of the mount we suppress. */
+/* The raw tree, and the strings that identify the mount we intercept. */
 #define RAW_PATH   "/data/media"
 #define FUSE_TYPE  "fuse"
 #define FUSE_SRC   "/dev/fuse"
@@ -446,37 +496,71 @@ static bool decode_stub(const uint8_t *p, uint64_t va, uint64_t *ldr_target) {
 }
 
 /* Build the replacement bytes for a stub: `ldr x17,#8 ; br x17 ; .quad handler`.
- * 16 bytes, fits exactly where adrp/ldr/add/br were, so no neighbouring stub is
- * disturbed. Opens with bti jc for the same reason hook_libc.cpp does: a stub is
- * a legal indirect-branch target and stays one under -mbranch-protection. */
+ *
+ * 16 bytes — exactly the space adrp/ldr/add/br occupied, so no neighbouring stub
+ * is disturbed. The layout is forced by that budget:
+ *
+ *     +0  ldr x17, #8      loads from pc+8 = stub+8
+ *     +4  br  x17
+ *     +8  .quad handler    the whole 64-bit address, 8 bytes
+ *
+ * The literal MUST sit at +8. An earlier version opened with `bti jc` and put
+ * the quad at +12, which needs 20 bytes: it wrote 4 bytes past the end of this
+ * buffer, and since only 16 bytes ever reach vold the top half of the address
+ * was never written at all. `ldr x17,#8` then read the handler's low 32 bits in
+ * the low half and the NEIGHBOURING stub's `adrp` word (0xd0000030 on the
+ * device's vold) in the high half, so `br x17` left for a mangled 64-bit
+ * address and vold died with SIGSEGV / SEGV_MAPERR on the first mount() call
+ * after patching — no tombstone, because crash_dump cannot attach to vold. On a
+ * boot where the patch lands before vold mounts emulated storage that first
+ * call IS the emulated mount, so init sees a critical service die and reboots:
+ * the reported bootloop.
+ *
+ * Dropping `bti jc` costs nothing here: this stub is reached only by a direct
+ * `bl` from vold's own code, and BTI is checked on indirect branches only. The
+ * landing pad belongs on the handler, which the stub reaches with `br x17` — and
+ * the handler does open with `bti jc`. */
 #define STUB_PATCH_LEN 16
 static void build_stub_patch(uint8_t out[STUB_PATCH_LEN], uint64_t handler_va) {
-    uint32_t w[3];
-    w[0] = INSN_BTI_JC;
-    w[1] = 0x58000051u;                     /* ldr x17, #8  */
-    w[2] = 0xd61f0220u;                     /* br  x17      */
+    uint32_t w[2];
+    w[0] = 0x58000051u;                     /* ldr x17, #8  (reads stub+8) */
+    w[1] = 0xd61f0220u;                     /* br  x17                     */
     memcpy(out + 0, &w[0], 4);
     memcpy(out + 4, &w[1], 4);
-    memcpy(out + 8, &w[2], 4);
-    memcpy(out + 12, &handler_va, 8);       /* PC-relative literal at +12 */
+    memcpy(out + 8, &handler_va, 8);        /* +8..+15 — fits, nothing spilled */
 }
 
 static bool stub_is_patched(const uint8_t *p) {
-    uint32_t w0, w1, w2;
+    uint32_t w0, w1;
     memcpy(&w0, p + 0, 4);
     memcpy(&w1, p + 4, 4);
-    memcpy(&w2, p + 8, 4);
-    return w0 == INSN_BTI_JC && w1 == 0x58000051u && w2 == 0xd61f0220u;
+    return w0 == 0x58000051u && w1 == 0xd61f0220u;
+}
+
+/* Where the patch's `ldr x17,#imm` will read its literal from, as a byte offset
+ * from the start of the patch — or -1 if the first word is not that ldr.
+ *
+ * Decoded rather than assumed, because the offset is the whole contract: the
+ * patch has to point the load at the 8-byte quad inside its own 16 bytes, and
+ * the bootloop came from a layout where it pointed past the end instead. */
+static int stub_literal_off(const uint8_t *p) {
+    uint32_t w0;
+    memcpy(&w0, p + 0, 4);
+    /* LDR (literal), 64-bit: 0x58000000 | imm19<<5 | Rt, with Rt = 17 (x17). */
+    if ((w0 & 0xff00001fu) != 0x58000011u) return -1;
+    int64_t imm19 = (int64_t)((w0 >> 5) & 0x7ffffu);
+    imm19 = (imm19 << 45) >> 45;            /* sign-extend the 19-bit field */
+    return (int)(imm19 * 4);
 }
 
 /* =================================================================== *
  * The handler
  *
  * Entered from the `mount` stub with the caller's registers intact:
- *   x0 = source   ("/dev/fuse" for the FUSE mount we want to stop)
+ *   x0 = source   ("/dev/fuse" for the FUSE mount we intercept)
  *   x1 = target   (fuse_path; points into a heap std::string's buffer)
  *   x2 = fstype   ("fuse")
- *   x3 = flags, x4 = data
+ *   x3 = flags, x4 = data (the "fd=%i,..." option string)
  *   lr = return address inside MountUserFuse
  *
  * Two outcomes:
@@ -486,21 +570,21 @@ static bool stub_is_patched(const uint8_t *p) {
  *          caller cannot tell the stub was replaced.
  *
  *   (b) the call IS that mount
- *       -> do not perform it. Instead:
- *            umount2(target, MNT_DETACH);          // drop what is there
+ *       -> make it, then put the raw tree on top:
+ *            mount("/dev/fuse", target, "fuse", x3, x4);   // vold's own call,
+ *                                                          // x0..x4 as given
  *            mount("/data/media", target, NULL,
- *                  MS_BIND | MS_REC, NULL);        // bind the raw tree
+ *                  MS_BIND | MS_REC, NULL);                // bind the raw tree
  *          and return 0 — the value MountUserFuse expects from a successful
- *          mount. This mirrors vold's own BindMount(): UnmountTree() first,
- *          then mount(MS_BIND). The unmount is the step the old
- *          namespace-side approach could not perform, and the reason that
- *          approach never worked on these images.
+ *          mount. Both mounts are wanted: see "why the FUSE mount is still
+ *          made" at the top. The bind is what anything actually reaches, and
+ *          it is reached the way vold's own BindMount() would reach it.
  *
  * ================ how the call is recognised
  *
- * By POINTER, not by bytes:
+ * By POINTER, not by bytes, plus one flag bit:
  *
- *     x2 == type_va  &&  x0 == src_va
+ *     x2 == type_va  &&  x0 == src_va  &&  (x3 & MS_LAZYTIME)
  *
  * where src_va/type_va are the VAs of the standalone "/dev/fuse" and "fuse"
  * literals — the same two the tool located in order to find this call site
@@ -508,35 +592,55 @@ static bool stub_is_patched(const uint8_t *p) {
  * tool knows both. This is exact: there is no byte pattern to get wrong, and
  * no assumption that the caller passes the literal rather than a copy.
  *
+ * The flag bit is not decoration. Measured on the device's vold
+ * (md5 2319c26fb4c5ccd1492b16fccc895cc5), vold calls mount(2) in exactly this
+ * shape from two places, and the compiler MERGED the string literals — both
+ * sites build x0 from 0x14e35 and x2 from 0x15cb3, and both `bl` the same
+ * stub at 0xf9de0, so the pointer test alone cannot tell them apart:
+ *
+ *     0x5f0c8  MountUserFuse()       mov w3,#0x40e; movk w3,#0x200,lsl#16
+ *                                    -> w3 = 0x0200040e   (MS_LAZYTIME)
+ *     0xa6ffc  AppFuseUtil::Mount()  mov w3,#0x40e
+ *                                    -> w3 = 0x0000040e
+ *
+ * AppFuseUtil mounts the per-app point /mnt/appfuse/<uid>_<name>, whose whole
+ * point is that the app sees its own directory and not its neighbours'. Binding
+ * /data/media there would hand it the entire tree instead. So the flags are
+ * tested, and MS_LAZYTIME — which only MountUserFuse sets — is what separates
+ * them. It is the same discriminator find_fuse_site() already relies on to
+ * choose the site, so the two halves of the tool now agree.
+ *
  * Targeting by arguments (not by call site) is deliberate: it means a vendor
  * that reorganises MountUserFuse's internals, inlines it, or adds another call
  * through the same stub is still handled correctly, because the decision is
- * made on what the call actually asks for.
+ * made on what the call actually asks for. The flag test is what makes that
+ * promise safe when the extra call happens to look identical.
  *
  * ================ register discipline
  *
- * The pass-through path must preserve x0..x18 exactly as the caller left them.
- * Classification therefore uses only x9 — a scratch register the ABI lets a
- * function clobber — and touches no callee-saved register.
+ * The handler stands in for a real `mount` call, so it must be a well-behaved
+ * callee: every callee-saved register the caller relies on has to come back
+ * untouched. The whole handler therefore uses only scratch registers —
+ * x0..x4 (arguments), x9 (the ABI's scratch register) and x10 for the target
+ * across the two calls. No callee-saved register is written at all.
  *
- * On the take-over path we are no longer a normal call: we do not return to
- * the instruction after `bl mount` with mount's own effects, we synthesise the
- * result. The caller's x19..x28 do not need to survive for its own benefit
- * (the ABI does not require that across a call anyway). We still keep the
- * frame symmetric and restrict ourselves to x0, x1, x2, x3, x4, x9, x19, so
- * the deviation from a well-behaved callee is minimal and auditable.
+ * The pass-through path in particular must preserve x0..x18 exactly as the
+ * caller left them: classification uses only x9, and the path restores the
+ * frame before tail-calling libc mount with the arguments it was given.
+ *
+ * The take-over path does not return mount's own effects, it synthesises the
+ * result — but the caller's view of the callee-saved set still has to be
+ * intact, which is why the target is parked in x10 rather than the x19 an
+ * earlier revision used.
  *
  * ================ why the frame looks the way it does
  *
- * `stp x29, x30, [sp, #-16]!` is emitted once, before the comparisons. That
- * means the pass-through path must NOT undo it — but it also must not leave
- * it, because it never returns to us; it jumps straight into libc mount, which
- * will itself return to the caller. libc mount does not care what is on the
- * stack above sp, and the caller's `bl mount` pushed only its own frame. So
- * the extra 16 bytes are pushed and never popped on that path: harmless, and
- * they keep the two paths' addressing identical. The take-over path pops them
- * before returning, because it DOES return through the original `lr`.
- * =================================================================== */
+ * `stp x29, x30, [sp, #-16]!` is emitted once, before the comparisons. The
+ * take-over path pops it before returning, because it returns through the
+ * original `lr`. The pass-through path does NOT pop it — it never returns to
+ * us; it tail-calls libc mount, which returns straight to the caller. libc
+ * mount does not care what sits above sp, and the caller's `bl mount` pushed
+ * only its own frame, so the extra 16 bytes are harmless there. */
 
 /* --- encoders, so the emission below reads as assembly --- */
 static uint32_t enc_ldr_lit(int rt, int64_t byte_delta) {
@@ -577,13 +681,13 @@ static uint32_t enc_ldp_post(int rt, int rt2, int imm7) {
 }
 
 #define COND_NE 0x1
+#define COND_EQ 0x0
 
 /* Named pool slots; the enum and the `pool_val[]` assignment must stay in the
  * same order — that is the only invariant in this function. */
 enum {
     P_TYPE = 0,     /* runtime VA of vold's "fuse" literal       */
     P_SRC,          /* runtime VA of vold's "/dev/fuse" literal  */
-    P_UMOUNT2,      /* runtime VA of libc umount2                */
     P_MOUNT,        /* runtime VA of libc mount                  */
     P_RAW,          /* runtime VA of the "/data/media\0" copy    */
     P_COUNT
@@ -595,7 +699,7 @@ enum {
  * `raw_string` is copied after the pool and NUL-terminated; P_RAW points at it.
  */
 static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
-                         uint64_t real_mount, uint64_t real_umount2,
+                         uint64_t real_mount,
                          uint64_t src_va, uint64_t type_va,
                          const char *raw_string) {
     uint32_t w[96];
@@ -604,6 +708,7 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     int      fld_at[32];      /* word index of each ldr           */
     int      nfld = 0;
     int      br_at[8];        /* word index of each b.cond        */
+    int      br_cond[8];      /* ...and the condition it tests    */
     int      nbr = 0;
     int      n = 0;
     int      idx_restore = -1;   /* word index of the pass-path frame restore */
@@ -620,10 +725,14 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
         fld_at[nfld] = n; nfld++;                                     \
         E(0);                    /* placeholder, fixed up below */    \
     } while (0)
-#define BNE() do { if (nbr >= 8) return -1; br_at[nbr++] = n; E(0); } while (0)
+#define BNE() do { if (nbr >= 8) return -1; br_at[nbr] = n; \
+        br_cond[nbr] = COND_NE; nbr++; E(0); } while (0)
+#define BEQ() do { if (nbr >= 8) return -1; br_at[nbr] = n; \
+        br_cond[nbr] = COND_EQ; nbr++; E(0); } while (0)
 
-    /* bti jc — the stub reaches us with `br x17`, an indirect jump. */
-    E(0xd50324dfu);
+    /* bti jc — the stub reaches us with `br x17`, an indirect jump. This is the
+     * landing pad; the stub itself cannot carry one (see build_stub_patch). */
+    E(INSN_BTI_JC);
     E(enc_stp_pre(29, 30, -2));         /* stp x29, x30, [sp, #-16]! */
     E(0x910003fdu);                     /* mov x29, sp               */
 
@@ -637,20 +746,46 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     E(enc_cmp_reg(0, 9));               /* cmp x0, x9       */
     BNE();                              /* b.ne pass        */
 
+    /* classify: x3 & MS_LAZYTIME. The two tests above are not enough: vold
+     * calls mount(2) this way from TWO places and the compiler merged the
+     * string literals, so both reach the handler with the identical x0 and x2
+     * pointers —
+     *
+     *   MountUserFuse()      w3 = 0x40e | MS_LAZYTIME = 0x0200040e
+     *   AppFuseUtil::Mount() w3 = 0x40e               (no MS_LAZYTIME)
+     *
+     * — and AppFuseUtil's target is the per-app point /mnt/appfuse/<uid>_<name>,
+     * not the emulated volume. Binding /data/media over that would hand the app
+     * the whole tree where it asked for its own directory, so it must pass
+     * through untouched. MS_LAZYTIME is the only thing that separates them, and
+     * it is the same discriminator find_fuse_site() uses to pick the site; see
+     * "how the call is recognised". */
+    E(0x52a04009u);                     /* movz w9, #0x200, lsl #16 */
+    E(0x6a09007fu);                     /* tst  w3, w9              */
+    BEQ();                              /* b.eq pass — not our mount */
+
     /* ---------------- take over ---------------- */
 
-    E(enc_mov_reg(19, 1));              /* mov x19, x1  (target)           */
+    /* The target is parked in x10, a caller-saved temporary, NOT in x19: the
+     * handler is entered from the PLT stub in place of a real `mount` call, so
+     * the caller's callee-saved registers must survive untouched. x19 is
+     * callee-saved and the handler has no frame slot for it — using it here
+     * would corrupt whatever the caller kept there across the call. */
+    E(enc_mov_reg(10, 1));              /* mov x10, x1  (target)           */
 
-    /* umount2(target, MNT_DETACH) — best effort, result ignored */
-    LDR(P_UMOUNT2, 9);                  /* ldr x9, <umount2>               */
-    E(enc_movz_w(0, 2));                /* mov w0, #2                      */
-    E(enc_mov_reg(1, 19));              /* mov x1, x19                     */
+    /* (a) the FUSE mount the caller asked for — x0..x4 are still exactly its
+     * arguments, so there is nothing to set up. It has to happen: the fd it
+     * leaves behind is what MediaProvider's FUSE daemon is started on, and a
+     * volume whose daemon does not come up is reported "unmountable". */
+    LDR(P_MOUNT, 9);                    /* ldr x9, <mount>                 */
     E(enc_blr(9));                      /* blr x9                          */
 
-    /* mount("/data/media", target, NULL, MS_BIND|MS_REC, NULL) */
+    /* (b) the raw tree on top of it. This is the mount anything actually sees:
+     * it is the topmost mount at fuse_path, so the FUSE view below it is
+     * unreachable through the path. */
     LDR(P_MOUNT, 9);                    /* ldr x9, <mount>                 */
     LDR(P_RAW, 0);                      /* ldr x0, <raw>                   */
-    E(enc_mov_reg(1, 19));              /* mov x1, x19                     */
+    E(enc_mov_reg(1, 10));              /* mov x1, x10                     */
     E(0xd2800002u);                     /* mov x2, #0     (fstype = NULL)  */
     E(enc_movz_w(3, 4096u | 16384u));   /* mov w3,#0x5000 MS_BIND|MS_REC   */
     E(0xd2800004u);                     /* mov x4, #0     (data   = NULL)  */
@@ -682,6 +817,7 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
 #undef E
 #undef LDR
 #undef BNE
+#undef BEQ
 
     /* ---- pool + string placement ---- */
     while ((n & 1) != 0) w[n++] = 0x00000000u;      /* align pool to 8 bytes */
@@ -706,11 +842,13 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
 
     /* ---- fix up the b.cond to reach the pass block ----
      *
-     * Both `b.ne` jump forward to the frame restore at the head of the pass
-     * block (`ldp x29,x30,[sp],#16`), not to the tail-call after it: landing on
-     * the tail-call would hand libc mount a frame that is still pushed. The
-     * delta is in instructions, pc-relative; the encoder masks it to imm19, so
-     * the distance must fit, which is asserted rather than assumed. */
+     * Every classification branch — the two `b.ne` on the argument pointers and
+     * the `b.eq` on MS_LAZYTIME — jumps forward to the frame restore at the
+     * head of the pass block (`ldp x29,x30,[sp],#16`), not to the tail-call
+     * after it: landing on the tail-call would hand libc mount a frame that is
+     * still pushed. The delta is in instructions, pc-relative; the encoder
+     * masks it to imm19, so the distance must fit, which is asserted rather
+     * than assumed. Each branch keeps its own condition code. */
     if (idx_restore < 0 || idx_pass_tail < 0) return -1;
     if (nbr == 0) return -1;
     for (int i = 0; i < nbr; i++) {
@@ -718,20 +856,20 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
         if (at >= idx_restore) return -1;   /* must jump forward */
         int64_t delta_words = (int64_t)idx_restore - (int64_t)at;
         if (delta_words < -(1 << 18) || delta_words >= (1 << 18)) return -1;
-        w[at] = enc_b_cond(COND_NE, delta_words * 4);
+        w[at] = enc_b_cond(br_cond[i], delta_words * 4);
         /* Prove the encoding survived: decode it back and require the word we
-         * get to point where we meant. If the decoder disagrees with the
-         * encoder the encoder is lying, and this is worth failing on. */
+         * get to carry the condition we meant and point where we meant. If the
+         * decoder disagrees with the encoder the encoder is lying, and this is
+         * worth failing on. */
         int64_t got = 0;
         int cond = dec_b_cond(&got, w[at]);
-        if (cond != COND_NE || at + got != idx_restore) return -1;
+        if (cond != br_cond[i] || at + got != idx_restore) return -1;
     }
 
     /* ---- write the pool (each entry is two 32-bit words) ---- */
     uint64_t pool_val[P_COUNT];
     pool_val[P_TYPE]    = type_va;
     pool_val[P_SRC]     = src_va;
-    pool_val[P_UMOUNT2] = real_umount2;
     pool_val[P_MOUNT]   = real_mount;
     pool_val[P_RAW]     = str_va;
     for (int i = 0; i < P_COUNT; i++) {
@@ -753,12 +891,6 @@ typedef struct {
     uint32_t sym_index;
     int      reloc_index;
     int      plt_delta;
-
-    /* umount2 is imported too and the handler needs its address. It has no
-     * stub requirement of its own — we only need the GOT slot so we can read
-     * the resolved libc address out of the live process. */
-    uint64_t umount2_got;
-    bool     have_umount2;
 } Resolved;
 
 static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
@@ -910,6 +1042,150 @@ static int mem_write(pid_t pid, uint64_t addr, const void *buf, size_t len) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ *
+ * getting an executable page inside vold
+ *
+ * The .plt is the cheapest home for the handler, but only when the linker
+ * left padding after the last stub. A build that packs its PLT flush to the
+ * end of the executable segment has no such room and no zero run anywhere in
+ * .text either (measured on the device's vold: 0 bytes after the last stub,
+ * no zero run >= 256 bytes in the whole segment). Then the handler needs
+ * memory the image does not provide.
+ *
+ * Anonymous executable memory is not available: measured on the device, both
+ * mmap(PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANONYMOUS) and mprotect(rw anon,
+ * PROT_EXEC) come back -EACCES (W^X / SELinux execmem). mmap of an anonymous
+ * RX mapping is refused too.
+ *
+ * What IS allowed is a private executable mapping of the process's own
+ * executable file: vold already has execute permission on its binary, so
+ * mapping it PROT_READ|PROT_EXEC|MAP_PRIVATE succeeds, and a write into that
+ * page through /proc/<pid>/mem (which uses FOLL_FORCE) breaks COW into a
+ * private page that keeps PROT_EXEC. Measured end to end: a page mapped this
+ * way runs code written into it.
+ *
+ * So the page is obtained by asking vold itself to do the two syscalls:
+ *
+ *   fd   = openat(AT_FDCWD, <vold's own path>, O_RDONLY)
+ *   home = mmap(NULL, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE, fd, 0)
+ *
+ * The path string is placed in a scratch page first, itself obtained with an
+ * mmap(PROT_READ|PROT_WRITE, MAP_ANONYMOUS) injection (that one is allowed).
+ *
+ * Each syscall is run the classic way: attach, save the thread's register
+ * file, overwrite the two instructions at the stopped pc with `svc #0` then
+ * `brk #0` (PTRACE_POKEDATA bypasses page permissions, so an r-x page works),
+ * set x8 and x0..x5, resume, and read x0 back at the brk. The thread is
+ * stopped for the whole thing, and its pc and the two clobbered words are
+ * restored before it resumes.
+ * ------------------------------------------------------------------ */
+
+#if defined(__aarch64__)
+
+#define INSN_SVC_0  0xd4000001u   /* svc #0 */
+#define INSN_BRK_0  0xd4200000u   /* brk #0 — the stop after the syscall */
+
+/* arm64 syscall numbers used here. */
+#define NR_MMAP     222
+#define NR_MPROTECT 226
+#define NR_OPENAT   56
+#define NR_CLOSE    57
+
+/* Run one syscall inside `pid` from its stopped pc. On success `*ret` holds
+ * the raw x0 and the thread is left exactly as it was (pc restored). */
+static int inj_syscall(pid_t pid, uint64_t nr, uint64_t a0, uint64_t a1,
+                       uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
+                       int64_t *ret) {
+    struct user_pt_regs regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) == -1) return -1;
+
+    uint64_t pc0 = regs.pc;
+    errno = 0;
+    long w0 = ptrace(PTRACE_PEEKDATA, pid, (void *)pc0, NULL);
+    if (w0 == -1 && errno != 0) return -1;
+    errno = 0;
+    long w1 = ptrace(PTRACE_PEEKDATA, pid, (void *)(pc0 + 4), NULL);
+    if (w1 == -1 && errno != 0) return -1;
+
+    if (ptrace(PTRACE_POKEDATA, pid, (void *)pc0,
+               (void *)(uintptr_t)INSN_SVC_0) == -1) return -1;
+    if (ptrace(PTRACE_POKEDATA, pid, (void *)(pc0 + 4),
+               (void *)(uintptr_t)INSN_BRK_0) == -1) return -1;
+
+    struct user_pt_regs saved = regs;
+    regs.pc = pc0;
+    regs.regs[8] = nr;
+    regs.regs[0] = a0; regs.regs[1] = a1; regs.regs[2] = a2;
+    regs.regs[3] = a3; regs.regs[4] = a4; regs.regs[5] = a5;
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) == -1) {
+        goto restore;
+    }
+    if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) goto restore;
+
+    {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) goto restore;
+        if (WIFSTOPPED(status)) {
+            struct user_pt_regs got;
+            struct iovec giov = { .iov_base = &got, .iov_len = sizeof(got) };
+            if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &giov) == 0) {
+                *ret = (int64_t)got.regs[0];
+                saved.regs[0] = got.regs[0];
+            }
+        }
+    }
+
+restore:
+    ptrace(PTRACE_POKEDATA, pid, (void *)pc0, (void *)(uintptr_t)w0);
+    ptrace(PTRACE_POKEDATA, pid, (void *)(pc0 + 4), (void *)(uintptr_t)w1);
+    iov.iov_base = &saved;
+    iov.iov_len = sizeof(saved);
+    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+    return 0;
+}
+
+/* A private executable page taken from vold's own file. Returns the address,
+ * or 0. `self_path` is vold's executable path (/proc/<pid>/exe). */
+static uint64_t vold_exec_page(pid_t pid, const char *self_path) {
+    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) return 0;
+    {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0 || !WIFSTOPPED(status)) {
+            ptrace(PTRACE_DETACH, pid, NULL, NULL);
+            return 0;
+        }
+    }
+
+    uint64_t result = 0;
+    int64_t scratch = 0, fd = 0, home = 0;
+    size_t plen = strlen(self_path) + 1;
+
+    /* 1. a writable page to hold the path string */
+    if (inj_syscall(pid, NR_MMAP, 0, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0,
+                    &scratch) != 0 || scratch <= 0) goto out;
+    if (mem_write(pid, (uint64_t)scratch, self_path, plen) != 0) goto out;
+
+    /* 2. open the binary from inside vold */
+    if (inj_syscall(pid, NR_OPENAT, (uint64_t)-100 /* AT_FDCWD */,
+                    (uint64_t)scratch, O_RDONLY, 0, 0, 0,
+                    &fd) != 0 || fd <= 0) goto out;
+
+    /* 3. map it executable, private; the page is ours to overwrite */
+    if (inj_syscall(pid, NR_MMAP, 0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE,
+                    (uint64_t)fd, 0, &home) != 0 || home <= 0) goto out_close;
+
+    result = (uint64_t)home;
+
+out_close:
+    { int64_t c; inj_syscall(pid, NR_CLOSE, (uint64_t)fd, 0, 0, 0, 0, 0, &c); }
+out:
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    return result;
+}
+#endif  /* __aarch64__ */
+
 /* .plt layout: C = va - 16*i must be constant across foreign pairs. */
 static int plt_delta_emit(const uint64_t *stub_va, const uint64_t *stub_target,
                           size_t nstubs, const Elf64_Rela *rel, size_t nrel) {
@@ -953,7 +1229,6 @@ static int resolve(Src *s, Resolved *r) {
     if (load_relocs(s, &d, &rel, &nrel) != 0) return EXIT_NO_RESOLVE;
 
     int nmatch = 0;
-    int numount = 0;
     for (size_t i = 0; i < nrel; i++) {
         if ((uint32_t)(rel[i].r_info & 0xffffffffu) != R_AARCH64_JUMP_SLOT)
             continue;
@@ -969,13 +1244,6 @@ static int resolve(Src *s, Resolved *r) {
             }
             continue;
         }
-        if (strcmp(nm, UMOUNT2_SYM) == 0) {
-            numount++;
-            if (numount == 1) {
-                r->umount2_got = rel[i].r_offset;
-                r->have_umount2 = true;
-            }
-        }
     }
     if (nmatch == 0) {
         warn("%s: в .rela.plt нет JUMP_SLOT для \"%s\"", s->label, TARGET_SYM);
@@ -985,18 +1253,6 @@ static int resolve(Src *s, Resolved *r) {
     if (nmatch > 1) {
         warn("%s: у \"%s\" %d JUMP_SLOT-релокаций — отказываюсь",
              s->label, TARGET_SYM, nmatch);
-        free(rel);
-        return EXIT_NO_RESOLVE;
-    }
-    if (numount > 1) {
-        warn("%s: у \"%s\" %d JUMP_SLOT-релокаций — отказываюсь",
-             s->label, UMOUNT2_SYM, numount);
-        free(rel);
-        return EXIT_NO_RESOLVE;
-    }
-    if (!r->have_umount2) {
-        warn("%s: \"%s\" не импортируется — обработчику нечем снять "
-             "существующий FUSE, отказываюсь", s->label, UMOUNT2_SYM);
         free(rel);
         return EXIT_NO_RESOLVE;
     }
@@ -1403,8 +1659,17 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
      * The first is the emulated-storage FUSE, which is the whole point of this
      * patch. The second is per-app Android/data sandboxing; killing it would
      * break apps that rely on it and would not help us at all. MS_LAZYTIME
-     * (0x20000) is present in exactly one of them on every release we have
-     * checked, so it is the discriminator.
+     * (1 << 25 = 0x02000000) is present in exactly one of them on every release
+     * we have checked, so it is the discriminator.
+     *
+     * This choice only decides which site's literal VAs are handed to
+     * build_handler(). It is NOT sufficient on its own: on the device's vold
+     * the compiler merged the two "/dev/fuse" literals, so both sites pass the
+     * SAME pointer to mount(2) and the handler would take over AppFuseUtil's
+     * call as well. That is why the handler re-tests MS_LAZYTIME on x3 at
+     * runtime — see "how the call is recognised". The two checks have to agree;
+     * if this one ever picks a site that the handler's test rejects, nothing is
+     * intercepted and the log says so.
      */
     enum { MAXCAND = 8 };
     FuseSite keep[MAXCAND];
@@ -1461,9 +1726,14 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
  *
  *   - it assembles, and long enough for both paths;
  *   - the first word is `bti jc`;
- *   - the literal pool holds exactly the five values passed in;
+ *   - the literal pool holds exactly the values passed in;
  *   - the P_RAW slot points at the copy of "/data/media" inside the block;
- *   - both `b.ne` instructions point at the pass block;
+ *   - there are exactly three classification branches — two `b.ne` (the two
+ *     argument pointers) and one `b.eq` (MS_LAZYTIME) — and all three point at
+ *     the pass block;
+ *   - the MS_LAZYTIME test is emitted as `movz w9,#0x200,lsl#16; tst w3,w9;
+ *     b.eq`, verified word by word, because it is the only thing that keeps
+ *     the handler off AppFuseUtil::Mount();
  *   - the pass block ends in `br x9` preceded by `ldp x29,x30,[sp],#16`;
  *   - the take-over block ends in `ret` preceded by the same `ldp`;
  *   - the "mov w3" immediate is MS_BIND|MS_REC.
@@ -1478,9 +1748,8 @@ static int selftest(void) {
     uint64_t src_va    = base + 0x14e35ULL;
     uint64_t type_va   = base + 0x15cb3ULL;
     uint64_t mount_va  = 0x79067a7580ULL;
-    uint64_t umount_va = 0x79067a75c0ULL;
 
-    int n = build_handler(buf, sizeof(buf), code_va, mount_va, umount_va,
+    int n = build_handler(buf, sizeof(buf), code_va, mount_va,
                           src_va, type_va, "/data/media");
     if (n <= 0) { fputs("selftest: build_handler failed\n", stderr); return 1; }
 
@@ -1541,10 +1810,15 @@ static int selftest(void) {
         return 1;
     }
 
-    /* both b.ne must target the pass block. This is checked by *decoding* the
-     * emitted imm19, so an encoder that silently lost the delta (the bug this
-     * test was written after) is caught even though the word count is right. */
-    int ncond = 0;
+    /* Every classification branch — two b.ne on the argument pointers, one
+     * b.eq on MS_LAZYTIME — must target the pass block. This is checked by
+     * *decoding* the emitted imm19, so an encoder that silently lost the delta
+     * (the bug this test was written after) is caught even though the word
+     * count is right. The conditions are counted separately as well: a handler
+     * that lost the b.eq, or emitted it as another b.ne, would still show three
+     * branches but would take over AppFuseUtil::Mount() — the defect this
+     * branch exists to prevent. */
+    int ncond = 0, n_ne = 0, n_eq = 0;
     for (int i = 0; i < nw; i++) {
         /* b.cond is 0x5400_0000 | imm19<<5 | cond: the opcode lives in bits
          * 31..24 and the condition in bits 3..0, with imm19 in between. So the
@@ -1560,8 +1834,11 @@ static int selftest(void) {
         ncond++;
         int64_t d;
         int cond = dec_b_cond(&d, w[i]);
-        if (cond != COND_NE) {
-            fprintf(stderr, "selftest FAIL: b.cond со словом %d — не b.ne\n", i);
+        if (cond == COND_NE) n_ne++;
+        else if (cond == COND_EQ) n_eq++;
+        else {
+            fprintf(stderr, "selftest FAIL: b.cond со словом %d — cond %d,"
+                            " ждали b.ne или b.eq\n", i, cond);
             return 1;
         }
         int dst = i + (int)d;
@@ -1577,9 +1854,39 @@ static int selftest(void) {
             return 1;
         }
     }
-    if (ncond != 2) {
-        fprintf(stderr, "selftest FAIL: условных переходов %d, ждали 2\n", ncond);
+    if (ncond != 3 || n_ne != 2 || n_eq != 1) {
+        fprintf(stderr, "selftest FAIL: условных переходов %d (b.ne %d, b.eq %d),"
+                        " ждали 3 (2 b.ne + 1 b.eq)\n", ncond, n_ne, n_eq);
         return 1;
+    }
+
+    /* The MS_LAZYTIME discriminator itself, as a contiguous sequence:
+     *
+     *     movz w9, #0x200, lsl #16   0x52a04009
+     *     tst  w3, w9                0x6a09007f
+     *     b.eq pass
+     *
+     * Checking the words rather than trusting the emitter is the point: this
+     * sequence is the only thing keeping the handler off AppFuseUtil::Mount(),
+     * and a wrong immediate here would silently redirect app-fuse mounts with
+     * nothing else in the test noticing. */
+    {
+        int seq_at = -1;
+        for (int i = 0; i + 2 < nw; i++) {
+            if (w[i] == 0x52a04009u && w[i + 1] == 0x6a09007fu &&
+                (w[i + 2] >> 24) == 0x54u) { seq_at = i; break; }
+        }
+        if (seq_at < 0) {
+            fprintf(stderr, "selftest FAIL: нет проверки MS_LAZYTIME"
+                            " (movz w9,#0x200,lsl#16; tst w3,w9; b.eq)\n");
+            return 1;
+        }
+        int64_t d = 0;
+        if (dec_b_cond(&d, w[seq_at + 2]) != COND_EQ) {
+            fprintf(stderr, "selftest FAIL: MS_LAZYTIME проверяется не b.eq"
+                            " (слово %d)\n", seq_at + 2);
+            return 1;
+        }
     }
 
     /* The take-over path must end `ldp x29,x30,[sp],#16; ret`, and that is the
@@ -1627,7 +1934,7 @@ static int selftest(void) {
     }
 
     /* the other four pool values must be present verbatim */
-    uint64_t want[] = { type_va, src_va, umount_va, mount_va };
+    uint64_t want[] = { type_va, src_va, mount_va };
     for (size_t k = 0; k < sizeof(want) / sizeof(want[0]); k++) {
         bool found = false;
         for (int i = 0; i + 1 < nw; i++) {
@@ -1649,6 +1956,60 @@ static int selftest(void) {
     if (!have_f) {
         fprintf(stderr, "selftest FAIL: нет 'mov w3, #0x5000'\n");
         return 1;
+    }
+
+    /* ---- the stub patch must fit, and carry the WHOLE address ----
+     *
+     * This is the check whose absence cost a bootloop. The patch has to encode a
+     * full 64-bit handler address inside a 16-byte slot, and exactly one layout
+     * does: `ldr x17,#8` at +0 (which therefore reads +8), `br x17` at +4, quad
+     * at +8. Asserting the words alone is not enough — the failure mode was a
+     * literal that fell past the end of the buffer, so the test also decodes the
+     * load the way the CPU does and requires the 8 bytes it addresses to hold the
+     * address we asked for, and to lie inside STUB_PATCH_LEN. */
+    {
+        uint8_t sp[STUB_PATCH_LEN];
+        uint64_t want_handler = 0x000000ab1234ef00ULL;  /* deliberately > 32 bits */
+        memset(sp, 0xAA, sizeof(sp));   /* poison — a byte we fail to write shows */
+        build_stub_patch(sp, want_handler);
+
+        uint32_t s0, s1;
+        memcpy(&s0, sp + 0, 4);
+        memcpy(&s1, sp + 4, 4);
+        if (s0 != 0x58000051u) {
+            fprintf(stderr, "selftest FAIL: трамплин, слово0 %08x — не 'ldr x17,#8'\n", s0);
+            return 1;
+        }
+        if (s1 != 0xd61f0220u) {
+            fprintf(stderr, "selftest FAIL: трамплин, слово1 %08x — не 'br x17'\n", s1);
+            return 1;
+        }
+
+        /* decode the literal offset the way the CPU does: pc + sign_extend(imm19)*4 */
+        int64_t lit_off = stub_literal_off(sp);
+        if (lit_off != 8) {
+            fprintf(stderr, "selftest FAIL: 'ldr x17' читает +%lld, ждали +8\n",
+                    (long long)lit_off);
+            return 1;
+        }
+        if (lit_off + 8 > STUB_PATCH_LEN) {
+            fprintf(stderr, "selftest FAIL: литерал +%lld..+%lld не влезает в %d байт\n",
+                    (long long)lit_off, (long long)lit_off + 7, STUB_PATCH_LEN);
+            return 1;
+        }
+        uint64_t got_handler = 0;
+        memcpy(&got_handler, sp + lit_off, 8);
+        if (got_handler != want_handler) {
+            fprintf(stderr, "selftest FAIL: в литерале %016llx, ждали %016llx "
+                            "(старшая половина адреса потеряна?)\n",
+                    (unsigned long long)got_handler,
+                    (unsigned long long)want_handler);
+            return 1;
+        }
+        if (!stub_is_patched(sp)) {
+            fprintf(stderr, "selftest FAIL: stub_is_patched не узнал свой же патч\n");
+            return 1;
+        }
     }
 
     info("selftest: ок — %d байт, пул и оба пути на месте", n);
@@ -1889,7 +2250,7 @@ resolved_as_file:
      * never changes again, so the handler can carry the real libc addresses.
      * Read them from the live process and report them; if either is zero the
      * process is not fully relocated and we must not patch. */
-    uint64_t real_mount = 0, real_umount2 = 0;
+    uint64_t real_mount = 0;
     if (s.is_proc) {
         if (mem_read(s.pid, s.base + r.got_slot, &real_mount,
                      sizeof(real_mount)) != 0) {
@@ -1898,24 +2259,13 @@ resolved_as_file:
             src_close(&s);
             return EXIT_NO_RESOLVE;
         }
-        if (mem_read(s.pid, s.base + r.umount2_got, &real_umount2,
-                     sizeof(real_umount2)) != 0) {
-            warn("%s: не читается GOT-слот \"%s\" (0x%llx)", s.label,
-                 UMOUNT2_SYM, (unsigned long long)(s.base + r.umount2_got));
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
-        info("%s: GOT \"%s\"@0x%llx -> 0x%llx; \"%s\"@0x%llx -> 0x%llx",
+        info("%s: GOT \"%s\"@0x%llx -> 0x%llx",
              s.label, TARGET_SYM,
              (unsigned long long)(s.base + r.got_slot),
-             (unsigned long long)real_mount, UMOUNT2_SYM,
-             (unsigned long long)(s.base + r.umount2_got),
-             (unsigned long long)real_umount2);
-        if (!real_mount || !real_umount2) {
-            warn("%s: GOT-слоты не заполнены (%s=0x%llx, %s=0x%llx) — "
-                 "процесс ещё не слинкован, отказываюсь",
-                 s.label, TARGET_SYM, (unsigned long long)real_mount,
-                 UMOUNT2_SYM, (unsigned long long)real_umount2);
+             (unsigned long long)real_mount);
+        if (!real_mount) {
+            warn("%s: GOT-слот \"%s\" пуст — процесс ещё не слинкован, "
+                 "отказываюсь", s.label, TARGET_SYM);
             src_close(&s);
             return EXIT_NO_RESOLVE;
         }
@@ -1989,27 +2339,82 @@ resolved_as_file:
     }
 
     /*
-     * Place the handler in the trailing zero padding of the .plt page, then
-     * point the stub at it. The .plt is a file-backed r-x mapping, so the
-     * bytes are writable through /proc/<pid>/mem by COW and no mmap/mprotect/
-     * syscall injection is needed.
+     * Where the handler goes: the cheapest home is the trailing padding of the
+     * .plt page — a file-backed r-x mapping, writable through /proc/<pid>/mem
+     * by COW, no mmap/mprotect/syscall injection needed. But that padding is
+     * not guaranteed: a build can pack its PLT flush to the end of the
+     * executable segment (measured on the device's vold: 0 bytes after the
+     * last stub, and no zero run >= 256 bytes anywhere in .text). Then the
+     * handler needs memory the image does not provide, and we ask vold itself
+     * for a page: vold is made to map a page of its own binary executable
+     * (see vold_exec_page).
      *
-     * Where exactly: after the last stub, inside the same page as the stubs,
-     * at a 16-byte boundary, in space that is all zero. That keeps the handler
-     * in a region that is unambiguously padding — we verify it is zero before
-     * writing, so we can never step on real code.
+     * The handler is built for the address it will live at, so that address is
+     * fixed here first, as an ABSOLUTE one: the PLT search returns an offset
+     * into the image, which becomes s.base + off in the process, while the
+     * injected page is already absolute. The PLT search is tried first because
+     * it leaves no new mapping and no trace in /proc/<pid>/maps.
      */
-    uint64_t handler_va = 0;
-    if (find_handler_room(&s, r.stub_va, &handler_va) != 0) {
-        warn("%s: не нашлось свободного места под обработчик в .plt-странице",
-             s.label);
-        src_close(&s);
-        return EXIT_NO_RESOLVE;
+    uint64_t handler_abs = 0;
+    bool handler_in_mapping = false;
+    {
+        uint64_t off = 0;
+        bool found = false;
+        if (!s.is_proc) {
+            /* Offline (--file): keep the old offset semantics, no injection. */
+            if (find_handler_room(&s, r.stub_va, &off) != 0) {
+                warn("%s: не нашлось свободного места под обработчик в .plt-странице",
+                     s.label);
+                src_close(&s);
+                return EXIT_NO_RESOLVE;
+            }
+            handler_abs = s.base + off;
+            found = true;
+        } else if (find_handler_room(&s, r.stub_va, &off) == 0) {
+            handler_abs = s.base + off;
+            found = true;
+        }
+#if defined(__aarch64__)
+        else {
+            /* No room in the image. Ask vold to map a page of its own binary
+             * executable — anonymous executable memory is refused (see the
+             * note above vold_exec_page). */
+            char self[4096];
+            if (!pid_is_vold(s.pid, self, sizeof(self))) {
+                warn("%s: в .plt места нет, и путь к исполняемому файлу не узнать",
+                     s.label);
+                src_close(&s);
+                return EXIT_NO_RESOLVE;
+            }
+            handler_abs = vold_exec_page(s.pid, self);
+            if (handler_abs == 0) {
+                warn("%s: в .plt места нет, и исполняемую страницу из %s"
+                     " получить не удалось", s.label, self);
+                src_close(&s);
+                return EXIT_NO_RESOLVE;
+            }
+            handler_in_mapping = true;
+            found = true;
+            info("%s: в .plt места нет — взял исполняемую страницу из %s"
+                 " (0x%llx)", s.label, self, (unsigned long long)handler_abs);
+        }
+#else
+        else {
+            warn("%s: не нашлось свободного места под обработчик в .plt-странице",
+                 s.label);
+            src_close(&s);
+            return EXIT_NO_RESOLVE;
+        }
+#endif
+        if (!found) {
+            src_close(&s);
+            return EXIT_NO_RESOLVE;
+        }
     }
 
     uint8_t hbuf[512];
-    int hlen = build_handler(hbuf, sizeof(hbuf), s.base + handler_va,
-                             real_mount, real_umount2,
+    int hlen = build_handler(hbuf, sizeof(hbuf), handler_abs,
+                             real_mount,
                              s.base + fs.src_va, s.base + fs.type_va,
                              RAW_PATH);
     if (hlen <= 0) {
@@ -2018,9 +2423,9 @@ resolved_as_file:
         return EXIT_NO_RESOLVE;
     }
 
-    info("%s: обработчик %d байт по 0x%llx (в процессе 0x%llx)",
-         s.label, hlen, (unsigned long long)handler_va,
-         (unsigned long long)(s.base + handler_va));
+    info("%s: обработчик %d байт по 0x%llx%s",
+         s.label, hlen, (unsigned long long)handler_abs,
+         handler_in_mapping ? " [запрошенная страница]" : " (в .plt)");
 
     if (dry_run) {
         info("--dry-run: обработчик не записан; трамплин 0x%llx не тронут",
@@ -2029,17 +2434,17 @@ resolved_as_file:
         return EXIT_OK;
     }
 
-    /* 1) write the handler into the padding */
-    if (mem_write(s.pid, s.base + handler_va, hbuf, (size_t)hlen) != 0) {
+    /* 1) write the handler into the chosen home */
+    if (mem_write(s.pid, handler_abs, hbuf, (size_t)hlen) != 0) {
         warn("%s: не записать обработчик по 0x%llx: %s", s.label,
-             (unsigned long long)(s.base + handler_va), strerror(errno));
+             (unsigned long long)handler_abs, strerror(errno));
         src_close(&s);
         return EXIT_NO_WRITE;
     }
 
     /* 2) verify it landed, byte for byte */
     uint8_t back[512];
-    if (mem_read(s.pid, s.base + handler_va, back, (size_t)hlen) != 0 ||
+    if (mem_read(s.pid, handler_abs, back, (size_t)hlen) != 0 ||
         memcmp(back, hbuf, (size_t)hlen) != 0) {
         /* Roll back: the region was verified all-zero before we wrote, so
          * restoring it to zero returns vold to its pre-patch state (the stub
@@ -2047,7 +2452,7 @@ resolved_as_file:
         warn("%s: обработчик не читается обратно — возвращаю нули", s.label);
         uint8_t zeros[512];
         memset(zeros, 0, (size_t)hlen);
-        mem_write(s.pid, s.base + handler_va, zeros, (size_t)hlen);
+        mem_write(s.pid, handler_abs, zeros, (size_t)hlen);
         src_close(&s);
         return EXIT_NO_WRITE;
     }
@@ -2055,7 +2460,7 @@ resolved_as_file:
     /* 3) redirect the stub. The stub is 16 bytes; our replacement is 16 bytes,
      * so no neighbouring stub is touched. */
     uint8_t patch[STUB_PATCH_LEN];
-    build_stub_patch(patch, s.base + handler_va);
+    build_stub_patch(patch, handler_abs);
     if (mem_write(s.pid, run_stub, patch, sizeof(patch)) != 0) {
         warn("%s: не переписать трамплин 0x%llx: %s", s.label,
              (unsigned long long)run_stub, strerror(errno));
@@ -2063,8 +2468,15 @@ resolved_as_file:
         return EXIT_NO_WRITE;
     }
 
-    /* 4) verify the stub is now ours */
-    uint8_t chk[16];
+    /* 4) verify the stub is now ours — instructions AND literal.
+     *
+     * Checking the two instruction words alone is not enough, and that is not
+     * hypothetical: the version that shipped a bootloop had exactly the right
+     * words, and a literal that fell past the end of the 16 bytes, so the load
+     * picked up the neighbouring stub's adrp for the top half of the address.
+     * `stub_is_patched` said yes. So decode the load the way the CPU will and
+     * require the 8 bytes it addresses to be the handler address. */
+    uint8_t chk[STUB_PATCH_LEN];
     if (mem_read(s.pid, run_stub, chk, sizeof(chk)) != 0 ||
         !stub_is_patched(chk)) {
         warn("%s: трамплин после записи не подтверждается — возможно, "
@@ -2072,9 +2484,34 @@ resolved_as_file:
         src_close(&s);
         return EXIT_NO_WRITE;
     }
+    {
+        int lit = stub_literal_off(chk);
+        if (lit < 0 || lit + 8 > STUB_PATCH_LEN) {
+            warn("%s: литерал трамплина по смещению %d не влезает в %d байт — "
+                 "откатываю (vold ушёл бы в SIGSEGV на первом же mount)",
+                 s.label, lit, STUB_PATCH_LEN);
+            mem_write(s.pid, run_stub, cur, sizeof(cur));
+            src_close(&s);
+            return EXIT_NO_WRITE;
+        }
+        uint64_t got = 0;
+        memcpy(&got, chk + lit, 8);
+        if (got != handler_abs) {
+            warn("%s: трамплин ведёт на 0x%llx, а обработчик на 0x%llx — "
+                 "откатываю (vold ушёл бы в SIGSEGV на первом же mount)",
+                 s.label, (unsigned long long)got,
+                 (unsigned long long)handler_abs);
+            mem_write(s.pid, run_stub, cur, sizeof(cur));
+            uint8_t zeros[512];
+            memset(zeros, 0, (size_t)hlen);
+            mem_write(s.pid, handler_abs, zeros, (size_t)hlen);
+            src_close(&s);
+            return EXIT_NO_WRITE;
+        }
+    }
 
     info("%s: патч поставлен — трамплин \"%s\" ведёт на обработчик 0x%llx",
-         s.label, TARGET_SYM, (unsigned long long)(s.base + handler_va));
+         s.label, TARGET_SYM, (unsigned long long)handler_abs);
     src_close(&s);
     return EXIT_OK;
 }
