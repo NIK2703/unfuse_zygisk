@@ -9,22 +9,79 @@
 #   * the media_rw_data_file label on the /data/media root;
 #   * the ACL for group 9997 on the raw /data/media tree;
 #   * vold's FUSE mount for emulated storage redirected away, so the apps reach
-#     the raw tree rather than FUSE.
+#     the raw tree rather than FUSE;
+#   * the module's state directory, labelled so the module's own domain may
+#     write to it.
 #
-# storage.sh does the first two. The third has to happen before vold prepares
-# the user's storage rather than after: tools/vold-fusefs is pointed at vold to
-# redirect its mount() trampoline, so the FUSE mount for emulated storage is
-# turned into a bind of the raw tree instead of being made at all.
+# storage.sh does the first two, the vold patch below does the third, and the
+# first section here does the fourth.
+#
+# The third has to happen before vold prepares the user's storage rather than
+# after: tools/vold-fusefs is pointed at vold to redirect its mount()
+# trampoline, so the FUSE mount for emulated storage is turned into a bind of the
+# raw tree instead of being made at all.
 #
 
 MODDIR=${MODDIR:-${0%/*}}
 LOG=/data/adb/unfuse_zygisk.log
 
-# The native module logs one sample per boot and guards it with this marker, so
-# it has to be gone before Zygote starts — otherwise the tag stays silent for
-# the whole boot after the first one. Here, not in service.sh: that runs after
+# --- state directory for the native module ------------------------------------
+#
+# The Zygisk module keeps two files: `once`, claimed by the first app that gets
+# storage so the tag carries one sample per boot, and `no_hooks`, created by hand
+# to switch the libc patching off.
+#
+# They cannot live in /data/adb itself. The module runs in the zygote domain —
+# preAppSpecialize is called before the process specialises — and the only thing
+# the policy gives that domain over /data/adb is traversal:
+#
+#   allow zygote adb_data_file dir search          (zygisksu/sepolicy.rule)
+#
+# search is what the path walk to the module's own .so needs, and it is all
+# there is. open(O_CREAT) there needs add_name and write on the directory, so it
+# fails, and the failure is dontaudit'ed: nothing in logcat, nothing anywhere.
+# Measured on the device by running permissive for four seconds — the only way to
+# see an unaudited denial — the marker appeared and the sample was written the
+# moment SELinux stopped blocking, with no avc line either way. Full account in
+# the header of src/unfuse_zygisk.cpp.
+#
+# So the two files get a directory of their own, labelled with the one type the
+# policy hands out to every domain:
+#
+#   allow * magisk_file dir *      allow * magisk_file file *
+#
+# and a file created inside such a directory inherits that label — verified on
+# the device, where touch and mkdir inside it both came out magisk_file. That is
+# what lets the module create and write its state from the zygote domain without
+# a policy rule of its own.
+#
+# mkdir, not rm -rf: no_hooks is the user's file and has to survive a reboot. The
+# label is re-applied every boot because nothing guarantees it survived the last
+# one. Not repeated in service.sh either, unlike the vold patch: that one is
+# repeated because vold may not exist yet at this stage, and this has no such
+# dependency — if the directory is not there now, it never will be.
+#
+STATE=/data/adb/unfuse_zygisk.state
+mkdir -p "$STATE" 2>/dev/null
+chcon u:object_r:magisk_file:s0 "$STATE" 2>/dev/null
+
+state_label=$(ls -Zd "$STATE" 2>/dev/null | cut -d' ' -f1)
+if [ ! -d "$STATE" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: нет $STATE —" \
+        "модуль не сможет создать маркер и не напишет сэмпл в лог" >>"$LOG"
+elif [ "$state_label" != "u:object_r:magisk_file:s0" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: у $STATE метка" \
+        "'$state_label', а не magisk_file — писать в неё модуль не сможет" >>"$LOG"
+fi
+
+# The marker has to be gone before Zygote starts, otherwise the tag stays silent
+# for the whole boot after the first one. Here, not in service.sh: that runs after
 # apps are already launching.
-rm -f /data/adb/unfuse_zygisk.once
+rm -f "$STATE/once" 2>/dev/null
+if [ -e "$STATE/once" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: маркер прошлой загрузки" \
+        "не снялся — в этой загрузке сэмпла не будет" >>"$LOG"
+fi
 
 sh "$MODDIR/storage.sh" post-fs-data
 

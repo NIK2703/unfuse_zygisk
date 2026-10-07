@@ -24,15 +24,62 @@
  * The libc entry patch (hook_libc.cpp) runs after specialisation, on the raw
  * source: it shapes modes into the sdcardfs view (group rw/rwx, other cleared)
  * and synthesises the group the raw tree does not carry. Disabled by
- * /data/adb/unfuse_zygisk.no_hooks, checked in preAppSpecialize while still
- * root, since /data/adb is invisible to apps.
+ * /data/adb/unfuse_zygisk.state/no_hooks, checked in preAppSpecialize while
+ * still root, since /data/adb is invisible to apps.
  *
  * The tag gets one sample per boot, not one per app launch: the first app that
- * receives storage claims /data/adb/unfuse_zygisk.once and logs, the rest stay
- * quiet. post-fs-data.sh removes the marker at boot. Everything else on the tag
- * is an error. The sample names the Android release the hooks ran on, what the
- * loaded images declare about branch protection, and complains when the tally
- * differs from what that release is known to yield (android_ver.h).
+ * receives storage claims /data/adb/unfuse_zygisk.state/once and logs, the rest
+ * stay quiet. post-fs-data.sh removes the marker at boot. Everything else on the
+ * tag is an error. The sample names the domain this code runs in before
+ * specialisation, the Android release the hooks ran on, what the loaded images
+ * declare about branch protection, and complains when the tally differs from
+ * what that release is known to yield (android_ver.h).
+ *
+ * ---------------------------------------------------------------------------
+ * Why the state files live in a directory of their own — measured 2026-10-07
+ * ---------------------------------------------------------------------------
+ *
+ * Both files used to sit directly in /data/adb, and neither of them ever did
+ * anything: the tag stayed silent boot after boot, the sample never appeared
+ * and the kill-switch could not be trusted either. The reason is the domain
+ * this code runs in. preAppSpecialize is called before the process specialises,
+ * so it is still the zygote domain, and the only thing the policy gives that
+ * domain over /data/adb is traversal:
+ *
+ *   allow zygote adb_data_file dir search          (zygisksu/sepolicy.rule)
+ *
+ * search is what the path walk to the module's own .so needs, and it is all
+ * there is. open(O_CREAT|O_EXCL) on /data/adb/unfuse_zygisk.once needs add_name
+ * and write on the directory, so it fails — and the failure is dontaudit'ed, so
+ * it shows up neither in logcat nor anywhere else. The module simply never
+ * spoke, and nothing said why.
+ *
+ * Proved by running the device permissive for four seconds, which is the only
+ * way to see a denial that is not audited: the moment SELinux stopped blocking,
+ * the marker appeared as u:object_r:adb_data_file:s0 and both sample lines were
+ * written; back in enforcing, both stopped again. No avc line either way.
+ *
+ * The fix is a directory labelled with the one type the policy hands out to
+ * every domain — Zygisk Next's own rule, on the device at
+ * /data/adb/modules/zygisksu/sepolicy.rule:
+ *
+ *   type magisk_file file_type
+ *   typeattribute magisk_file mlstrustedobject
+ *   allow * magisk_file dir *
+ *   allow * magisk_file file *
+ *
+ * A file created inside such a directory inherits the label — verified on the
+ * device, where touch and mkdir inside it both came out magisk_file — so the
+ * module can create and write its state from the zygote domain without shipping
+ * a policy rule of its own. post-fs-data.sh creates and labels the directory at
+ * every boot, before Zygote starts, and re-labels it every time because nothing
+ * guarantees the label survived the last boot.
+ *
+ * The switch fails open, deliberately. An absent no_hooks is the default, and a
+ * state directory that cannot be read is not evidence that the user wanted the
+ * hooks off: switching them off on that basis would turn a broken install into a
+ * quiet no-op, which is exactly the failure just cured here. So an access() that
+ * fails with anything other than ENOENT is reported rather than swallowed.
  *
  * ---------------------------------------------------------------------------
  * A second bind used to live here — removed 2026-10-07 as redundant
@@ -82,8 +129,11 @@
  * false.
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <android/log.h>
@@ -93,21 +143,66 @@
 
 #define LOG_TAG "UnfuseZygisk"
 
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
 namespace {
 
-constexpr const char *kNoHooksFlag = "/data/adb/unfuse_zygisk.no_hooks";
+// The module's state directory: the two files below, and nothing else. Created
+// and labelled by post-fs-data.sh before Zygote starts — the module cannot
+// create it, and that is the whole point of the header above. A macro rather
+// than a constant so the two paths stay compile-time joins of one name.
+#define STATE_DIR "/data/adb/unfuse_zygisk.state"
+
+// The switch: present means the libc patching stays off. Absent is the default.
+constexpr const char *kNoHooksFlag = STATE_DIR "/no_hooks";
 
 // Claimed by the first app that gets storage, so the tag carries one sample per
 // boot instead of one per launch. post-fs-data.sh removes it.
-constexpr const char *kOnceFlag = "/data/adb/unfuse_zygisk.once";
+constexpr const char *kOnceFlag = STATE_DIR "/once";
 
 // Creates path if absent; true only for the caller that created it. Several
 // apps specialise at once, so this must be atomic — O_EXCL is.
+//
+// EEXIST is the ordinary outcome for every app but the first, so it stays
+// quiet. Anything else means the directory post-fs-data.sh prepares is missing
+// or unreachable, and then the tag would go silent for the whole boot with no
+// explanation — which is the defect this marker is recovering from. Say it out
+// loud instead, on every launch, until it is fixed.
 bool claim_once(const char *path) {
     int fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        if (errno != EEXIST) {
+            LOGE("маркер %s не создался: %s — сэмпла в логе не будет, "
+                 "проверьте каталог состояния", path, strerror(errno));
+        }
+        return false;
+    }
     close(fd);
     return true;
+}
+
+// The domain preAppSpecialize runs in. A field of its own because it is not
+// knowable from outside: the process has not specialised yet, so /proc/<pid> of
+// the running app shows the app's domain and never this one — and it is this
+// one that decides whether the two paths above can be touched at all. "?" means
+// the read was refused, which is itself an answer.
+void current_domain(char *out, size_t n) {
+    snprintf(out, n, "?");
+    int fd = open("/proc/self/attr/current", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+
+    const ssize_t got = read(fd, out, n - 1);
+    close(fd);
+    if (got <= 0) {
+        snprintf(out, n, "?");
+        return;
+    }
+
+    // The attribute comes back NUL-terminated, sometimes with a newline.
+    size_t len = static_cast<size_t>(got);
+    while (len > 0 && (out[len - 1] == '\0' || out[len - 1] == '\n')) out[--len] = '\0';
+    if (len == 0) snprintf(out, n, "?");
 }
 
 // android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is
@@ -132,9 +227,6 @@ bool is_android_writable(int mode) {
            mode == kMountModeExternalAndroidWritableR;
 }
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
 class UnfuseZygisk : public zygisk::ModuleBase {
 public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
@@ -150,16 +242,27 @@ public:
             *args->mount_storage_dirs = JNI_FALSE;
         }
 
+        // The switch is a file the user creates in the state directory; its
+        // absence is the default and means "hooks on". See the header for why
+        // this fails open and why a failure that is not plain "no such file" is
+        // reported rather than swallowed.
+        errno = 0;
         hooks_allowed_ = (access(kNoHooksFlag, F_OK) != 0);
+        if (hooks_allowed_ && errno != 0 && errno != ENOENT) {
+            LOGE("выключатель %s не прочитался: %s — хуки включены",
+                 kNoHooksFlag, strerror(errno));
+        }
 
         // Per-launch by nature, and a launch happens every few seconds, so the
         // tag is written only by the app that wins the marker. post-fs-data.sh
         // removes it before Zygote starts, so this is one line per boot.
         log_once_ = claim_once(kOnceFlag);
         if (log_once_) {
+            char domain[64];
+            current_domain(domain, sizeof domain);
             LOGI("Android/{data,obb} не изолируются, сырое дерево даёт bind vold: "
-                 "uid=%d%s",
-                 static_cast<int>(args->uid),
+                 "uid=%d, домен %s%s",
+                 static_cast<int>(args->uid), domain,
                  hooks_allowed_ ? ", хуки включены" : ", хуки выключены файлом");
         }
     }
