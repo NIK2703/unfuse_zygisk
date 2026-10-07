@@ -12,12 +12,10 @@
  * Zygote does not cover Android/{data,obb} with a per-package tmpfs, giving full
  * Android/data and Android/obb as before scoped storage.
  *
- * Source chosen at runtime: primary /mnt/runtime/full/emulated — sdcardfs, mask
- * 0007, gid 9997 -> 0770/0660, raised by storage.sh since this ROM has
- * external_storage.sdcardfs.enabled=0 and vold does not mount it; fallback raw
- * /data/media when the kernel lacks sdcardfs (the path AOSP exposes at
- * /mnt/pass_through; storage.sh adds a named 9997 ACL entry, else it is
- * 1023:1023 with 0550/2770/0670 and apps cannot enter). The log names the winner.
+ * Source: raw /data/media, always. vold's FUSE mount for emulated storage is
+ * redirected away by tools/vold-fusefs, so the only thing to place under the
+ * point is the raw tree. storage.sh adds a named 9997 ACL entry to it, else it
+ * is 1023:1023 with 0550/2770/0670 and apps cannot enter.
  *
  * DEFAULT and ANDROID_WRITABLE (SAF provider com.android.externalstorage behind
  * the system "Files" app) are handled; NONE, INSTALLER and PASS_THROUGH are
@@ -26,9 +24,9 @@
  * same on every release — 8 on 11, 4 from 12 on — so both are accepted; see
  * is_android_writable().
  *
- * The libc entry patch (hook_libc.cpp) runs after specialisation, only on the
- * RAW source (on sdcardfs it is useless/harmful: the fs synthesises mode/group
- * and an ACL write cannot pass the mount). Disabled by
+ * The libc entry patch (hook_libc.cpp) runs after specialisation, on the raw
+ * source: it shapes modes into the sdcardfs view (group rw/rwx, other cleared)
+ * and synthesises the group the raw tree does not carry. Disabled by
  * /data/adb/unfuse_zygisk.no_hooks, checked in preAppSpecialize while still
  * root, since /data/adb is invisible to apps.
  *
@@ -62,10 +60,8 @@
 
 namespace {
 
-// Primary source: sdcardfs with full access (mask=0007, gid=9997).
-constexpr const char *kSourceSdcardfs = "/mnt/runtime/full/emulated";
-
-// Fallback: raw volume tree when sdcardfs is absent from the kernel.
+// The raw volume tree. vold's FUSE mount is redirected away by tools/vold-fusefs,
+// so this is the only source the module places under a point.
 constexpr const char *kSourceRaw = "/data/media";
 
 constexpr const char *kNoHooksFlag = "/data/adb/unfuse_zygisk.no_hooks";
@@ -109,7 +105,6 @@ bool is_android_writable(int mode) {
 constexpr unsigned kAidUserOffset = 100000;
 
 // SDCARDFS_SUPER_MAGIC, FUSE_SUPER_MAGIC (include/uapi/linux/magic.h)
-constexpr unsigned long kSdcardFsMagic = 0x5dca2df5UL;
 constexpr unsigned long kFuseMagic = 0x65735546UL;
 
 // android::base::GetBoolProperty: the same set of spellings it accepts, and the
@@ -144,8 +139,7 @@ bool prop_bool(const char *name, bool fallback) {
 bool zygote_uses_runtime_view() { return !prop_bool("persist.sys.fuse", false); }
 
 // ExternalStorageViews[] in that arm, restricted to the two modes the module
-// handles. ANDROID_WRITABLE maps to /mnt/runtime/full, which is the sdcardfs
-// source itself, so the caller skips it when the source already is sdcardfs.
+// handles.
 const char *runtime_view_for_mode(int mode) {
     if (mode == kMountModeExternalDefault) return "default";
     if (is_android_writable(mode)) return "full";
@@ -154,8 +148,6 @@ const char *runtime_view_for_mode(int mode) {
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
-enum class Source { Sdcardfs, Raw };
 
 void rollback(const std::string &dst) { umount2(dst.c_str(), MNT_DETACH); }
 
@@ -178,21 +170,13 @@ bool bind_and_type(const char *src, const std::string &dst, unsigned long *type)
     return true;
 }
 
-// Places a working source under dst. What matters is the fs type under the
-// point, not mount(2) success: without sdcardfs storage.sh cannot mount it and
-// the bind would expose an empty directory. On mismatch, roll back and try the
-// raw tree, so the app never ends up with no storage.
-bool attach(const std::string &dst, Source *used) {
+// Places the raw tree under dst. What matters is the fs type under the point,
+// not mount(2) success: the point must not be left carrying FUSE, which is what
+// this module exists to remove. tools/vold-fusefs is what keeps FUSE out; if it
+// is missing or failed, the check here catches it rather than silently exposing
+// a FUSE view.
+bool attach(const std::string &dst) {
     unsigned long type = 0;
-
-    if (bind_and_type(kSourceSdcardfs, dst, &type)) {
-        if (type == kSdcardFsMagic) {
-            *used = Source::Sdcardfs;
-            return true;
-        }
-        LOGE("%s: под точкой не sdcardfs (0x%lx) — откат", dst.c_str(), type);
-        rollback(dst);
-    }
 
     if (!bind_and_type(kSourceRaw, dst, &type)) return false;
 
@@ -202,7 +186,6 @@ bool attach(const std::string &dst, Source *used) {
         return false;
     }
 
-    *used = Source::Raw;
     return true;
 }
 
@@ -231,15 +214,10 @@ public:
         // Zygote takes whatever point it finds under /storage: usually
         // /mnt/user/<user>/emulated, or /mnt/androidwritable/<user>/emulated for
         // ANDROID_WRITABLE with persist.sys.vold_app_data_isolation_enabled.
-        Source used = Source::Sdcardfs;
-        bool ok = attach("/mnt/user/" + user + "/emulated", &used);
+        bool ok = attach("/mnt/user/" + user + "/emulated");
 
         if (android_writable) {
-            Source writable = Source::Sdcardfs;
-            if (attach("/mnt/androidwritable/" + user + "/emulated", &writable)) {
-                ok = true;
-                used = writable;
-            }
+            if (attach("/mnt/androidwritable/" + user + "/emulated")) ok = true;
         }
 
         // The other arm of Zygote's MountEmulatedStorage(): when it is going to
@@ -247,22 +225,17 @@ public:
         // the substitution above is off the path. Put the source there as well.
         // Both binds are kept: /storage/self comes from /mnt/user/<user> even on
         // that arm, so dropping the first would lose it.
+        bool used_runtime_view = false;
         std::string runtime_dst;
         if (zygote_uses_runtime_view()) {
             const char *view = runtime_view_for_mode(mode);
             if (view != nullptr) {
                 const std::string dst =
                     std::string("/mnt/runtime/") + view + "/emulated";
-                // ANDROID_WRITABLE's view is /mnt/runtime/full, which IS the
-                // sdcardfs source: binding it onto itself adds nothing, while
-                // the raw fallback still has to be substituted there.
-                if (dst != kSourceSdcardfs) {
-                    Source rt = Source::Sdcardfs;
-                    if (attach(dst, &rt)) {
-                        ok = true;
-                        used = rt;
-                        runtime_dst = dst;
-                    }
+                if (attach(dst)) {
+                    ok = true;
+                    used_runtime_view = true;
+                    runtime_dst = dst;
                 }
             }
         }
@@ -272,13 +245,12 @@ public:
             *args->mount_storage_dirs = JNI_FALSE;
         }
 
-        raw_ = (used == Source::Raw);
         hooks_allowed_ = (access(kNoHooksFlag, F_OK) != 0);
 
         // Both lines below are per-launch by nature, and a launch happens every
         // few seconds, so the tag is written only by the app that wins the
-        // marker. status.sh reads that sample; when it is gone (logcat rolled
-        // over) it falls back to the module being mapped.
+        // marker. status.sh's libc fallback reads that sample; the sign in the
+        // module description reads the FUSE-off patch directly.
         log_once_ = claim_once(kOnceFlag);
         if (log_once_) {
             // The arm is named only when the runtime view is the one in play, so
@@ -286,18 +258,16 @@ public:
             // actually ran — the one thing about the mount that is not the same
             // on every release.
             const std::string arm =
-                runtime_dst.empty() ? std::string() : (", вид " + runtime_dst);
-            LOGI("%s подключён: uid=%d%s%s",
-                 used == Source::Sdcardfs ? "sdcardfs" : "сырой /data/media",
+                used_runtime_view ? (", вид " + runtime_dst) : std::string();
+            LOGI("сырой /data/media подключён: uid=%d%s%s",
                  static_cast<int>(args->uid),
-                 raw_ ? (hooks_allowed_ ? ", хуки включены" : ", хуки выключены файлом")
-                      : "",
+                 hooks_allowed_ ? ", хуки включены" : ", хуки выключены файлом",
                  arm.c_str());
         }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (!raw_ || !hooks_allowed_) return;
+        if (!hooks_allowed_) return;
 
         // Now specialised: this is app code, with its rights and namespace. The
         // libc patch cannot leak from here, unlike from preAppSpecialize.
@@ -352,7 +322,6 @@ public:
 
 private:
     // State survives specialisation: both callbacks run on the same instance.
-    bool raw_ = false;
     bool hooks_allowed_ = true;
     bool log_once_ = false;
 };

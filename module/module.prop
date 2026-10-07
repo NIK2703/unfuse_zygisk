@@ -3,4 +3,4 @@ name=Unfuse Zygisk
 version=v1.0
 versionCode=1
 author=NIK2703
-description=Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace and lifts Android/data and Android/obb isolation. Uses sdcardfs (mask 0007, gid 9997) when the kernel has it, otherwise raw /data/media with an ACL for group 9997. Mode is set by path=auto|sdcardfs|acl in the module's unfuse_zygisk.conf. Requires Zygisk.
+description=Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace and lifts Android/data and Android/obb isolation.

@@ -1,10 +1,10 @@
 #!/system/bin/sh
 #
-# service.sh — repeat the preparation after vold mounts the storages.
+# service.sh — repeat the preparation after vold mounts the storages, then
+# report the state.
 #
 # vold may have restored the media_userdir_file label while preparing
-# /data/media, so both storage.sh steps run again after it starts. They are
-# idempotent.
+# /data/media, so storage.sh runs again after it starts. The pass is idempotent.
 #
 
 MODDIR=${MODDIR:-${0%/*}}
@@ -37,33 +37,29 @@ else
     echo "[$(stamp)] service: патч vold НЕ встал — vold перепишет default-ACL у /data/media/0" >>"$LOG"
 fi
 
-# --- FUSE-off patch: confirmation (mode=fuse) --------------------------------
+# --- FUSE-off patch: confirmation --------------------------------------------
 #
 # Repeated for the same reason as vold-noacl: the patch lives in vold's memory
 # only, and at the post-fs-data stage vold may not have existed yet, or may have
 # been restarted by the framework since. The step is idempotent.
 #
-# Unlike vold-noacl, a failure here is visible rather than merely inconvenient:
-# if the patch is not in place, vold mounts FUSE and the mode silently reverts to
-# the acl behaviour. So the log line says explicitly which of the two happened,
-# and path-mode.sh reports the same thing on demand.
+# A failure here is visible rather than merely inconvenient: if the patch is not
+# in place, vold mounts FUSE over the raw tree and apps go back to seeing that
+# instead of direct storage. So the log line says explicitly which of the two
+# happened, and status.sh puts the same answer in the module description.
 #
-FUSEMODE=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' \
-    "$MODDIR/unfuse_zygisk.conf" 2>/dev/null \
-    | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
-case "$FUSEMODE" in
-    raw) FUSEMODE=acl ;;
-esac
-[ -n "$FUSEMODE" ] || FUSEMODE=auto
-
-if [ "$FUSEMODE" = fuse ]; then
-    FUSEFS="$MODDIR/tools/vold-fusefs"
-    if [ ! -x "$FUSEFS" ]; then
-        echo "[$(stamp)] service: нет $FUSEFS — FUSE останется смонтированным" >>"$LOG"
-    elif "$FUSEFS" >>"$LOG" 2>&1; then
-        echo "[$(stamp)] service: FUSE отключён в vold — MountUserFuse перехвачен" >>"$LOG"
-    else
-        echo "[$(stamp)] service: патч FUSE НЕ встал — vold смонтирует FUSE," \
-            "режим выродится в acl" >>"$LOG"
-    fi
+FUSEFS="$MODDIR/tools/vold-fusefs"
+if [ ! -x "$FUSEFS" ]; then
+    echo "[$(stamp)] service: нет $FUSEFS — FUSE останется смонтированным" >>"$LOG"
+elif "$FUSEFS" >>"$LOG" 2>&1; then
+    echo "[$(stamp)] service: FUSE отключён в vold — MountUserFuse перехвачен" >>"$LOG"
+else
+    echo "[$(stamp)] service: патч FUSE НЕ встал — vold смонтирует FUSE," \
+        "прямого доступа не будет" >>"$LOG"
 fi
+
+# --- the sign in the description ---------------------------------------------
+#
+# Reads the same patch state as the block above, and also runs on its own; it
+# does not care that the storage pass ran first.
+sh "$MODDIR/status.sh"
