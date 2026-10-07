@@ -32,9 +32,17 @@ sh "$MODDIR/storage.sh" post-fs-data
 # The deepest thing this branch does: instead of living alongside the FUSE mount
 # and fighting it for permissions (which is what the ACL work in storage.sh
 # does), vold's own mount() trampoline is redirected so that MountUserFuse()
-# binds /data/media onto the target rather than mounting FUSE on it. No FUSE
-# superblock is ever created for emulated storage, so there is nothing for the
-# ACL pass to chase.
+# ends with a bind of /data/media on top of the FUSE mount it asked for. The
+# FUSE superblock still exists — the fd it hands to MediaProvider is part of
+# its contract, and a volume whose daemon does not start is reported
+# "unmountable" — but nothing reaches it, because the bind is the topmost mount
+# at the path.
+#
+# The same run redirects vold's umount2() trampoline too. That is not a
+# separate feature: vold's teardown removes exactly one mount per path, so
+# without it UnmountUserFuse() would take our bind off and leave the FUSE mount
+# behind, and every later mount of the volume would fail with ENOTCONN. The two
+# hooks go in together or not at all.
 #
 # The patch lives in process memory, so it is re-applied every boot; it is
 # idempotent — on an already patched vold the tool confirms the patch instead of

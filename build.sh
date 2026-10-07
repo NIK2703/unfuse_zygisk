@@ -12,9 +12,11 @@
 #                                     stops overwriting those ACLs with its own
 #                                     group 1023 entry (C).
 #   module/tools/vold-fusefs-<abi>  — the FUSE-off patcher: redirects vold's
-#                                     mount() stub so MountUserFuse() binds
-#                                     /data/media onto the target instead of
-#                                     mounting FUSE at all (C).
+#                                     mount() stub so MountUserFuse() puts a
+#                                     bind of /data/media on top of the FUSE
+#                                     mount it asked for, and redirects the
+#                                     umount2() stub as well so the teardown
+#                                     clears both layers instead of one (C).
 # Then packs module/ into out/unfuse_zygisk-<version>.zip.
 #
 # Usage:

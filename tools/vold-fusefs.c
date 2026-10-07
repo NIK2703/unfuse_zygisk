@@ -1,6 +1,7 @@
 /*
  * vold-fusefs — stop vold from mounting FUSE for emulated storage, so the raw
- *               /data/media tree is what lands on /mnt/user/<user>/emulated.
+ *               /data/media tree is what lands on /mnt/user/<user>/emulated,
+ *               and keep vold's teardown consistent with that.
  *
  * ============================== why
  *
@@ -85,6 +86,38 @@
  * nothing reads. That is the platform's design, not a choice made here: the fd
  * is part of MountUserFuse()'s contract, and a bind mount cannot satisfy it.
  *
+ * ============================== and why a second stub has to go with it
+ *
+ * Making two mounts at fuse_path is only half the change, and shipping the
+ * first half alone produced the worst bug this tool has had: the volume mounted
+ * fine, then could never be mounted again.
+ *
+ * vold's teardown removes exactly ONE mount per path. UnmountUserFuse()
+ * (Utils.cpp:1696) calls ForceUnmount(), which is a single
+ * umount2(UMOUNT_NOFOLLOW) (Utils.cpp:477); UnmountTree() is a single
+ * umount2(MNT_DETACH) (Utils.cpp:1314). With two mounts stacked, that removed
+ * our bind and left the FUSE mount — now daemon-less — at fuse_path. Every
+ * access to the path then returned ENOTCONN, so the next MountUserFuse() failed:
+ *
+ *     E vold: Failed to mount emulated fuse volume: Transport endpoint is not
+ *             connected
+ *
+ * and the volume came up "unmountable" with no storage at all. /storage/emulated
+ * degraded with it, because init.rc makes /storage a slave recursive bind of
+ * /mnt/user/0 — one mount gone wrong there is visible to every app.
+ *
+ * The violated invariant is "one umount2 clears fuse_path", and the fix is to
+ * make it true again from the teardown side rather than to stop stacking: hook
+ * umount2 as well, and for a target shaped /mnt/user/<uid>/emulated unmount
+ * repeatedly until the path is really clear. Nothing else changes — every other
+ * target is passed through untouched, and the failure of a busy unmount still
+ * reaches ForceUnmount's SIGINT/SIGTERM/SIGKILL escalation.
+ *
+ * The two hooks are installed together or not at all. A vold carrying only the
+ * mount hook is worse than an unpatched vold, so a half-install is rolled back
+ * and reported rather than left in place. See build_umount_handler() for the
+ * handler, and FUSE_PATH_* above for why it recognises the path by shape.
+ *
  * ============================== why not name MountUserFuse directly
  *
  * It is not in .dynsym (checked on device: `readelf --dyn-syms` has no such
@@ -104,7 +137,8 @@
  * point... no: it does not. Instead the page is taken from the process by
  * remapping one of vold's own anonymous mappings, see "where the handler goes".
  *
- * The handler is deliberately small and does only what is needed:
+ * The handlers are deliberately small and do only what is needed. The mount
+ * handler:
  *
  *   1. keep the target (x1) and the caller's return address;
  *   2. compare x0 with "/dev/fuse", x2 with "fuse", and test x3 against
@@ -117,12 +151,25 @@
  *        b. mount("/data/media", target, NULL, MS_BIND|MS_REC, NULL);
  *        c. return 0.
  *
- * Step (a) needs no setup at all: the handler is entered through the `mount`
- * stub, so x0..x4 already hold exactly the arguments mount() wants. Only the
- * target has to survive the call, and it is parked in x10 — a caller-saved
- * temporary, NOT x19: the handler runs in place of a real call, so every
- * callee-saved register must come back untouched, and there is no frame slot
- * for one here.
+ * and the umount2 handler:
+ *
+ *   1. match the target against /mnt/user/<digits>/emulated exactly;
+ *   2. if it does not match -> tail-call the original umount2 with x0/x1
+ *      untouched, so an ordinary unmount is bit-for-bit what it was;
+ *   3. if it does -> call umount2 repeatedly, at most four times, stopping at
+ *      the first failure, and return that last result.
+ *
+ * Step (a) of the mount handler needs no setup at all: the handler is entered
+ * through the `mount` stub, so x0..x4 already hold exactly the arguments mount()
+ * wants. Only the target has to survive the call, and it is parked in x10 — a
+ * caller-saved temporary, NOT x19: the handler runs in place of a real call, so
+ * every callee-saved register must come back untouched, and there is no frame
+ * slot for one here.
+ *
+ * The umount2 handler cannot park anything in a caller-saved register: it makes
+ * its call in a loop, so the path and the flags have to survive it. They go in
+ * its own 32-byte frame, and the count with them. Nothing else is spilled, and
+ * no callee-saved register is touched there either.
  *
  * ============================== where the handler goes
  *
@@ -159,11 +206,22 @@
  * ============================== when it refuses
  *
  * Premises checked; if any fails the tool refuses (code 2) and writes NOTHING:
- *   (1) `mount` has exactly one .rela.plt JUMP_SLOT and one stub;
- *   (2) the handler has a home — the .plt padding, or a page vold grants;
- *   (3) exactly one call site in vold's .text passes "/dev/fuse" as the source
+ *   (1) `mount` AND `umount2` each have exactly one .rela.plt JUMP_SLOT and one
+ *       stub;
+ *   (2) both stubs are still intact — neither already redirected, and neither
+ *       already OURS. A vold with only one of the two hooks is refused
+ *       outright: it cannot clear what it mounts, which is the ENOTCONN
+ *       regression itself;
+ *   (3) the handlers have a home — the .plt padding, or a page vold grants —
+ *       large enough for both (364 bytes today, against a 512-byte search);
+ *   (4) exactly one call site in vold's .text passes "/dev/fuse" as the source
  *       (counted by scanning for the string and the adrp/add pairs that build
  *       its address); more than one means the anchor is not what we think.
+ *
+ * If (1)-(4) hold but the write or the stub verification fails, everything is
+ * rolled back: the handler region goes back to zeros and whichever stub was
+ * already redirected is restored to the bytes it had, so the outcome is either
+ * both hooks or none.
  *
  * Return codes: 0 patch present; 1 vold absent or --check saw an intact stub;
  * 2 could not parse / find / the premises failed; 3 could not write.
@@ -204,6 +262,45 @@
 
 /* The imported symbol whose stub we replace. */
 #define TARGET_SYM "mount"
+
+/* The second imported symbol we replace — vold's teardown primitive.
+ *
+ * mount alone is not enough, and the reason is in vold's own sources rather
+ * than in anything this module does. MountUserFuse() (vold/Utils.cpp:1598)
+ * makes exactly ONE mount at /mnt/user/<uid>/emulated. The patch makes TWO:
+ * the FUSE mount the caller asked for, plus the raw-tree bind stacked on top.
+ * Every teardown path vold has removes exactly ONE mount per call:
+ *
+ *   ForceUnmount()  vold/Utils.cpp:477   one umount2(UMOUNT_NOFOLLOW)
+ *   UnmountTree()   vold/Utils.cpp:1314  one umount2(MNT_DETACH)
+ *
+ * So UnmountUserFuse() (vold/Utils.cpp:1696) removed only our bind and left
+ * the daemon-less FUSE mount behind. Every later access to the path returned
+ * ENOTCONN, MountUserFuse() on the next mount failed with "Failed to mount
+ * emulated fuse volume: Transport endpoint is not connected", the volume was
+ * reported unmountable and apps were back on FUSE — the regression this
+ * symbol exists to prevent.
+ *
+ * See build_umount_handler() for the fix and why it is shaped the way it is. */
+#define TARGET_SYM2 "umount2"
+
+/* The one path shape whose teardown has to clear more than one layer.
+ *
+ * /mnt/user/<uid>/emulated is the only path the patch ever stacks a second
+ * mount on (fuse_path in MountUserFuse()). The check is deliberately a shape
+ * match and not a remembered string: the handler runs inside vold with its
+ * page mapped r-x, so it cannot write to any state of its own, and a static
+ * buffer in the handler would fault. See build_umount_handler().
+ *
+ * The shape is fixed by AOSP and verified against vold/Utils.cpp:1600-1606:
+ *   fuse_path = StringPrintf("/mnt/user/%d/%s", user_id, relative_upper_path)
+ * with relative_upper_path == "emulated" for the emulated volume (label). The
+ * deeper binds (Android/data, Android/obb, the shared-storage volume binds)
+ * and the pass-through path are all deliberately NOT matched: each of those
+ * carries exactly one mount, so one umount2 is already correct for them. */
+#define FUSE_PATH_PREFIX_Q 0x6573752f746e6d2full   /* "/mnt/use" — first 8 bytes */
+#define FUSE_PATH_SEP_H    0x2f72u                 /* "r/" — bytes 8 and 9       */
+#define FUSE_PATH_TAIL_S   "/emulated"             /* bytes 10+n .. — see build_umount_handler */
 
 /* The raw tree, and the strings that identify the mount we intercept. */
 #define RAW_PATH   "/data/media"
@@ -680,8 +777,70 @@ static uint32_t enc_ldp_post(int rt, int rt2, int imm7) {
            ((uint32_t)rt2 << 10) | (31u << 5) | (uint32_t)rt;
 }
 
+/* --- the wider set the umount2 handler needs ---------------------------
+ *
+ * These exist so the emission below reads as assembly rather than as magic
+ * words. Every one of them is a direct transcription of the ARM ARM encoding,
+ * and each is checked by selftest() — a wrong immediate here is not a wrong
+ * count, it is vold jumping into the void on the first unmount. */
+static uint32_t enc_cmp_w_reg(int rn, int rm) {      /* cmp Wn, Wm */
+    return 0x6b00001fu | ((uint32_t)rm << 16) | ((uint32_t)rn << 5);
+}
+static uint32_t enc_ldr_imm(int rt, int rn, unsigned off) {   /* ldr Xt, [Xn,#off] */
+    return 0xf9400000u | ((off / 8u) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t enc_str_imm(int rt, int rn, unsigned off) {   /* str Xt, [Xn,#off] */
+    return 0xf9000000u | ((off / 8u) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t enc_ldrh_imm(int rt, int rn, unsigned off) {  /* ldrh Wt, [Xn,#off] */
+    return 0x79400000u | ((off / 2u) << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t enc_ldrb_imm(int rt, int rn, unsigned off) {  /* ldrb Wt, [Xn,#off] */
+    return 0x39400000u | (off << 10) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t enc_ldrb_post(int rt, int rn) {               /* ldrb Wt, [Xn], #1 */
+    return 0x38401400u | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
+static uint32_t enc_add_imm(int rd, int rn, unsigned imm) {   /* add Xd, Xn, #imm */
+    return 0x91000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t enc_sub_w_imm(int rd, int rn, unsigned imm) { /* sub Wd, Wn, #imm */
+    return 0x51000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static uint32_t enc_subs_w_imm(int rd, int rn, unsigned imm){ /* subs Wd, Wn, #imm */
+    return 0x71000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+/* CBZ/CBNZ (32-bit) is `0x34/0x35 | imm19<<5 | Rt`: the base carries the
+ * opcode, sf=0 and op=0/1 in bit 24, and imm19 starts at bit 5. The first
+ * version of this used 0x35800000, which sets bit 27 — a different instruction
+ * with a zero imm19 and op=0, i.e. a jump into the void. selftest() caught it
+ * by decoding the emitted word back; that is why the decoder exists. */
+static uint32_t enc_cbnz_w(int rt, int64_t byte_delta) {      /* cbnz Wt, #delta */
+    int64_t d = byte_delta >> 2;
+    return 0x35000000u | ((uint32_t)(d & 0x7ffff) << 5) | (uint32_t)rt;
+}
+static uint32_t enc_b(int64_t byte_delta) {                   /* b #delta */
+    int64_t d = byte_delta >> 2;
+    return 0x14000000u | (uint32_t)(d & 0x3ffffff);
+}
+/* Decoders for the same two forms, used to prove an emitted branch actually
+ * reaches its label instead of merely having the right word count. */
+static int64_t dec_b(uint32_t w) {
+    int64_t d = (int64_t)(w & 0x3ffffffu);
+    if (d & (1 << 25)) d -= (1 << 26);
+    return d;
+}
+static int64_t dec_cbnz_w(uint32_t w, int *rt_out, int *is_nz) {
+    int64_t d = (int64_t)((w >> 5) & 0x7ffffu);
+    if (d & (1 << 18)) d -= (1 << 19);
+    *rt_out = (int)(w & 0x1fu);
+    *is_nz  = (int)((w >> 24) & 1u);
+    return d;
+}
+
 #define COND_NE 0x1
 #define COND_EQ 0x0
+#define COND_HI 0x8
 
 /* Named pool slots; the enum and the `pool_val[]` assignment must stay in the
  * same order — that is the only invariant in this function. */
@@ -892,6 +1051,334 @@ typedef struct {
     int      reloc_index;
     int      plt_delta;
 } Resolved;
+
+/* ------------------------------------------------------------------ *
+ * The umount2 handler — completing the teardown
+ *
+ * ================ what is wrong without it
+ *
+ * See TARGET_SYM2: the patch stacks two mounts at fuse_path and every vold
+ * teardown removes exactly one, so the FUSE mount outlives its daemon and the
+ * volume becomes permanently unmountable. The fix is to make the teardown
+ * remove every layer the patch added, so the invariant vold's own code assumes
+ * — "one umount2 clears fuse_path" — is true again.
+ *
+ * ================ why the path is recognised by shape, not by memory
+ *
+ * The natural implementation is to remember fuse_path when the mount handler
+ * takes over and compare against it here. It cannot be done: the handler is
+ * written into a page vold has mapped r-x (the tail of the .plt page, or a
+ * PROT_READ|PROT_EXEC mapping of vold's own binary — see find_handler_room and
+ * vold_exec_page), and writes through /proc/<pid>/mem are what make the patch
+ * possible at all. A `str` into that page from the handler itself would take a
+ * protection fault and kill vold, so the handler has to be position-independent
+ * AND state-free: it may only read the literal pool that ships with it.
+ *
+ * The path is therefore matched by shape — exactly, not as a prefix:
+ *
+ *   "/mnt/user/" <one or more ASCII digits> "/emulated" <NUL>
+ *
+ * so the width of the user id does not matter and nothing that merely starts
+ * like the path can slip through:
+ *
+ *   /mnt/user/0/emulated                 match
+ *   /mnt/user/10/emulated                match
+ *   /mnt/user//emulated                  no  — the digit loop consumed nothing
+ *   /mnt/user/0/emulated/0/Android/data  no  — the tail compare sees '/'
+ *   /mnt/user/0/emulatedx                no  — the tail compare sees 'x'
+ *   /mnt/user/0/emulate                  no  — the tail compare hits the NUL
+ *   /mnt/pass_through/0/emulated         no  — the head compare fails
+ *
+ * selftest() runs every one of those through the emitted machine code.
+ *
+ * ================ why no read can leave the string
+ *
+ * The matcher must never read past the NUL of the path it is handed, and that
+ * is a real constraint rather than a theoretical one: vold unmounts short
+ * paths too (`/data`, `/proc`, every mount point in /proc/mounts reaches
+ * ForceUnmount through VolumeManager::tearDownStaleMounts), and a path is a
+ * std::string whose buffer is only as long as the string. Every access is
+ * therefore bounded by construction:
+ *
+ *   - the head is one 8-byte load at offset 0. Any std::string has at least a
+ *     23-byte SSO buffer or a heap buffer of at least its own length, so this
+ *     one is in bounds even for "/data";
+ *   - the digit loop stops at the first non-digit, and a NUL is not a digit;
+ *   - the tail is a byte-by-byte compare against "/emulated\0" that stops at
+ *     the first mismatch — and a NUL never equals a non-NUL template byte, so
+ *     the loop always stops at or before the path's own NUL. A single 10-byte
+ *     compare here would have read up to 9 bytes past a short string, which is
+ *     why it is written as a loop.
+ *
+ * ================ why a bounded loop, not exactly two unmounts
+ *
+ * Two layers is the normal case, but the handler cannot know it is looking at
+ * the normal case: it may also run against a vold that was mounted before the
+ * patch was installed (one layer), or after a partial teardown. "Unmount until
+ * the kernel says there is nothing left" is right in all of them, and EINVAL /
+ * ENOENT is the only honest signal that the path is clear. The cap of four is
+ * a guard against a path remounted underneath us, not a functional limit — it
+ * is twice what the patch can ever create.
+ *
+ * ================ why the last result is returned, not a synthesised 0
+ *
+ * ForceUnmount() (vold/Utils.cpp:477) uses the first umount2's return value as
+ * its only success test, and escalates through SIGINT/SIGTERM/SIGKILL when it
+ * fails. Reporting success while a layer is still mounted would hand vold a
+ * clean bill of health for a dirty teardown — precisely the state that caused
+ * the ENOTCONN regression. So the loop stops on the first failure and returns
+ * that failure with errno intact:
+ *
+ *   one layer,  not busy : call 1 removes it,   call 2 gives EINVAL -> EINVAL
+ *   two layers, not busy : calls 1,2 remove them, call 3 gives EINVAL -> EINVAL
+ *   either,     busy     : the failing call's errno is returned      -> EBUSY
+ *
+ * EINVAL is exactly what vold already treats as "unmounted" — ForceUnmount()
+ * checks `errno == EINVAL` (Utils.cpp:479), so do UnmountTree() (1315) and
+ * UnmountFusePaths() (1733) — so a fully cleared path reports what an
+ * unpatched single-layer unmount reported. An EBUSY still reaches the
+ * escalation path.
+ *
+ * ================ why the arguments are spilled to the stack
+ *
+ * libc umount2 is a real call and may clobber x0..x18, so the path and the
+ * flags have to survive it. The handler may not touch any callee-saved
+ * register either: it stands in for a call the caller made, so x19..x28 must
+ * come back untouched. The frame is therefore 32 bytes — the usual x29/x30
+ * pair plus two slots for the arguments — and nothing else is needed.
+ *
+ * The pass path leaves x0/x1 exactly as the caller set them and tail-calls
+ * libc umount2, so an ordinary unmount is bit-for-bit what it was before the
+ * patch: same arguments, same return value, same errno. */
+
+enum {
+    U_MNTPFX = 0,   /* the constant "/mnt/use"         */
+    U_TAIL,         /* VA of the "/emulated\0" copy    */
+    U_UMOUNT2,      /* runtime VA of libc umount2      */
+    U_POOL_COUNT
+};
+
+/* Labels inside the umount2 handler, recorded as word indices while emitting
+ * and resolved into pc-relative deltas afterwards — the same two-step
+ * build_handler() uses for its `pass` block, generalised because this handler
+ * branches both forward and backward. */
+enum { L_PASS = 0, L_DIGITS, L_DIGITS_DONE, L_TAIL, L_LOOP, L_DONE,
+       L_LABEL_COUNT };
+
+static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
+                                uint64_t real_umount2) {
+    static const char tail[] = FUSE_PATH_TAIL_S;   /* the NUL is added below */
+    uint32_t w[96];
+    uint32_t fld_slot[8];
+    uint32_t fld_rt[8];
+    int      fld_at[8];
+    int      nfld = 0;
+    /* kind: 0 = b.cond, 1 = b, 2 = cbnz W<rt> */
+    struct { int at; uint32_t cond; int label; int kind; int rt; } fx[20];
+    int      nfx = 0;
+    int      label_at[L_LABEL_COUNT];
+    int      n = 0;
+
+    if (out_cap < 256) return -1;
+    for (int i = 0; i < L_LABEL_COUNT; i++) label_at[i] = -1;
+
+/* The limits below are the handler's own budget, and they say so rather than
+ * silently returning -1: a handler that outgrows its space would otherwise
+ * fail as "не удалось собрать обработчик" with no way to tell which bound was
+ * hit. */
+#define UE(x) do {                                                    \
+        if (n >= 72) {                                                \
+            warn("build_umount_handler: код длиннее 72 слов (n=%d)", n); \
+            return -1;                                                \
+        }                                                             \
+        w[n++] = (uint32_t)(x);                                       \
+    } while (0)
+#define ULDR(slot, rt) do {                                           \
+        if (nfld >= 8) { warn("build_umount_handler: больше 8 литералов"); \
+                         return -1; }                                 \
+        fld_slot[nfld] = (uint32_t)(slot); fld_rt[nfld] = (uint32_t)(rt); \
+        fld_at[nfld] = n; nfld++;                                     \
+        UE(0);                     /* placeholder, fixed up below */  \
+    } while (0)
+#define ULBL(l) do { label_at[l] = n; } while (0)
+#define UBC(cc, l) do {                                               \
+        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
+                          return -1; }                                  \
+        fx[nfx].at = n; fx[nfx].cond = (uint32_t)(cc);                \
+        fx[nfx].label = (l); fx[nfx].kind = 0; fx[nfx].rt = -1;       \
+        nfx++; UE(0);                                                 \
+    } while (0)
+#define UB(l) do {                                                    \
+        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
+                          return -1; }                                  \
+        fx[nfx].at = n; fx[nfx].cond = 0;                             \
+        fx[nfx].label = (l); fx[nfx].kind = 1; fx[nfx].rt = -1;       \
+        nfx++; UE(0);                                                 \
+    } while (0)
+#define UCBZNZ(reg, l) do {                                           \
+        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
+                          return -1; }                                  \
+        fx[nfx].at = n; fx[nfx].cond = 0;                             \
+        fx[nfx].label = (l); fx[nfx].kind = 2; fx[nfx].rt = (reg);    \
+        nfx++; UE(0);                                                 \
+    } while (0)
+
+    UE(INSN_BTI_JC);                    /* bti jc — reached by `br x17`  */
+    UE(enc_stp_pre(29, 30, -4));        /* stp x29, x30, [sp, #-32]!     */
+    UE(0x910003fdu);                    /* mov x29, sp                   */
+    UE(enc_str_imm(0, 31, 16));         /* str x0, [sp, #16]   path      */
+    UE(enc_str_imm(1, 31, 24));         /* str x1, [sp, #24]   flags     */
+
+    /* ---- shape: "/mnt/user/<digits>/emulated\0" ---- */
+    UE(enc_ldr_imm(9, 0, 0));           /* ldr x9, [x0]                  */
+    ULDR(U_MNTPFX, 10);                 /* ldr x10, <"/mnt/use">         */
+    UE(enc_cmp_reg(9, 10));             /* cmp x9, x10                   */
+    UBC(COND_NE, L_PASS);
+
+    UE(enc_ldrh_imm(9, 0, 8));          /* ldrh w9, [x0, #8]             */
+    UE(enc_movz_w(10, FUSE_PATH_SEP_H));/* movz w10, #"r/"               */
+    UE(enc_cmp_w_reg(9, 10));
+    UBC(COND_NE, L_PASS);
+
+    UE(enc_add_imm(11, 0, 10));         /* add x11, x0, #10              */
+    UE(enc_mov_reg(12, 11));            /* mov x12, x11  (digits begin)  */
+    ULBL(L_DIGITS);
+    UE(enc_ldrb_imm(9, 11, 0));         /* ldrb w9, [x11]                */
+    UE(enc_sub_w_imm(10, 9, '0'));
+    UE(enc_subs_w_imm(10, 10, 9));      /* cmp w10, #9                   */
+    UBC(COND_HI, L_DIGITS_DONE);
+    UE(enc_add_imm(11, 11, 1));
+    UB(L_DIGITS);
+    ULBL(L_DIGITS_DONE);
+    UE(enc_cmp_reg(11, 12));            /* cmp x11, x12                  */
+    UBC(COND_EQ, L_PASS);               /* no digit consumed at all      */
+
+    /* The tail is a byte compare, not a 10-byte one: it stops at the path's
+     * own NUL, so it cannot read past the end of a short string. See the note
+     * above the function. */
+    ULDR(U_TAIL, 13);                   /* ldr x13, <"/emulated">        */
+    ULBL(L_TAIL);
+    UE(enc_ldrb_post(9, 11));           /* ldrb w9,  [x11], #1           */
+    UE(enc_ldrb_post(10, 13));          /* ldrb w10, [x13], #1           */
+    UE(enc_cmp_w_reg(9, 10));
+    UBC(COND_NE, L_PASS);
+    UCBZNZ(9, L_TAIL);                  /* cbnz w9, tail — stop on NUL   */
+
+    /* ---- clear every layer; stop at the first refusal ---- */
+    UE(enc_movz_w(12, 4));              /* mov w12, #4                   */
+    ULBL(L_LOOP);
+    UE(enc_ldr_imm(0, 31, 16));         /* ldr x0, [sp, #16]             */
+    UE(enc_ldr_imm(1, 31, 24));         /* ldr x1, [sp, #24]             */
+    ULDR(U_UMOUNT2, 9);                 /* ldr x9, <umount2>             */
+    UE(enc_blr(9));                     /* blr x9                        */
+    UCBZNZ(0, L_DONE);                  /* cbnz w0, done                 */
+    UE(enc_subs_w_imm(12, 12, 1));      /* subs w12, w12, #1             */
+    UBC(COND_NE, L_LOOP);
+
+    ULBL(L_DONE);
+    UE(enc_ldp_post(29, 30, 4));        /* ldp x29, x30, [sp], #32       */
+    UE(INSN_RET);
+
+    ULBL(L_PASS);
+    UE(enc_ldp_post(29, 30, 4));        /* ldp x29, x30, [sp], #32       */
+    ULDR(U_UMOUNT2, 9);
+    UE(enc_br(9));                      /* br x9 — x0/x1 exactly as given */
+
+#undef UE
+#undef ULDR
+#undef ULBL
+#undef UBC
+#undef UB
+#undef UCBZNZ
+
+    /* ---- pool + tail string ---- */
+    while ((n & 1) != 0) w[n++] = 0x00000000u;      /* align pool to 8 bytes */
+    int pool_idx = n;
+    uint64_t pool_va = code_va + (uint64_t)pool_idx * 4u;
+    n += U_POOL_COUNT * 2;                           /* 8 bytes each */
+    int str_off_bytes = n * 4;
+    int str_words = (int)((sizeof(tail) + 3) / 4);   /* sizeof includes the NUL */
+    n += str_words;
+    if (n > 96) { warn("build_umount_handler: %d слов не влезает в %d", n, 96); return -1; }
+    uint64_t str_va = code_va + (uint64_t)str_off_bytes;
+
+    uint64_t pool_val[U_POOL_COUNT];
+    pool_val[U_MNTPFX]  = FUSE_PATH_PREFIX_Q;
+    pool_val[U_TAIL]    = str_va;
+    pool_val[U_UMOUNT2] = real_umount2;
+
+    for (int i = 0; i < nfld; i++) {
+        int at = fld_at[i];
+        uint64_t target_va = pool_va + (uint64_t)fld_slot[i] * 8u;
+        uint64_t at_va = code_va + (uint64_t)at * 4u;
+        w[at] = enc_ldr_lit((int)fld_rt[i], (int64_t)target_va - (int64_t)at_va);
+    }
+    for (int i = 0; i < U_POOL_COUNT; i++) {
+        w[pool_idx + i * 2 + 0] = (uint32_t)(pool_val[i] & 0xffffffffu);
+        w[pool_idx + i * 2 + 1] = (uint32_t)(pool_val[i] >> 32);
+    }
+
+    /* ---- resolve every branch, then prove it by decoding it back ----
+     *
+     * A branch with the right word count but a wrong imm19 is a jump into the
+     * void, and this handler runs on the unmount path of every volume — so the
+     * delta is decoded back out of the emitted word and required to land on the
+     * label, exactly as build_handler() does for its `pass` block. */
+    for (int i = 0; i < nfx; i++) {
+        int at  = fx[i].at;
+        int tgt = label_at[fx[i].label];
+        if (tgt < 0) {
+            warn("build_umount_handler: метка %d не выставлена (ветвь %d)",
+                 fx[i].label, i);
+            return -1;
+        }
+        int64_t dw = (int64_t)tgt - (int64_t)at;
+        if (dw == 0) {
+            warn("build_umount_handler: ветвь %d на слове %d ведёт сама в себя",
+                 i, at);
+            return -1;
+        }
+        if (dw < -(1 << 18) || dw >= (1 << 18)) {
+            warn("build_umount_handler: ветвь %d вне imm19 (%lld слов)",
+                 i, (long long)dw);
+            return -1;
+        }
+
+        if (fx[i].kind == 0) {
+            w[at] = enc_b_cond(fx[i].cond, dw * 4);
+            int64_t got = 0;
+            int cc = dec_b_cond(&got, w[at]);
+            if (cc != (int)fx[i].cond || at + got != tgt) {
+                warn("build_umount_handler: b.cond %d: слово %08x дало "
+                     "cond=%d цель %d, ждали cond=%d цель %d",
+                     i, w[at], cc, (int)(at + got), (int)fx[i].cond, tgt);
+                return -1;
+            }
+        } else if (fx[i].kind == 1) {
+            w[at] = enc_b(dw * 4);
+            if (at + dec_b(w[at]) != tgt) {
+                warn("build_umount_handler: b %d: слово %08x дало цель %d, "
+                     "ждали %d", i, w[at], (int)(at + dec_b(w[at])), tgt);
+                return -1;
+            }
+        } else {
+            w[at] = enc_cbnz_w(fx[i].rt, dw * 4);
+            int rt = -1, nz = -1;
+            int64_t got = dec_cbnz_w(w[at], &rt, &nz);
+            if (rt != fx[i].rt || nz != 1 || at + got != tgt) {
+                warn("build_umount_handler: cbnz %d: слово %08x дало rt=%d "
+                     "nz=%d цель %d, ждали rt=%d nz=1 цель %d",
+                     i, w[at], rt, nz, (int)(at + got), fx[i].rt, tgt);
+                return -1;
+            }
+        }
+    }
+
+    memset(out, 0, (size_t)n * 4u);
+    memcpy(out, w, (size_t)n * 4u);
+    memcpy(out + str_off_bytes, tail, sizeof(tail));
+    return n * 4;
+}
 
 static int find_load_base(pid_t pid, const char *want_exe, uint64_t *base,
                           char *exe_out, size_t exelen) {
@@ -1216,7 +1703,14 @@ static int plt_delta_emit(const uint64_t *stub_va, const uint64_t *stub_target,
     return (int)delta;
 }
 
-static int resolve(Src *s, Resolved *r) {
+/* Locate the PLT stub for one imported symbol.
+ *
+ * `sym` is the symbol name to look up in .rela.plt; the two the module needs
+ * are TARGET_SYM ("mount") and TARGET_SYM2 ("umount2"). Everything else about
+ * the resolution is symbol-independent, so this takes the name rather than
+ * being duplicated per symbol — a second copy is a second place for the
+ * relocation-count guard below to rot. */
+static int resolve_sym(Src *s, const char *sym, Resolved *r) {
     memset(r, 0, sizeof(*r));
     r->reloc_index = -1;
     r->plt_delta = -1;
@@ -1235,7 +1729,7 @@ static int resolve(Src *s, Resolved *r) {
         uint32_t idx = (uint32_t)(rel[i].r_info >> 32);
         char nm[512];
         if (sym_name(s, &d, idx, nm, sizeof(nm)) != 0) continue;
-        if (strcmp(nm, TARGET_SYM) == 0) {
+        if (strcmp(nm, sym) == 0) {
             nmatch++;
             if (nmatch == 1) {
                 r->got_slot = rel[i].r_offset;
@@ -1246,13 +1740,13 @@ static int resolve(Src *s, Resolved *r) {
         }
     }
     if (nmatch == 0) {
-        warn("%s: в .rela.plt нет JUMP_SLOT для \"%s\"", s->label, TARGET_SYM);
+        warn("%s: в .rela.plt нет JUMP_SLOT для \"%s\"", s->label, sym);
         free(rel);
         return EXIT_NO_RESOLVE;
     }
     if (nmatch > 1) {
         warn("%s: у \"%s\" %d JUMP_SLOT-релокаций — отказываюсь",
-             s->label, TARGET_SYM, nmatch);
+             s->label, sym, nmatch);
         free(rel);
         return EXIT_NO_RESOLVE;
     }
@@ -1740,6 +2234,180 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
  *
  * Any failure prints what was expected and returns non-zero.
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * Running the umount2 handler for real
+ *
+ * The handler is position-independent and reads nothing but the literal pool
+ * that ships with it, so a copy of it can be run right here with the pool's
+ * umount2 entry pointed at a stub of our own. That turns "the encodings look
+ * right" into "an aarch64 CPU does the right thing", which is the only claim
+ * that matters: this code runs inside vold, on the unmount path of every
+ * volume, where a wrong branch is a dead vold and a reboot loop.
+ *
+ * The stub models the kernel rather than merely counting calls: it holds a
+ * layer count, returns 0 while it can remove one, and answers EINVAL once the
+ * path is clear — which is what umount2 really does, and what the handler's
+ * "stop at the first refusal" rule is written against. A second knob makes it
+ * fail with EBUSY from the Nth call on, so the rule is tested from both sides:
+ * a cleared path must be reported clear, and a refusal must be reported rather
+ * than swallowed.
+ *
+ * The path list is the contract, not a sample. It covers both accepted widths
+ * of user id, the pre-patch one-layer case, both refusal points, and every way
+ * a string can look like the path without being it — a prefix, a suffix, a
+ * different separator position, a trailing slash, a wrong case, a foreign
+ * mount root, and the short paths vold really does unmount (/data, /). */
+#define UM_TEST_FLAGS 0x1234
+
+#if defined(__aarch64__)
+static int  g_um_calls;
+static int  g_um_layers;
+static int  g_um_fail_from;
+static char g_um_last_path[256];
+static int  g_um_last_flags;
+
+static int fake_umount2(const char *path, int flags) {
+    g_um_calls++;
+    snprintf(g_um_last_path, sizeof(g_um_last_path), "%s",
+             path ? path : "(null)");
+    g_um_last_flags = flags;
+    if (g_um_fail_from && g_um_calls >= g_um_fail_from) {
+        errno = EBUSY;
+        return -1;
+    }
+    if (g_um_layers <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    g_um_layers--;
+    return 0;
+}
+#endif
+
+static int umount_handler_exec_selftest(void) {
+#if !defined(__aarch64__)
+    return 0;   /* the handler is aarch64 machine code; nothing to run here */
+#else
+    static const struct {
+        const char *path; int layers; int fail_from;
+        int want_calls; int want_rc; int want_errno;
+    } cases[] = {
+        /* ours: two layers, so three calls and a final EINVAL */
+        { "/mnt/user/0/emulated",                2, 0, 3, -1, EINVAL },
+        { "/mnt/user/10/emulated",               2, 0, 3, -1, EINVAL },
+        { "/mnt/user/999/emulated",              2, 0, 3, -1, EINVAL },
+        /* ours, mounted before the patch: one layer, two calls */
+        { "/mnt/user/0/emulated",                1, 0, 2, -1, EINVAL },
+        /* ours and busy: the refusal must come back, not be swallowed */
+        { "/mnt/user/0/emulated",                2, 2, 2, -1, EBUSY  },
+        { "/mnt/user/0/emulated",                1, 1, 1, -1, EBUSY  },
+        /* not ours: passed through exactly once, result handed back as-is */
+        { "/mnt/pass_through/0/emulated",        1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulated/0/Android/data", 1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulated/0/Android/obb",  1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulatedx",               1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulated/",               1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulatedx/emulated",      1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulate",                 1, 0, 1,  0, 0      },
+        { "/mnt/user/0/emulateX",                1, 0, 1,  0, 0      },
+        { "/mnt/user/0/Emulated",                1, 0, 1,  0, 0      },
+        { "/mnt/user//emulated",                 1, 0, 1,  0, 0      },
+        { "/mnt/user/emulated",                  1, 0, 1,  0, 0      },
+        { "/mnt/users/0/emulated",               1, 0, 1,  0, 0      },
+        { "/mnt/user",                           1, 0, 1,  0, 0      },
+        { "/data",                               1, 0, 1,  0, 0      },
+        { "/",                                   1, 0, 1,  0, 0      },
+        { "",                                    1, 0, 1,  0, 0      },
+    };
+
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t pgsz = pg > 0 ? (size_t)pg : 4096;
+    void *mem = mmap(NULL, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        fprintf(stderr, "selftest: исполняемую память не дали (%s) — "
+                        "прогон машины пропущен\n", strerror(errno));
+        return 0;   /* not a failure: the structural checks still ran */
+    }
+
+    uint8_t blob[512];
+    int n = build_umount_handler(blob, sizeof(blob), (uint64_t)(uintptr_t)mem,
+                                 (uint64_t)(uintptr_t)&fake_umount2);
+    if (n <= 0) {
+        munmap(mem, pgsz);
+        fprintf(stderr, "selftest FAIL: build_umount_handler вернул %d\n", n);
+        return 1;
+    }
+    memcpy(mem, blob, (size_t)n);
+    __builtin___clear_cache((char *)mem, (char *)mem + n);
+
+    typedef int (*um_fn)(const char *, int);
+    um_fn fn = (um_fn)(void *)mem;
+
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char pbuf[256];
+        snprintf(pbuf, sizeof(pbuf), "%s", cases[i].path);
+        g_um_calls = 0;
+        g_um_layers = cases[i].layers;
+        g_um_fail_from = cases[i].fail_from;
+        g_um_last_path[0] = '\0';
+        g_um_last_flags = 0;
+        errno = 0;
+
+        int rc = fn(pbuf, UM_TEST_FLAGS);
+        int err = errno;
+
+        bool ok = g_um_calls == cases[i].want_calls &&
+                  rc == cases[i].want_rc &&
+                  (cases[i].want_rc == 0 || err == cases[i].want_errno) &&
+                  strcmp(g_um_last_path, cases[i].path) == 0 &&
+                  g_um_last_flags == UM_TEST_FLAGS;
+        if (!ok) {
+            fprintf(stderr, "selftest FAIL: \"%s\" (слоёв %d, отказ с %d): "
+                    "вызовов %d (ждали %d), rc %d (ждали %d), errno %d (ждали "
+                    "%d), последний путь \"%s\", flags %#x\n",
+                    cases[i].path, cases[i].layers, cases[i].fail_from,
+                    g_um_calls, cases[i].want_calls, rc, cases[i].want_rc,
+                    err, cases[i].want_errno, g_um_last_path, g_um_last_flags);
+            bad++;
+        }
+    }
+    munmap(mem, pgsz);
+
+    if (bad) return 1;
+    info("selftest: обработчик umount2 прогнан на %zu путях — ок",
+         sizeof(cases) / sizeof(cases[0]));
+    return 0;
+#endif
+}
+
+/* The two handlers have to fit in the one zero run find_handler_room() asks
+ * for. That constant (512) and this check are two halves of the same claim, so
+ * they are asserted together rather than left to drift apart. */
+static int handlers_fit_selftest(void) {
+    uint8_t buf[1024];
+    memset(buf, 0, sizeof(buf));
+    uint64_t code_va  = 0x567c0ef7d0ULL;
+    uint64_t base     = 0x567bff3000ULL;
+
+    int a = build_handler(buf, sizeof(buf), code_va, 0x79067a7580ULL,
+                          base + 0x14e35ULL, base + 0x15cb3ULL, RAW_PATH);
+    if (a <= 0) { fprintf(stderr, "selftest FAIL: build_handler вернул %d\n", a); return 1; }
+    int a_len = (a + 7) & ~7;
+    int b = build_umount_handler(buf + a_len, sizeof(buf) - (size_t)a_len,
+                                 code_va + (uint64_t)a_len, 0x79067a9c40ULL);
+    if (b <= 0) { fprintf(stderr, "selftest FAIL: build_umount_handler вернул %d\n", b); return 1; }
+    if (a_len + b > 512) {
+        fprintf(stderr, "selftest FAIL: обработчики занимают %d байт, "
+                        "а find_handler_room ищет 512\n", a_len + b);
+        return 1;
+    }
+    info("selftest: оба обработчика — %d + %d = %d байт (потолок 512)",
+         a, b, a_len + b);
+    return 0;
+}
+
 static int selftest(void) {
     uint8_t buf[512];
     memset(buf, 0, sizeof(buf));
@@ -2012,6 +2680,9 @@ static int selftest(void) {
         }
     }
 
+    if (handlers_fit_selftest() != 0) return 1;
+    if (umount_handler_exec_selftest() != 0) return 1;
+
     info("selftest: ок — %d байт, пул и оба пути на месте", n);
     return 0;
 }
@@ -2101,21 +2772,201 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
     return -1;
 }
 
+/* ------------------------------------------------------------------ *
+ * One redirected symbol
+ *
+ * Both hooks are installed the same way and can fail in the same ways, so the
+ * sequence lives in one place: resolve the symbol's PLT stub, read the libc
+ * address its GOT slot already holds (BIND_NOW, so it never changes), keep the
+ * stub's original bytes so a half-installed patch can be undone, then write
+ * and verify. A second copy of this for umount2 would be a second place for
+ * the literal-offset check in hook_install() to be forgotten — and that check
+ * is the one that caught the bootloop. */
+typedef struct {
+    const char *sym;
+    Resolved    res;
+    uint64_t    run_stub;              /* stub VA as the process sees it */
+    uint64_t    real;                  /* libc target, from the GOT      */
+    uint8_t     cur[STUB_PATCH_LEN];   /* original bytes, for rollback   */
+} Hook;
+
+static int hook_resolve(Src *s, Hook *h, const char *sym) {
+    memset(h, 0, sizeof(*h));
+    h->sym = sym;
+
+    int rc = resolve_sym(s, sym, &h->res);
+    if (rc != EXIT_OK) return rc;
+
+    h->run_stub = s->is_proc ? s->base + h->res.stub_va : h->res.stub_va;
+
+    if (s->is_proc) {
+        /* With BIND_NOW (vold has it) every GOT slot is resolved at load time
+         * and never changes again, so the handler can carry the real libc
+         * addresses. A zero slot means the process is not fully relocated and
+         * we must not patch. */
+        if (mem_read(s->pid, s->base + h->res.got_slot, &h->real,
+                     sizeof(h->real)) != 0) {
+            warn("%s: не читается GOT-слот \"%s\" (0x%llx)", s->label, sym,
+                 (unsigned long long)(s->base + h->res.got_slot));
+            return EXIT_NO_RESOLVE;
+        }
+        if (!h->real) {
+            warn("%s: GOT-слот \"%s\" пуст — процесс ещё не слинкован, "
+                 "отказываюсь", s->label, sym);
+            return EXIT_NO_RESOLVE;
+        }
+        if (mem_read(s->pid, h->run_stub, h->cur, sizeof(h->cur)) != 0) {
+            warn("%s: не читается трамплин \"%s\" по 0x%llx", s->label, sym,
+                 (unsigned long long)h->run_stub);
+            return EXIT_NO_RESOLVE;
+        }
+    } else {
+        if (src_pread(s, h->res.stub_va, h->cur, sizeof(h->cur)) != 0) {
+            warn("%s: не читается трамплин \"%s\"", s->label, sym);
+            return EXIT_NO_RESOLVE;
+        }
+    }
+
+    info("%s: %s -> .rela.plt[%d], GOT 0x%llx, трамплин 0x%llx "
+         "(в процессе 0x%llx), сдвиг раскладки %d",
+         s->label, sym, h->res.reloc_index,
+         (unsigned long long)h->res.got_slot,
+         (unsigned long long)h->res.stub_va,
+         (unsigned long long)h->run_stub, h->res.plt_delta);
+    if (s->is_proc)
+        info("%s: GOT \"%s\"@0x%llx -> 0x%llx", s->label, sym,
+             (unsigned long long)(s->base + h->res.got_slot),
+             (unsigned long long)h->real);
+    return EXIT_OK;
+}
+
+/* The stub still points at its own GOT slot: untouched, ours to take. */
+static bool hook_stub_intact(const Hook *h) {
+    uint64_t tgt = 0;
+    return decode_stub(h->cur, h->res.stub_va, &tgt) && tgt == h->res.got_slot;
+}
+
+static int hook_install(Src *s, Hook *h, uint64_t handler_va) {
+    uint8_t patch[STUB_PATCH_LEN];
+    build_stub_patch(patch, handler_va);
+    if (mem_write(s->pid, h->run_stub, patch, sizeof(patch)) != 0) {
+        warn("%s: не переписать трамплин \"%s\" 0x%llx: %s", s->label, h->sym,
+             (unsigned long long)h->run_stub, strerror(errno));
+        return EXIT_NO_WRITE;
+    }
+
+    /* Verify the stub is now ours — instructions AND literal.
+     *
+     * Checking the two instruction words alone is not enough, and that is not
+     * hypothetical: the version that shipped a bootloop had exactly the right
+     * words, and a literal that fell past the end of the 16 bytes, so the load
+     * picked up the neighbouring stub's adrp for the top half of the address.
+     * `stub_is_patched` said yes. So decode the load the way the CPU will and
+     * require the 8 bytes it addresses to be the handler address. */
+    uint8_t chk[STUB_PATCH_LEN];
+    if (mem_read(s->pid, h->run_stub, chk, sizeof(chk)) != 0 ||
+        !stub_is_patched(chk)) {
+        warn("%s: трамплин \"%s\" после записи не подтверждается — возможно, "
+             "частичная запись", s->label, h->sym);
+        mem_write(s->pid, h->run_stub, h->cur, sizeof(h->cur));
+        return EXIT_NO_WRITE;
+    }
+    int lit = stub_literal_off(chk);
+    uint64_t got = 0;
+    if (lit >= 0 && lit + 8 <= STUB_PATCH_LEN) memcpy(&got, chk + lit, 8);
+    if (lit < 0 || lit + 8 > STUB_PATCH_LEN || got != handler_va) {
+        warn("%s: трамплин \"%s\" ведёт на 0x%llx, а обработчик на 0x%llx — "
+             "откатываю (vold ушёл бы в SIGSEGV на первом же вызове \"%s\")",
+             s->label, h->sym, (unsigned long long)got,
+             (unsigned long long)handler_va, h->sym);
+        mem_write(s->pid, h->run_stub, h->cur, sizeof(h->cur));
+        return EXIT_NO_WRITE;
+    }
+    return EXIT_OK;
+}
+
+/* ------------------------------------------------------------------ *
+ * Writing the handler blob out for offline disassembly
+ *
+ * selftest() proves the handlers *work* by running them; this proves they are
+ * what the comments say they are, by letting a disassembler read the same
+ * bytes. Both are needed, and neither replaces the other: a handler can run
+ * correctly by accident (the mount handler did, with a literal that fell past
+ * the end of its stub), and a disassembly cannot tell you that the path matcher
+ * accepts the right strings.
+ *
+ * The blob is built for a fixed, arbitrary base address. The handlers are
+ * position-independent — every reference to the outside world goes through
+ * their own literal pool — so the base only shifts the printed addresses.
+ * Layout: the mount handler, then the umount2 handler at the next 8-byte
+ * boundary, which is the layout main() installs. */
+static int emit_handlers(const char *path) {
+    uint8_t buf[1024];
+    memset(buf, 0, sizeof(buf));
+
+    const uint64_t code_va   = 0x100000000ULL;      /* arbitrary */
+    const uint64_t mount_va  = 0x7f0000000000ULL;   /* plausible libc addrs */
+    const uint64_t umount_va = 0x7f0000001000ULL;
+    const uint64_t src_va    = 0x5f0000002000ULL;   /* vold's "/dev/fuse"   */
+    const uint64_t type_va   = 0x5f0000002040ULL;   /* vold's "fuse"        */
+
+    int a = build_handler(buf, sizeof(buf), code_va, mount_va,
+                          src_va, type_va, RAW_PATH);
+    if (a <= 0) { warn("--emit: build_handler вернул %d", a); return EXIT_NO_RESOLVE; }
+    int a_len = (a + 7) & ~7;
+    uint64_t um_va = code_va + (uint64_t)a_len;
+    int b = build_umount_handler(buf + a_len, sizeof(buf) - (size_t)a_len,
+                                 um_va, umount_va);
+    if (b <= 0) { warn("--emit: build_umount_handler вернул %d", b); return EXIT_NO_RESOLVE; }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { warn("--emit: не открыть %s: %s", path, strerror(errno)); return EXIT_NO_WRITE; }
+    size_t wrote = fwrite(buf, 1, (size_t)(a_len + b), f);
+    fclose(f);
+    if (wrote != (size_t)(a_len + b)) {
+        warn("--emit: записалось %zu из %d байт", wrote, a_len + b);
+        return EXIT_NO_WRITE;
+    }
+
+    printf("handlers.bin: %d байт\n", a_len + b);
+    printf("  \"%s\"   @ 0x%llx .. 0x%llx (%d байт)\n",
+           TARGET_SYM, (unsigned long long)code_va,
+           (unsigned long long)(code_va + (uint64_t)a - 1), a);
+    printf("  \"%s\" @ 0x%llx .. 0x%llx (%d байт)\n",
+           TARGET_SYM2, (unsigned long long)um_va,
+           (unsigned long long)(um_va + (uint64_t)b - 1), b);
+    return EXIT_OK;
+}
+
 static void usage(void) {
     fputs("usage: vold-fusefs [--wait SEC] [--pid PID] [--check] [--dry-run]\n"
-          "                   [--file ELF] [--selftest] [--quiet]\n"
+          "                   [--file ELF] [--selftest] [--emit FILE] [--quiet]\n"
           "\n"
-          "Stops vold from mounting FUSE for emulated storage: the mount()\n"
-          "stub is redirected to a handler that turns the MountUserFuse\n"
-          "call into a bind of /data/media onto the same target, leaving the\n"
-          "AppFuse call alone.\n"
+          "Stops vold from mounting FUSE for emulated storage, and keeps the\n"
+          "teardown consistent with it. Two stubs are redirected:\n"
           "\n"
-          "  --selftest   verify the arm64 handler this tool emits. Runs\n"
-          "               anywhere, touches nothing, needs no root. Checks\n"
-          "               the shape of all 164 bytes: the entry point, both\n"
-          "               branch targets, the literal pool, the string and\n"
-          "               the mount flags. Run this first — a bad instruction\n"
-          "               word is a jump into the void inside vold.\n"
+          "  mount    MountUserFuse's call becomes a FUSE mount with a bind\n"
+          "           of /data/media stacked on top, so the path everything\n"
+          "           sees is the raw tree. The AppFuse call is left alone.\n"
+          "  umount2  a target shaped /mnt/user/<uid>/emulated is unmounted\n"
+          "           repeatedly until the path is really clear. Without it\n"
+          "           vold's single-umount teardown would leave the FUSE\n"
+          "           mount behind and the volume would go unmountable.\n"
+          "\n"
+          "  --selftest   verify the handlers this tool emits. Runs anywhere,\n"
+          "               touches nothing, needs no root. Checks the shape of\n"
+          "               both blocks (entry point, branch targets, literal\n"
+          "               pool, the path string, the mount flags), then runs\n"
+          "               the umount2 handler on the CPU against a stub that\n"
+          "               models umount2's own semantics, over every path\n"
+          "               shape it must accept and reject. Run this first — a\n"
+          "               bad instruction word is a jump into the void inside\n"
+          "               vold, and a bad path match is a volume that will not\n"
+          "               unmount.\n"
+          "  --emit FILE  write the handler blob to FILE for offline\n"
+          "               disassembly, and print the addresses it was built\n"
+          "               for. The handlers are position-independent, so any\n"
+          "               base works.\n"
           "  --file ELF   use a file instead of a live process. Combine with\n"
           "               --check to validate the anchor offline against a\n"
           "               copy of /system/bin/vold before touching a device.\n"
@@ -2127,11 +2978,16 @@ static void usage(void) {
           "\n"
           "Verification chain, cheapest first:\n"
           "  vold-fusefs --selftest\n"
+          "  vold-fusefs --emit /tmp/h.bin   # then disassemble that\n"
           "  vold-fusefs --file /data/local/tmp/vold-copy --check   (as root\n"
           "      if the copy is only root-readable; exit 1 here means the\n"
           "      anchor resolved but the stub is not patched yet — expected)\n"
           "  su -c 'vold-fusefs --dry-run'\n"
           "  su -c 'vold-fusefs'\n"
+          "\n"
+          "Both stubs are installed together or not at all: a vold carrying\n"
+          "only the mount hook would stack two mounts and clear one, which is\n"
+          "the failure this tool exists to prevent.\n"
           "\n"
           "Exit codes: 0 ok; 1 no vold found; 2 anchor did not resolve;\n"
           "            3 could not write.\n",
@@ -2143,6 +2999,7 @@ int main(int argc, char **argv) {
     long pid_opt = 0;
     bool check = false, dry_run = false, do_selftest = false;
     const char *file = NULL;
+    const char *emit_file = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--wait") && i + 1 < argc) {
@@ -2159,6 +3016,8 @@ int main(int argc, char **argv) {
             g_quiet = true;
         } else if (!strcmp(argv[i], "--selftest")) {
             do_selftest = true;
+        } else if (!strcmp(argv[i], "--emit") && i + 1 < argc) {
+            emit_file = argv[++i];
         } else {
             usage();
             return 2;
@@ -2166,6 +3025,7 @@ int main(int argc, char **argv) {
     }
 
     if (do_selftest) return selftest();
+    if (emit_file) return emit_handlers(emit_file);
 
     char exe[4096] = {0};
     Src s;
@@ -2225,75 +3085,73 @@ int main(int argc, char **argv) {
 resolved_as_file:
     ;
 
-    Resolved r;
-    int rc = resolve(&s, &r);
-    if (rc != EXIT_OK) { src_close(&s); return rc; }
-
-    FuseSite fs;
-    memset(&fs, 0, sizeof(fs));
-    char fdetail[512];
-    if (find_fuse_site(&s, r.stub_va, &fs, fdetail, sizeof(fdetail)) != 0) {
-        warn("%s: %s", s.label, fdetail);
+    /* ---- both hooks -------------------------------------------------
+     *
+     * mount and umount2 are one change, not two. The mount handler stacks a
+     * second mount at fuse_path; the umount2 handler is what clears it again.
+     * A vold carrying only the first is strictly worse than an unpatched vold:
+     * it would stack two mounts and remove one, which is the ENOTCONN
+     * regression itself. So the two are resolved, verified and installed
+     * together, and neither is left behind without the other. */
+    Hook hm, hu;
+    if (hook_resolve(&s, &hm, TARGET_SYM) != EXIT_OK) {
+        src_close(&s);
+        return EXIT_NO_RESOLVE;
+    }
+    if (hook_resolve(&s, &hu, TARGET_SYM2) != EXIT_OK) {
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
 
-    info("%s: база=0x%llx; %s -> .rela.plt[%d], GOT 0x%llx, трамплин 0x%llx "
-         "(в процессе 0x%llx), сдвиг раскладки %d",
-         s.label, (unsigned long long)s.base, TARGET_SYM, r.reloc_index,
-         (unsigned long long)r.got_slot, (unsigned long long)r.stub_va,
-         (unsigned long long)(s.is_proc ? s.base + r.stub_va : r.stub_va),
-         r.plt_delta);
+    FuseSite fs;
+    memset(&fs, 0, sizeof(fs));
+    char fdetail[512];
+    if (find_fuse_site(&s, hm.res.stub_va, &fs, fdetail, sizeof(fdetail)) != 0) {
+        warn("%s: %s", s.label, fdetail);
+        src_close(&s);
+        return EXIT_NO_RESOLVE;
+    }
     info("%s: %s", s.label, fdetail);
 
-    /* With BIND_NOW (vold has it) every GOT slot is resolved at load time and
-     * never changes again, so the handler can carry the real libc addresses.
-     * Read them from the live process and report them; if either is zero the
-     * process is not fully relocated and we must not patch. */
-    uint64_t real_mount = 0;
-    if (s.is_proc) {
-        if (mem_read(s.pid, s.base + r.got_slot, &real_mount,
-                     sizeof(real_mount)) != 0) {
-            warn("%s: не читается GOT-слот \"%s\" (0x%llx)", s.label,
-                 TARGET_SYM, (unsigned long long)(s.base + r.got_slot));
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
-        info("%s: GOT \"%s\"@0x%llx -> 0x%llx",
-             s.label, TARGET_SYM,
-             (unsigned long long)(s.base + r.got_slot),
-             (unsigned long long)real_mount);
-        if (!real_mount) {
-            warn("%s: GOT-слот \"%s\" пуст — процесс ещё не слинкован, "
-                 "отказываюсь", s.label, TARGET_SYM);
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
-    }
+    bool m_ours = stub_is_patched(hm.cur);
+    bool u_ours = stub_is_patched(hu.cur);
 
-    uint64_t run_stub = s.is_proc ? s.base + r.stub_va : r.stub_va;
-
-    if (!s.is_proc) {
-        /* A file is answered exactly as --check/--dry-run on a process would be. */
-        uint8_t cur[16];
-        if (src_pread(&s, r.stub_va, cur, sizeof(cur)) != 0) {
-            warn("%s: не читается трамплин", s.label);
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
-        if (stub_is_patched(cur)) {
-            info("%s: патч уже стоит (ldr x17 / br x17)", s.label);
+    if (m_ours || u_ours) {
+        if (m_ours && u_ours) {
+            info("%s: оба патча уже стоят (\"%s\" и \"%s\") — ничего не делаю",
+                 s.label, TARGET_SYM, TARGET_SYM2);
             src_close(&s);
             return EXIT_OK;
         }
-        uint64_t tgt = 0;
-        if (!decode_stub(cur, r.stub_va, &tgt) || tgt != r.got_slot) {
-            warn("%s: трамплин не про \"%s\" — не трогаю", s.label, TARGET_SYM);
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
+        /* Half a patch. Saying "OK" here would be a lie with consequences: the
+         * volume would mount with two layers and unmount one. */
+        warn("%s: патч стоит только наполовину (\"%s\": %s, \"%s\": %s) — "
+             "vold в таком состоянии не снимает то, что монтирует; "
+             "нужен перезапуск vold", s.label,
+             TARGET_SYM, m_ours ? "есть" : "нет",
+             TARGET_SYM2, u_ours ? "есть" : "нет");
+        src_close(&s);
+        return EXIT_NO_RESOLVE;
+    }
+
+    if (!hook_stub_intact(&hm)) {
+        warn("%s: трамплин \"%s\" не тот, что ожидался — не трогаю",
+             s.label, TARGET_SYM);
+        src_close(&s);
+        return EXIT_NO_RESOLVE;
+    }
+    if (!hook_stub_intact(&hu)) {
+        warn("%s: трамплин \"%s\" не тот, что ожидался — не трогаю",
+             s.label, TARGET_SYM2);
+        src_close(&s);
+        return EXIT_NO_RESOLVE;
+    }
+
+    if (!s.is_proc) {
+        /* A file is answered exactly as --check/--dry-run on a process would be. */
         if (check) {
-            info("%s: трамплин цел — патча нет (--check)", s.label);
+            info("%s: трамплины \"%s\" и \"%s\" целы — патча нет (--check)",
+                 s.label, TARGET_SYM, TARGET_SYM2);
             src_close(&s);
             return 1;
         }
@@ -2304,42 +3162,23 @@ resolved_as_file:
 
     /* ---- live process ---- */
 
-    uint8_t cur[16];
-    if (mem_read(s.pid, run_stub, cur, sizeof(cur)) != 0) {
-        warn("pid %d: не читается 0x%llx", (int)s.pid,
-             (unsigned long long)run_stub);
-        src_close(&s);
-        return EXIT_NO_RESOLVE;
-    }
-
-    if (stub_is_patched(cur)) {
-        info("%s: патч уже стоит (ldr x17 / br x17) — ничего не делаю", s.label);
-        src_close(&s);
-        return EXIT_OK;
-    }
-
-    uint64_t tgt = 0;
-    if (!decode_stub(cur, r.stub_va, &tgt) || tgt != r.got_slot) {
-        warn("%s: в трамплине по 0x%llx не то, что ожидалось — не трогаю",
-             s.label, (unsigned long long)run_stub);
-        src_close(&s);
-        return EXIT_NO_RESOLVE;
-    }
-
     if (check) {
-        info("%s: трамплин цел — патча нет (--check)", s.label);
+        info("%s: трамплины \"%s\" и \"%s\" целы — патча нет (--check)",
+             s.label, TARGET_SYM, TARGET_SYM2);
         src_close(&s);
         return 1;
     }
     if (dry_run) {
-        info("--dry-run: записал бы обработчик в свободный хвост .plt-страницы "
-             "и 16 байт по 0x%llx", (unsigned long long)run_stub);
+        info("--dry-run: записал бы обработчики в свободный хвост .plt-страницы "
+             "и по 16 байт по 0x%llx (\"%s\") и 0x%llx (\"%s\")",
+             (unsigned long long)hm.run_stub, TARGET_SYM,
+             (unsigned long long)hu.run_stub, TARGET_SYM2);
         src_close(&s);
         return EXIT_OK;
     }
 
     /*
-     * Where the handler goes: the cheapest home is the trailing padding of the
+     * Where the handlers go: the cheapest home is the trailing padding of the
      * .plt page — a file-backed r-x mapping, writable through /proc/<pid>/mem
      * by COW, no mmap/mprotect/syscall injection needed. But that padding is
      * not guaranteed: a build can pack its PLT flush to the end of the
@@ -2349,28 +3188,18 @@ resolved_as_file:
      * for a page: vold is made to map a page of its own binary executable
      * (see vold_exec_page).
      *
-     * The handler is built for the address it will live at, so that address is
-     * fixed here first, as an ABSOLUTE one: the PLT search returns an offset
-     * into the image, which becomes s.base + off in the process, while the
-     * injected page is already absolute. The PLT search is tried first because
-     * it leaves no new mapping and no trace in /proc/<pid>/maps.
+     * The handlers are built for the address they will live at, so that
+     * address is fixed here first, as an ABSOLUTE one: the PLT search returns
+     * an offset into the image, which becomes s.base + off in the process,
+     * while the injected page is already absolute. The PLT search is tried
+     * first because it leaves no new mapping and no trace in /proc/<pid>/maps.
      */
     uint64_t handler_abs = 0;
     bool handler_in_mapping = false;
     {
         uint64_t off = 0;
         bool found = false;
-        if (!s.is_proc) {
-            /* Offline (--file): keep the old offset semantics, no injection. */
-            if (find_handler_room(&s, r.stub_va, &off) != 0) {
-                warn("%s: не нашлось свободного места под обработчик в .plt-странице",
-                     s.label);
-                src_close(&s);
-                return EXIT_NO_RESOLVE;
-            }
-            handler_abs = s.base + off;
-            found = true;
-        } else if (find_handler_room(&s, r.stub_va, &off) == 0) {
+        if (find_handler_room(&s, hm.res.stub_va, &off) == 0) {
             handler_abs = s.base + off;
             found = true;
         }
@@ -2400,7 +3229,7 @@ resolved_as_file:
         }
 #else
         else {
-            warn("%s: не нашлось свободного места под обработчик в .plt-странице",
+            warn("%s: не нашлось свободного места под обработчики в .plt-странице",
                  s.label);
             src_close(&s);
             return EXIT_NO_RESOLVE;
@@ -2412,106 +3241,89 @@ resolved_as_file:
         }
     }
 
-    uint8_t hbuf[512];
+    /* Both handlers share the one zero run, laid out back to back: the mount
+     * handler first, then the umount2 handler 8-byte aligned so its literal
+     * pool stays naturally aligned. */
+    uint8_t hbuf[1024];
     int hlen = build_handler(hbuf, sizeof(hbuf), handler_abs,
-                             real_mount,
+                             hm.real,
                              s.base + fs.src_va, s.base + fs.type_va,
                              RAW_PATH);
     if (hlen <= 0) {
-        warn("%s: не удалось собрать обработчик", s.label);
+        warn("%s: не удалось собрать обработчик \"%s\"", s.label, TARGET_SYM);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
-
-    info("%s: обработчик %d байт по 0x%llx%s",
-         s.label, hlen, (unsigned long long)handler_abs,
-         handler_in_mapping ? " [запрошенная страница]" : " (в .plt)");
-
-    if (dry_run) {
-        info("--dry-run: обработчик не записан; трамплин 0x%llx не тронут",
-             (unsigned long long)run_stub);
+    int h1_len = (hlen + 7) & ~7;
+    uint64_t um_handler_abs = handler_abs + (uint64_t)h1_len;
+    int u_len = build_umount_handler(hbuf + h1_len,
+                                     sizeof(hbuf) - (size_t)h1_len,
+                                     um_handler_abs, hu.real);
+    if (u_len <= 0) {
+        warn("%s: не удалось собрать обработчик \"%s\"", s.label, TARGET_SYM2);
         src_close(&s);
-        return EXIT_OK;
+        return EXIT_NO_RESOLVE;
     }
+    int total = h1_len + u_len;
 
-    /* 1) write the handler into the chosen home */
-    if (mem_write(s.pid, handler_abs, hbuf, (size_t)hlen) != 0) {
-        warn("%s: не записать обработчик по 0x%llx: %s", s.label,
+    info("%s: обработчики по 0x%llx%s: \"%s\" %d байт, \"%s\" %d байт "
+         "(всего %d)",
+         s.label, (unsigned long long)handler_abs,
+         handler_in_mapping ? " [запрошенная страница]" : " (в .plt)",
+         TARGET_SYM, hlen, TARGET_SYM2, u_len, total);
+
+    /* 1) write both handlers into the chosen home */
+    if (mem_write(s.pid, handler_abs, hbuf, (size_t)total) != 0) {
+        warn("%s: не записать обработчики по 0x%llx: %s", s.label,
              (unsigned long long)handler_abs, strerror(errno));
         src_close(&s);
         return EXIT_NO_WRITE;
     }
 
-    /* 2) verify it landed, byte for byte */
-    uint8_t back[512];
-    if (mem_read(s.pid, handler_abs, back, (size_t)hlen) != 0 ||
-        memcmp(back, hbuf, (size_t)hlen) != 0) {
+    /* 2) verify they landed, byte for byte */
+    uint8_t back[1024];
+    if (mem_read(s.pid, handler_abs, back, (size_t)total) != 0 ||
+        memcmp(back, hbuf, (size_t)total) != 0) {
         /* Roll back: the region was verified all-zero before we wrote, so
-         * restoring it to zero returns vold to its pre-patch state (the stub
-         * is still untouched at this point, so nothing is redirecting). */
-        warn("%s: обработчик не читается обратно — возвращаю нули", s.label);
-        uint8_t zeros[512];
-        memset(zeros, 0, (size_t)hlen);
-        mem_write(s.pid, handler_abs, zeros, (size_t)hlen);
+         * restoring it to zero returns vold to its pre-patch state (neither
+         * stub is touched yet, so nothing is redirecting). */
+        warn("%s: обработчики не читаются обратно — возвращаю нули", s.label);
+        uint8_t zeros[1024];
+        memset(zeros, 0, (size_t)total);
+        mem_write(s.pid, handler_abs, zeros, (size_t)total);
         src_close(&s);
         return EXIT_NO_WRITE;
     }
 
-    /* 3) redirect the stub. The stub is 16 bytes; our replacement is 16 bytes,
-     * so no neighbouring stub is touched. */
-    uint8_t patch[STUB_PATCH_LEN];
-    build_stub_patch(patch, handler_abs);
-    if (mem_write(s.pid, run_stub, patch, sizeof(patch)) != 0) {
-        warn("%s: не переписать трамплин 0x%llx: %s", s.label,
-             (unsigned long long)run_stub, strerror(errno));
+    /* 3) redirect both stubs. Each is 16 bytes and so is our replacement, so
+     * no neighbouring stub is touched. The mount hook goes first, so that a
+     * failure on the second one can be undone by putting the first back. */
+    if (hook_install(&s, &hm, handler_abs) != EXIT_OK) {
+        uint8_t zeros[1024];
+        memset(zeros, 0, (size_t)total);
+        mem_write(s.pid, handler_abs, zeros, (size_t)total);
+        src_close(&s);
+        return EXIT_NO_WRITE;
+    }
+    if (hook_install(&s, &hu, um_handler_abs) != EXIT_OK) {
+        /* Undo the first. A vold with the mount hook but not the teardown hook
+         * is worse than an unpatched vold — that is the regression itself — so
+         * falling back to "unpatched" is the only safe outcome here. */
+        warn("%s: \"%s\" не встал — снимаю \"%s\" и стираю обработчики",
+             s.label, TARGET_SYM2, TARGET_SYM);
+        mem_write(s.pid, hm.run_stub, hm.cur, sizeof(hm.cur));
+        uint8_t zeros[1024];
+        memset(zeros, 0, (size_t)total);
+        mem_write(s.pid, handler_abs, zeros, (size_t)total);
         src_close(&s);
         return EXIT_NO_WRITE;
     }
 
-    /* 4) verify the stub is now ours — instructions AND literal.
-     *
-     * Checking the two instruction words alone is not enough, and that is not
-     * hypothetical: the version that shipped a bootloop had exactly the right
-     * words, and a literal that fell past the end of the 16 bytes, so the load
-     * picked up the neighbouring stub's adrp for the top half of the address.
-     * `stub_is_patched` said yes. So decode the load the way the CPU will and
-     * require the 8 bytes it addresses to be the handler address. */
-    uint8_t chk[STUB_PATCH_LEN];
-    if (mem_read(s.pid, run_stub, chk, sizeof(chk)) != 0 ||
-        !stub_is_patched(chk)) {
-        warn("%s: трамплин после записи не подтверждается — возможно, "
-             "частичная запись", s.label);
-        src_close(&s);
-        return EXIT_NO_WRITE;
-    }
-    {
-        int lit = stub_literal_off(chk);
-        if (lit < 0 || lit + 8 > STUB_PATCH_LEN) {
-            warn("%s: литерал трамплина по смещению %d не влезает в %d байт — "
-                 "откатываю (vold ушёл бы в SIGSEGV на первом же mount)",
-                 s.label, lit, STUB_PATCH_LEN);
-            mem_write(s.pid, run_stub, cur, sizeof(cur));
-            src_close(&s);
-            return EXIT_NO_WRITE;
-        }
-        uint64_t got = 0;
-        memcpy(&got, chk + lit, 8);
-        if (got != handler_abs) {
-            warn("%s: трамплин ведёт на 0x%llx, а обработчик на 0x%llx — "
-                 "откатываю (vold ушёл бы в SIGSEGV на первом же mount)",
-                 s.label, (unsigned long long)got,
-                 (unsigned long long)handler_abs);
-            mem_write(s.pid, run_stub, cur, sizeof(cur));
-            uint8_t zeros[512];
-            memset(zeros, 0, (size_t)hlen);
-            mem_write(s.pid, handler_abs, zeros, (size_t)hlen);
-            src_close(&s);
-            return EXIT_NO_WRITE;
-        }
-    }
-
-    info("%s: патч поставлен — трамплин \"%s\" ведёт на обработчик 0x%llx",
-         s.label, TARGET_SYM, (unsigned long long)handler_abs);
+    info("%s: патч поставлен — \"%s\" 0x%llx -> 0x%llx, \"%s\" 0x%llx -> 0x%llx",
+         s.label, TARGET_SYM, (unsigned long long)hm.run_stub,
+         (unsigned long long)handler_abs,
+         TARGET_SYM2, (unsigned long long)hu.run_stub,
+         (unsigned long long)um_handler_abs);
     src_close(&s);
     return EXIT_OK;
 }
