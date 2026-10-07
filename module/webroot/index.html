@@ -84,16 +84,19 @@
         import { exec, toast } from './kernelsu.js';
 
         const MODDIR = '/data/adb/modules/unfuse_zygisk';
-        const MODES = ['auto', 'sdcardfs', 'acl'];
+        const MODES = ['auto', 'sdcardfs', 'acl', 'fuse'];
 
-        // What the checkmarks render. The sets differ because the two paths do
-        // different work: the main path has four mounts and their options, the
-        // fallback has ACLs, the vold patch and the libc patch. The keys are
-        // the ones status.sh prints.
+        // What the checkmarks render. The sets differ because the paths do
+        // different work: the main path has four mounts and their options; acl
+        // has ACLs, the vold patch and the libc patch; fuse has all of that plus
+        // the one thing that distinguishes it — vold's FUSE mount is gone.
+        // The keys are the ones status.sh prints.
         const SETS = {
             sdcardfs: ['mount_default', 'mount_read', 'mount_write', 'mount_full',
                        'mount_opts', 'label_media'],
-            acl: ['label_media', 'acl_access', 'acl_default', 'vold_patched', 'libc_hooks']
+            acl: ['label_media', 'acl_access', 'acl_default', 'vold_patched', 'libc_hooks'],
+            fuse: ['fuse_off', 'label_media', 'acl_access', 'acl_default',
+                   'vold_patched', 'libc_hooks']
         };
 
         let busy = false;
@@ -128,7 +131,6 @@
             const set = mode === 'auto'
                 ? (s.effective === 'sdcardfs' ? 'sdcardfs' : 'acl')
                 : mode;
-
             checks.replaceChildren(...SETS[set].map(key => {
                 const ok = s[key] === '1';
                 const li = document.createElement('li');
@@ -148,14 +150,21 @@
             // selected mode is not the running one, the change waits for a
             // reboot — and that has to be said.
             //
-            //   sdcardfs, acl — compared against the actual path directly;
+            //   sdcardfs      — compared against the actual path directly;
+            //   acl, fuse     — both run the module on the raw tree, so
+            //                   `effective` reads acl for either. For fuse the
+            //                   extra question is whether vold is still mounting
+            //                   FUSE: that is fuse_off, and while it is 0 the
+            //                   mode has not taken effect whatever the mounts say;
             //   auto          — chooses no path: it means "sdcardfs first". It
             //                   counts as unapplied only when the kernel has
             //                   sdcardfs but we are still on the raw tree, i.e.
             //                   the preference has not taken effect yet.
             const pending = mode === 'auto'
                 ? (kernel && s.effective !== 'sdcardfs')
-                : (mode !== s.effective);
+                : mode === 'fuse'
+                    ? (s.effective === 'sdcardfs' || s.fuse_off !== '1')
+                    : (mode !== s.effective);
             pending_note.hidden = !pending;
         }
 
@@ -211,6 +220,7 @@
             <button class="max" data-mode="auto">auto</button>
             <button class="max" data-mode="sdcardfs">sdcardfs</button>
             <button class="max" data-mode="acl">acl</button>
+            <button class="max" data-mode="fuse">fuse</button>
         </nav>
         <ul class="list" id="checks"></ul>
         <div id="pending_note" hidden>

@@ -11,6 +11,11 @@
 #
 # storage.sh does all of that. It runs again from service.sh, after vold.
 #
+# In mode=fuse there is a third thing, and it has to happen before vold prepares
+# the user's storage rather than after: tools/vold-fusefs is pointed at vold to
+# redirect its mount() trampoline, so the FUSE mount for emulated storage is
+# turned into a bind of the raw tree instead of being made at all.
+#
 
 MODDIR=${MODDIR:-${0%/*}}
 LOG=/data/adb/unfuse_zygisk.log
@@ -48,4 +53,44 @@ if [ -x "$NOACL" ]; then
 else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: нет $NOACL —" \
         "vold перепишет default-ACL у /data/media/0" >>"$LOG"
+fi
+
+# --- cut FUSE off in vold (mode=fuse) ----------------------------------------
+#
+# The deepest of the modes: instead of living alongside the FUSE mount and
+# fighting it for permissions (which is what the ACL work above does), vold's
+# own mount() trampoline is redirected so that MountUserFuse() binds /data/media
+# onto the target rather than mounting FUSE on it. No FUSE superblock is ever
+# created for emulated storage, so there is nothing for the ACL pass to chase.
+#
+# Ordered after vold-noacl on purpose: both patch vold's memory, and the FUSE
+# redirection changes which mount() calls happen at all. Applying them in this
+# order means the ACL pass above has already been neutralised regardless.
+#
+# Only in mode=fuse. In auto/sdcardfs/acl the FUSE mount is left alone: those
+# modes are built on coexisting with it (acl) or on replacing it with sdcardfs.
+#
+# The patch lives in process memory, so it is re-applied every boot; it is
+# idempotent — on an already patched vold the tool confirms the patch instead of
+# writing. Rationale for the patch itself: see the header of tools/vold-fusefs.c.
+#
+FUSEMODE=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' \
+    "$MODDIR/unfuse_zygisk.conf" 2>/dev/null \
+    | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
+case "$FUSEMODE" in
+    raw) FUSEMODE=acl ;;
+esac
+[ -n "$FUSEMODE" ] || FUSEMODE=auto
+
+if [ "$FUSEMODE" = fuse ]; then
+    FUSEFS="$MODDIR/tools/vold-fusefs"
+    if [ ! -x "$FUSEFS" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: нет $FUSEFS —" \
+            "vold смонтирует FUSE, режим fuse не работает" >>"$LOG"
+    elif "$FUSEFS" --wait 3 >>"$LOG" 2>&1; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: FUSE отключён в vold" >>"$LOG"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] post-fs-data: vold-fusefs вернул $? —" \
+            "FUSE останется смонтированным" >>"$LOG"
+    fi
 fi

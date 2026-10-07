@@ -9,8 +9,8 @@
 SKIPUNZIP=0
 
 case "$ARCH" in
-    arm64) ABI=arm64-v8a;   FIX=storage-fix-arm64; NOACL=vold-noacl-arm64 ;;
-    arm)   ABI=armeabi-v7a; FIX=storage-fix-arm;   NOACL=vold-noacl-arm   ;;
+    arm64) ABI=arm64-v8a;   FIX=storage-fix-arm64; NOACL=vold-noacl-arm64; FUSEFS=vold-fusefs-arm64 ;;
+    arm)   ABI=armeabi-v7a; FIX=storage-fix-arm;   NOACL=vold-noacl-arm;   FUSEFS=vold-fusefs-arm   ;;
     *)     abort "! Unsupported architecture: $ARCH (arm64-v8a or armeabi-v7a required)" ;;
 esac
 
@@ -18,23 +18,29 @@ if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
     abort "! zygisk/$ABI.so is missing - the build did not run (build.sh)"
 fi
 
-# The archive carries both tools for every ABI: keep only ours and rename them —
-# storage.sh, post-fs-data.sh and service.sh look for these names.
+# The archive carries all three tools for every ABI: keep only ours and rename
+# them — storage.sh, post-fs-data.sh and service.sh look for these names.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
     abort "! tools/$FIX is missing - the build did not run (build.sh)"
 fi
 if [ ! -f "$MODPATH/tools/$NOACL" ]; then
     abort "! tools/$NOACL is missing - the build did not run (build.sh)"
 fi
-mv "$MODPATH/tools/$FIX"   "$MODPATH/tools/storage-fix"
-mv "$MODPATH/tools/$NOACL" "$MODPATH/tools/vold-noacl"
+if [ ! -f "$MODPATH/tools/$FUSEFS" ]; then
+    abort "! tools/$FUSEFS is missing - the build did not run (build.sh)"
+fi
+mv "$MODPATH/tools/$FIX"    "$MODPATH/tools/storage-fix"
+mv "$MODPATH/tools/$NOACL"  "$MODPATH/tools/vold-noacl"
+mv "$MODPATH/tools/$FUSEFS" "$MODPATH/tools/vold-fusefs"
 rm -f "$MODPATH/tools/storage-fix-arm64" "$MODPATH/tools/storage-fix-arm" \
-      "$MODPATH/tools/vold-noacl-arm64"  "$MODPATH/tools/vold-noacl-arm"
+      "$MODPATH/tools/vold-noacl-arm64"  "$MODPATH/tools/vold-noacl-arm" \
+      "$MODPATH/tools/vold-fusefs-arm64" "$MODPATH/tools/vold-fusefs-arm"
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/zygisk/$ABI.so"     0 0 0644
 set_perm "$MODPATH/tools/storage-fix"  0 0 0755
 set_perm "$MODPATH/tools/vold-noacl"   0 0 0755
+set_perm "$MODPATH/tools/vold-fusefs"  0 0 0755
 set_perm "$MODPATH/customize.sh"       0 0 0755 2>/dev/null
 set_perm "$MODPATH/post-fs-data.sh"    0 0 0755 2>/dev/null
 set_perm "$MODPATH/service.sh"         0 0 0755 2>/dev/null
@@ -72,8 +78,8 @@ prev_mode() {
         m=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null \
             | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
         case "$m" in
-            auto|sdcardfs|acl) printf '%s\n' "$m"; return 0 ;;
-            raw)               printf 'acl\n';     return 0 ;;
+            auto|sdcardfs|acl|fuse) printf '%s\n' "$m"; return 0 ;;
+            raw)                    printf 'acl\n';     return 0 ;;
         esac
     done
     return 1
@@ -93,7 +99,7 @@ if [ -r "$CONF" ]; then
         | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
 fi
 case "$MODE" in
-    auto|sdcardfs|acl) ;;
+    auto|sdcardfs|acl|fuse) ;;
     raw) MODE=acl ;;
     *) MODE=auto ;;
 esac
@@ -114,6 +120,11 @@ fi
 case "$MODE" in
     acl)
         STORAGE="raw /data/media + ACL (mode=acl)" ;;
+    fuse)
+        # The mode whose whole point is that sdcardfs is irrelevant: vold's
+        # FUSE mount is turned into a bind of the raw tree, so the kernel's
+        # sdcardfs support does not change the answer.
+        STORAGE="raw /data/media, FUSE off (mode=fuse)" ;;
     sdcardfs)
         if [ "$HAVE_SDCARDFS" = 1 ]; then
             STORAGE="sdcardfs (mode=sdcardfs, kernel has sdcardfs)"

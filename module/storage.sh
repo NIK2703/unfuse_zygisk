@@ -44,7 +44,7 @@ if [ -z "$PATH_MODE" ]; then
 fi
 
 case "$PATH_MODE" in
-    auto|sdcardfs|acl) ;;
+    auto|sdcardfs|acl|fuse) ;;
     raw)
         # Former name of the acl mode; handled as acl from here on.
         log "конфиг: path=raw — прежнее имя режима acl"
@@ -244,12 +244,14 @@ sdcardfs_verify() {
 
 # --- 2b. What step 2 does ----------------------------------------------------
 #
-# By PATH_MODE: acl — never mount sdcardfs, tear down existing mounts at once;
+# By PATH_MODE: acl and fuse — never mount sdcardfs, tear down existing mounts at
+# once (both want the raw tree, and differ only in whether vold's FUSE mount is
+# also cut off, which is post-fs-data.sh's job, not this script's);
 # auto — sdcardfs first, then verify, falling back on failure; sdcardfs — the
 # same but strict: log what did not match and exit 1 instead of falling back.
 #
-if [ "$PATH_MODE" = acl ]; then
-    log "path=acl — основной путь выключен настройкой модуля"
+if [ "$PATH_MODE" = acl ] || [ "$PATH_MODE" = fuse ]; then
+    log "path=$PATH_MODE — основной путь выключен настройкой модуля"
     umount_all
 elif grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
     mount_all

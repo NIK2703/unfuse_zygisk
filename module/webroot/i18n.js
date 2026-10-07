@@ -16,6 +16,7 @@ const strings = {
     acl_access: 'ACL 9997 — access on /data/media/0',
     acl_default: 'ACL 9997 — default on /data/media/0',
     vold_patched: 'vold patch: setxattr defused',
+    fuse_off: 'FUSE off: vold binds the raw tree',
     libc_hooks: 'libc patch in apps',
     pending: 'The selected mode will apply only after a reboot',
     failed: 'Failed to apply the mode'

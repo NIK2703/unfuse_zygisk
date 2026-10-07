@@ -9,6 +9,7 @@
 # Usage:
 #
 #   sh path-mode.sh              show the current mode and where it came from
+#   sh path-mode.sh fuse         raw tree with FUSE cut off in vold
 #   sh path-mode.sh acl          raw tree + ACL only
 #   sh path-mode.sh sdcardfs     main path only
 #   sh path-mode.sh auto         default behaviour
@@ -16,6 +17,12 @@
 #
 # acl was formerly called raw; the old name is accepted and means the same, so
 # old configs and instructions keep working.
+#
+# fuse is the deepest of the modes: post-fs-data.sh points tools/vold-fusefs at
+# vold, which redirects vold's mount() stub so MountUserFuse() binds
+# /data/media onto the target instead of mounting FUSE at all. The raw tree then
+# reaches apps with no FUSE daemon in between. It still needs the ACL pass, so
+# storage.sh runs as usual; what it does not need is sdcardfs.
 #
 # `apply` runs storage.sh without a reboot: enough to switch between the raw
 # tree and sdcardfs and restart an app. vold prepares the user's CE storage
@@ -67,15 +74,34 @@ show() {
         done < /proc/mounts
         printf '  %-32s %s\n' "$p" "${t:-—}"
     done
+
+    # In fuse mode the thing worth reporting is not the mount type but whether
+    # vold's trampoline is redirected: the mode is only real if the patch is in
+    # vold's memory, and that does not survive a reboot as a file does.
+    if [ "$m" = fuse ]; then
+        vf="$MODDIR/tools/vold-fusefs"
+        if [ ! -x "$vf" ]; then
+            echo "  vold-fusefs: нет $vf — FUSE не отключён"
+        elif "$vf" --check >/dev/null 2>&1; then
+            echo "  vold-fusefs: патч на месте — vold не монтирует FUSE"
+        else
+            rc=$?
+            case "$rc" in
+                1) echo "  vold-fusefs: vold не найден — патч не применён" ;;
+                2) echo "  vold-fusefs: анкер не разрешился — патч не применён" ;;
+                *) echo "  vold-fusefs: трамплин цел — патч НЕ применён (rc=$rc)" ;;
+            esac
+        fi
+    fi
 }
 
 set_mode() {
     m="$1"
     case "$m" in
-        auto|sdcardfs|acl) ;;
-        raw)               m=acl ;;   # former name of the same mode
+        auto|sdcardfs|acl|fuse) ;;
+        raw)                    m=acl ;;   # former name of the same mode
         *)
-            echo "неизвестный режим: $1 (нужен auto, sdcardfs или acl)" >&2
+            echo "неизвестный режим: $1 (нужен auto, sdcardfs, acl или fuse)" >&2
             exit 2
             ;;
     esac
@@ -85,7 +111,8 @@ set_mode() {
     tmp="$CONF.new"
     {
         echo "# unfuse_zygisk.conf — written by path-mode.sh $(stamp)"
-        echo "# path: auto (default), sdcardfs (main path only), acl (raw tree + ACL)."
+        echo "# path: auto (default), sdcardfs (main path only), acl (raw tree + ACL),"
+        echo "#       fuse (raw tree, vold's FUSE mount cut off)."
         echo "path=$m"
     } > "$tmp" 2>/dev/null
 

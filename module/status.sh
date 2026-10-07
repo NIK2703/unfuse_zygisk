@@ -7,7 +7,7 @@
 #
 # Keys:
 #   kernel_sdcardfs  kernel has sdcardfs (otherwise the sdcardfs mode is off)
-#   mode             what the config says (auto|sdcardfs|acl)
+#   mode             what the config says (auto|sdcardfs|acl|fuse)
 #   effective        path actually in use right now
 #   mount_<point>    /mnt/runtime/<point>/emulated is an sdcardfs mount
 #   mount_opts       all four points carry the requested mask and gid
@@ -15,6 +15,7 @@
 #   acl_access       access ACL of /data/media/0 has an entry for 9997
 #   acl_default      default ACL of /data/media/0 has an entry for 9997
 #   vold_patched     setxattr defused in the running vold
+#   fuse_off         vold's FUSE mount redirected to a bind (mode=fuse only)
 #   libc_hooks       libc entry patch applied inside app processes
 #
 
@@ -86,9 +87,9 @@ fi
 mode=$(sed -n 's/^[[:space:]]*path[[:space:]]*=[[:space:]]*//p' "$CONF" 2>/dev/null \
     | sed 's/[[:space:]]*#.*$//' | sed 's/[[:space:]]*$//' | tail -n 1)
 case "$mode" in
-    auto|sdcardfs) ;;
-    acl|raw)       mode=acl ;;
-    *)             mode=auto ;;
+    auto|sdcardfs|fuse) ;;
+    acl|raw)            mode=acl ;;
+    *)                  mode=auto ;;
 esac
 kv mode "$mode"
 
@@ -192,6 +193,20 @@ if [ -x "$NOACL" ] && "$NOACL" --check >/dev/null 2>&1; then
     kv vold_patched 1
 else
     kv vold_patched 0
+fi
+
+# --- FUSE-off patch -----------------------------------------------------------
+# vold-fusefs --check exits 0 only when the trampoline is redirected; 1 means no
+# vold (or none patched), 2 that the anchor did not resolve. Only 0 counts.
+#
+# Reported always, not only in mode=fuse: the key answers "is vold still mounting
+# FUSE", which is a fact about the machine, and the page can decide what to do
+# with it. In the other modes 0 is expected.
+FUSEFS="$MODDIR/tools/vold-fusefs"
+if [ -x "$FUSEFS" ] && "$FUSEFS" --check >/dev/null 2>&1; then
+    kv fuse_off 1
+else
+    kv fuse_off 0
 fi
 
 # --- libc entry patch ---------------------------------------------------------

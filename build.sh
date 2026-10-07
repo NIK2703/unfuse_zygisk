@@ -11,6 +11,10 @@
 #                                     vold::SetDefaultAcl() into a no-op so vold
 #                                     stops overwriting those ACLs with its own
 #                                     group 1023 entry (C).
+#   module/tools/vold-fusefs-<abi>  — the FUSE-off patcher: redirects vold's
+#                                     mount() stub so MountUserFuse() binds
+#                                     /data/media onto the target instead of
+#                                     mounting FUSE at all (C).
 # Then packs module/ into out/unfuse_zygisk-<version>.zip.
 #
 # Usage:
@@ -29,6 +33,7 @@ HOOK_SRC="$HERE/src/hook_libc.cpp"
 SIZE_SRC="$HERE/src/func_size.cpp"
 TOOLS_SRC="$HERE/tools/storage-fix.c"
 NOACL_SRC="$HERE/tools/vold-noacl.c"
+FUSEFS_SRC="$HERE/tools/vold-fusefs.c"
 ZYG_DIR="$HERE/module/zygisk"
 TOOLS_DIR="$HERE/module/tools"
 OUT_DIR="$HERE/out"
@@ -41,20 +46,46 @@ DEBUG="${DEBUG:-0}"
 DEFAULT_ABIS=(arm64-v8a armeabi-v7a)
 
 # --------------------------------------------------------------- NDK lookup
+#
+# The prebuilt directory is named after the *host*: linux-x86_64, darwin-x86_64
+# or windows-x86_64. Hardcoding linux-x86_64 makes the script refuse to see a
+# perfectly good NDK on Windows, so the host tag is computed once here. Both the
+# clang++ probe and the toolchain root below use it.
+find_host_tag() {
+    local d
+    for d in "${NDK:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK:-}"; do
+        [[ -n "$d" && -d "$d/toolchains/llvm/prebuilt" ]] || continue
+        local tag
+        while IFS= read -r tag; do
+            [[ -n "$tag" ]] && { printf '%s\n' "$tag"; return 0; }
+        done < <(ls -1 "$d/toolchains/llvm/prebuilt" 2>/dev/null)
+    done
+    case "$(uname -s 2>/dev/null)" in
+        Darwin) printf 'darwin-x86_64\n' ;;
+        MINGW*|MSYS*|CYGWIN*) printf 'windows-x86_64\n' ;;
+        *)      printf 'linux-x86_64\n' ;;
+    esac
+}
+
 find_ndk() {
-    if [[ -n "${NDK:-}" && -x "${NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
+    local host_tag
+    host_tag="$(find_host_tag)"
+    local probe="toolchains/llvm/prebuilt/$host_tag/bin/clang++"
+
+    if [[ -n "${NDK:-}" && -x "${NDK}/$probe" ]]; then
         printf '%s\n' "$NDK"; return 0
     fi
     local env_candidates=("${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_ROOT:-}" "${ANDROID_NDK:-}")
     local c
     for c in "${env_candidates[@]}"; do
-        [[ -n "$c" && -x "$c/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]] && {
+        [[ -n "$c" && -x "$c/$probe" ]] && {
             printf '%s\n' "$c"; return 0; }
     done
 
     local roots=(
         "$HOME/projects/tools/android-sdk/ndk"
         "$HOME/Android/Sdk/ndk"
+        "$HOME/AppData/Local/Android/Sdk/ndk"
         "$HOME/Library/Android/sdk/ndk"
         "/opt/android-sdk/ndk"
         "/opt/android-ndk"
@@ -63,12 +94,12 @@ find_ndk() {
     for r in "${roots[@]}"; do
         [[ -d "$r" ]] || continue
         # is the directory itself an NDK?
-        if [[ -x "$r/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
+        if [[ -x "$r/$probe" ]]; then
             printf '%s\n' "$r"; return 0
         fi
-        # version container directory: take the newest
+        # version container directory: take the newest, skipping empty ones
         while IFS= read -r sub; do
-            if [[ -x "$sub/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]]; then
+            if [[ -x "$sub/$probe" ]]; then
                 printf '%s\n' "$sub"; return 0
             fi
         done < <(ls -1d "$r"/*/ 2>/dev/null | sed 's:/$::' | sort -V -r)
@@ -80,6 +111,20 @@ find_ndk() {
 die()  { printf 'ошибка: %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m ok\033[0m %s\n' "$*"; }
+
+# Paths the MSYS2 shell prints (/c/foo) are not understood by the Windows clang
+# that this same shell invokes: it needs C:/foo. Under a POSIX host the identity
+# function is right, so the translation is decided once, from the host tag.
+HOST_TAG="$(find_host_tag)"
+hostpath() {
+    case "$HOST_TAG" in
+        windows-*)
+            # /c/Users/x -> C:/Users/x ; /h/projects -> H:/projects
+            printf '%s\n' "$1" | sed -E 's|^/([a-zA-Z])/|\1:/|'
+            ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
 
 # abi -> (triple, clang-prefix)
 triple_for() {
@@ -117,9 +162,21 @@ noacl_name_for() {
     esac
 }
 
+# abi -> FUSE-off patcher binary name in module/tools/. Same reason as the other
+# two: the archive carries every variant and customize.sh keeps the right one,
+# renaming it to tools/vold-fusefs.
+fusefs_name_for() {
+    case "$1" in
+        arm64-v8a)   echo "vold-fusefs-arm64" ;;
+        armeabi-v7a) echo "vold-fusefs-arm" ;;
+        x86_64)      echo "vold-fusefs-x86_64" ;;
+        *)           return 1 ;;
+    esac
+}
+
 # --------------------------------------------------------------- main
 NDK_DIR="$(find_ndk)" || die "NDK не найден. Укажите путь: NDK=/path/to/ndk $0"
-TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/$(find_host_tag)"
 [[ -d "$TOOLCHAIN" ]] || die "нет toolchain: $TOOLCHAIN"
 
 info "NDK:      $NDK_DIR"
@@ -133,6 +190,7 @@ info "          $SIZE_SRC"
 [[ -f "$SIZE_SRC" ]] || die "нет исходника $SIZE_SRC"
 [[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
 [[ -f "$NOACL_SRC" ]] || die "нет исходника $NOACL_SRC"
+[[ -f "$FUSEFS_SRC" ]] || die "нет исходника $FUSEFS_SRC"
 mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
 
 ABIS=("$@")
@@ -190,9 +248,10 @@ CFLAGS=(
     -Wall
     -Wextra
     -Wno-unused-parameter
-    # vold-noacl.c includes android_ver.h — the release table the patchers share.
-    # storage-fix.c does not, and an unused -I costs it nothing.
-    -I"$HERE/src"
+    # vold-noacl.c and vold-fusefs.c include android_ver.h — the release table
+    # the patchers share. storage-fix.c does not, and an unused -I costs it
+    # nothing. Translated because the compiler is a Windows binary under MSYS.
+    -I"$(hostpath "$HERE/src")"
 )
 
 # --------------------------------------------------------------- build
@@ -205,11 +264,12 @@ for abi in "${ABIS[@]}"; do
     out="$ZYG_DIR/$abi.so"
     info "сборка $abi -> $(basename "$out")"
 
-    "$cxx" "${COMMON[@]}" "$SRC" "$HOOK_SRC" "$SIZE_SRC" -o "$out" "${LDFLAGS[@]}"
+    "$cxx" "${COMMON[@]}" "$(hostpath "$SRC")" "$(hostpath "$HOOK_SRC")" \
+        "$(hostpath "$SIZE_SRC")" -o "$(hostpath "$out")" "${LDFLAGS[@]}"
 
     if [[ "$STRIP" == "1" ]]; then
         strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-unneeded "$out"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-unneeded "$(hostpath "$out")"
     fi
 
     size="$(wc -c < "$out")"
@@ -218,10 +278,10 @@ for abi in "${ABIS[@]}"; do
     # The entry point must be exported and unmangled. zygisk_companion_entry is
     # optional: the module does not need it (a companion exists only for reading
     # config from places zygote cannot reach).
-    if ! "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$out" 2>/dev/null | grep -qw zygisk_module_entry; then
+    if ! "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_module_entry; then
         die "в $out отсутствует экспортируемая точка входа zygisk_module_entry"
     fi
-    if "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$out" 2>/dev/null | grep -qw zygisk_companion_entry; then
+    if "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_companion_entry; then
         ok "$abi: точки входа на месте (module + companion)"
     else
         ok "$abi: точка входа на месте (module)"
@@ -237,12 +297,12 @@ for abi in "${ABIS[@]}"; do
     tout="$TOOLS_DIR/$tool"
     info "сборка $abi -> $(basename "$tout")"
 
-    "$cc" "${CFLAGS[@]}" "$TOOLS_SRC" -o "$tout" \
+    "$cc" "${CFLAGS[@]}" "$(hostpath "$TOOLS_SRC")" -o "$(hostpath "$tout")" \
         -Wl,--gc-sections -Wl,--build-id=none
 
     if [[ "$STRIP" == "1" ]]; then
         strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$tout"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$tout")"
     fi
 
     ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
@@ -258,16 +318,37 @@ for abi in "${ABIS[@]}"; do
     nout="$TOOLS_DIR/$ntool"
     info "сборка $abi -> $(basename "$nout")"
 
-    "$cc" "${CFLAGS[@]}" "$NOACL_SRC" -o "$nout" \
+    "$cc" "${CFLAGS[@]}" "$(hostpath "$NOACL_SRC")" -o "$(hostpath "$nout")" \
         -Wl,--gc-sections -Wl,--build-id=none
 
     if [[ "$STRIP" == "1" ]]; then
         strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$nout"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$nout")"
     fi
 
     ok "$abi: $(basename "$nout") — $(wc -c < "$nout") байт"
     built+=("$nout")
+
+    # ------------------------------------------------ FUSE-off patcher
+    #
+    # Same shape as vold-noacl: it works on vold's process memory and parses
+    # ELF itself, so its ABI need not match vold's. The arm64 handler it emits
+    # is generated at run time for the target it finds, not compiled in, so
+    # nothing here is architecture-specific except the outer executable.
+    ftool="$(fusefs_name_for "$abi")" || die "нет имени патчера для $abi"
+    fout="$TOOLS_DIR/$ftool"
+    info "сборка $abi -> $(basename "$fout")"
+
+    "$cc" "${CFLAGS[@]}" "$(hostpath "$FUSEFS_SRC")" -o "$(hostpath "$fout")" \
+        -Wl,--gc-sections -Wl,--build-id=none
+
+    if [[ "$STRIP" == "1" ]]; then
+        strip_bin="$TOOLCHAIN/bin/llvm-strip"
+        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$fout")"
+    fi
+
+    ok "$abi: $(basename "$fout") — $(wc -c < "$fout") байт"
+    built+=("$fout")
 done
 
 # --------------------------------------------------------------- zip
@@ -286,8 +367,9 @@ if [[ "$ZIP" == "1" ]]; then
     info "упаковка $zipname"
 
     # Packed through python: deterministic, permissions preserved, no external
-    # zip and no need to delete an old archive first.
-    python3 - "$HERE/module" "$zippath" <<'PYEOF'
+    # zip and no need to delete an old archive first. Paths are translated
+    # because python here is a native Windows build, not an MSYS one.
+    python3 - "$(hostpath "$HERE/module")" "$(hostpath "$zippath")" <<'PYEOF'
 import os, sys, zipfile
 
 root, out = sys.argv[1], sys.argv[2]
