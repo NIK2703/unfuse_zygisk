@@ -115,13 +115,25 @@ fi
 # is no vold or none patched, 2 when the anchor did not resolve. Log line only —
 # the sign in module.prop (status.sh) is what the module list shows.
 #
-FUSEFS="$MODDIR/tools/vold-fusefs"
-if [ ! -x "$FUSEFS" ]; then
-    log "нет $FUSEFS — vold смонтирует FUSE, прямой доступ не заработает"
-elif "$FUSEFS" --check >/dev/null 2>&1; then
-    log "FUSE отключён в vold — MountUserFuse перехвачен"
+# Not asked at the post-fs-data stage, and that is the whole point of the guard:
+# post-fs-data.sh runs storage.sh BEFORE it applies the FUSE patch, so at that
+# moment the answer is always "not patched" — the check there could only ever
+# print a failure that is not one, and could never tell it apart from a real one.
+# The patch's own result at that stage is logged by post-fs-data.sh, which is the
+# only place that knows whether it just succeeded or failed.
+#
+if [ "$STAGE" = "post-fs-data" ]; then
+    log "состояние FUSE не проверяется на этой стадии — патч ставится ниже, " \
+        "в post-fs-data.sh; ответ будет в стадии service"
 else
-    log "FUSE НЕ отключён — vold смонтирует FUSE, прямой доступ не заработает"
+    FUSEFS="$MODDIR/tools/vold-fusefs"
+    if [ ! -x "$FUSEFS" ]; then
+        log "нет $FUSEFS — vold смонтирует FUSE, прямой доступ не заработает"
+    elif "$FUSEFS" --check >/dev/null 2>&1; then
+        log "FUSE отключён в vold — MountUserFuse перехвачен"
+    else
+        log "FUSE НЕ отключён — vold смонтирует FUSE, прямой доступ не заработает"
+    fi
 fi
 
 exit 0

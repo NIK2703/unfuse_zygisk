@@ -135,7 +135,6 @@ triple_for() {
     case "$1" in
         arm64-v8a)   echo "aarch64-linux-android" ;;
         armeabi-v7a) echo "armv7a-linux-androideabi" ;;
-        x86_64)      echo "x86_64-linux-android" ;;
         *)           return 1 ;;
     esac
 }
@@ -149,7 +148,6 @@ tool_name_for() {
     case "$1" in
         arm64-v8a)   echo "storage-fix-arm64" ;;
         armeabi-v7a) echo "storage-fix-arm" ;;
-        x86_64)      echo "storage-fix-x86_64" ;;
         *)           return 1 ;;
     esac
 }
@@ -161,7 +159,6 @@ noacl_name_for() {
     case "$1" in
         arm64-v8a)   echo "vold-noacl-arm64" ;;
         armeabi-v7a) echo "vold-noacl-arm" ;;
-        x86_64)      echo "vold-noacl-x86_64" ;;
         *)           return 1 ;;
     esac
 }
@@ -173,7 +170,6 @@ fusefs_name_for() {
     case "$1" in
         arm64-v8a)   echo "vold-fusefs-arm64" ;;
         armeabi-v7a) echo "vold-fusefs-arm" ;;
-        x86_64)      echo "vold-fusefs-x86_64" ;;
         *)           return 1 ;;
     esac
 }
@@ -252,9 +248,14 @@ CFLAGS=(
     -Wall
     -Wextra
     -Wno-unused-parameter
-    # vold-noacl.c and vold-fusefs.c include android_ver.h — the release table
-    # the patchers share. storage-fix.c does not, and an unused -I costs it
-    # nothing. Translated because the compiler is a Windows binary under MSYS.
+    # Only vold-noacl.c includes android_ver.h — the release table, whose two
+    # columns are its own: the AOSP site that writes the default ACL, and the
+    # libc target count the Zygisk module compares against. vold-fusefs.c and
+    # storage-fix.c do not include it, and an unused -I costs them nothing.
+    # The two patchers also include tools/vold-common.h, the ELF-reading half
+    # they share. A quoted include resolves next to the including file, so that
+    # one needs no -I at all.
+    # Translated because the compiler is a Windows binary under MSYS.
     -I"$(hostpath "$HERE/src")"
 )
 

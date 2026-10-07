@@ -55,10 +55,12 @@
 #define XATTR_ACL_ACCESS "system.posix_acl_access"
 #define XATTR_ACL_DEFAULT "system.posix_acl_default"
 
-/* linux/include/uapi/linux/posix_acl_xattr.h */
+/* linux/include/uapi/linux/posix_acl_xattr.h. ACL_USER (0x02) is absent on
+ * purpose: a named user entry is never written or looked for here — access is
+ * granted through the named GROUP entry for 9997, so the tag would be one more
+ * constant to keep in step for nothing. */
 #define POSIX_ACL_XATTR_VERSION 0x0002
 #define ACL_USER_OBJ 0x01
-#define ACL_USER 0x02
 #define ACL_GROUP_OBJ 0x04
 #define ACL_GROUP 0x08
 #define ACL_MASK 0x10
