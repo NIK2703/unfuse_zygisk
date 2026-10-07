@@ -25,13 +25,20 @@
  * the absolute_lower_path (the raw /data/media). So the raw tree is a supported
  * outcome; it is simply never the one that reaches /mnt/user/<user>/emulated.
  *
- * Having the raw tree there is what this module is for. The previous approach
- * had the Zygisk module try to bind /data/media over the FUSE point from inside
- * its own private mount namespace (unfuse_zygisk.cpp, attach()). That fails by
+ * Having the raw tree there is what this module is for. An earlier approach had
+ * the Zygisk module try to bind /data/media over the FUSE point from inside the
+ * app's own private mount namespace (unfuse_zygisk.cpp). That fails by
  * construction on such images: the point already has a FUSE superblock, the
- * bind cannot displace it, and statfs() still reports FUSE — the module detects
- * this and rolls back, so the raw path never activates. Fighting the FUSE mount
+ * bind cannot displace it, and statfs() still reports FUSE — the module detected
+ * this and rolled back, so the raw path never activated. Fighting the FUSE mount
  * from a child namespace is the wrong layer.
+ *
+ * That second bind is gone as of 2026-10-07, and this tool is why it could go:
+ * the bind made below sits on /mnt/user/<user>/emulated, a shared mount, so
+ * every app mount namespace receives it by propagation. A second bind of the
+ * same tree in the app's own namespace was pure duplication — and making the
+ * namespace private to keep that bind from leaking into Zygote was itself what
+ * kept this one from propagating in.
  *
  * ============================== what this does instead
  *

@@ -1,1 +1,1 @@
-Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace and lifts Android/data and Android/obb isolation.
+Direct internal storage for all apps — no FUSE, no scoped storage. vold's FUSE mount for emulated storage is replaced by a bind of the raw /data/media, and Android/data + Android/obb isolation is lifted.

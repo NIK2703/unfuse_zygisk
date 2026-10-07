@@ -2,11 +2,13 @@
 #
 # build.sh — build the Unfuse Zygisk module.
 #
-# Builds three things:
+# Builds four things:
 #   module/zygisk/<abi>.so          — the module itself (C++, NDK, clang++);
-#   module/tools/storage-fix-<abi>  — the tool that places ACLs on the raw tree
-#                                     (C; needed by the fallback path when the
-#                                     kernel has no sdcardfs);
+#   module/tools/storage-fix-<abi>  — the tool that places the group-9997 ACL on
+#                                     the raw tree (C): /data/media is
+#                                     1023:1023 with 0550/2770/0670, and apps
+#                                     are not in group 1023, so without this
+#                                     they cannot even enter the root;
 #   module/tools/vold-noacl-<abi>   — the vold patcher: turns
 #                                     vold::SetDefaultAcl() into a no-op so vold
 #                                     stops overwriting those ACLs with its own
@@ -291,7 +293,7 @@ for abi in "${ABIS[@]}"; do
 
     built+=("$out")
 
-    # --------------------------------------------- fallback-path utility
+    # ------------------------------------------------- storage-fix utility
     cc="$TOOLCHAIN/bin/${prefix}${API}-clang"
     [[ -x "$cc" ]] || die "нет компилятора $cc (проверьте API=$API)"
 

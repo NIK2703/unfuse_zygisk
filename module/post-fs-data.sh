@@ -2,8 +2,9 @@
 #
 # post-fs-data.sh — prepare storage before Zygote starts.
 #
-# The module can only expose a storage source to an app inside its private
-# namespace, so by the time the first app launches these must already exist:
+# The Zygisk module mounts nothing — it only clears mount_storage_dirs at
+# specialisation. Storage reaches the apps through vold, so by the time the first
+# app launches these must already exist:
 #
 #   * the media_rw_data_file label on the /data/media root;
 #   * the ACL for group 9997 on the raw /data/media tree;
