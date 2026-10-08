@@ -678,7 +678,11 @@ enum {
 
 /* Assemble the handler into `out`.
  *
- * out_cap must be >= 256. Returns bytes written (code + pool + string), or -1.
+ * Returns the number of bytes written (code + pool + string), or -1 — either
+ * because the handler's own budget was exceeded or because what was assembled
+ * does not fit in `out_cap`. There is no separate "minimum capacity" contract:
+ * the size produced is checked against `out_cap` at the write, so a caller
+ * cannot satisfy a documented minimum and still be overflowed.
  * `raw_string` is copied after the pool and NUL-terminated; P_RAW points at it.
  */
 static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
@@ -697,10 +701,8 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     int      idx_restore = -1;   /* word index of the pass-path frame restore */
     int      idx_pass_tail = -1; /* word index of the pass-path `ldr x9` */
 
-    if (out_cap < 256) return -1;
     size_t raw_len = strlen(raw_string) + 1;
     if (raw_len > 64) return -1;
-
 #define E(x) do { if (n >= 88) return -1; w[n++] = (uint32_t)(x); } while (0)
 #define LDR(slot, rt) do {                                            \
         if (nfld >= 32) return -1;                                    \
@@ -860,12 +862,22 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
         w[pool_idx + i * 2 + 1] = (uint32_t)(pool_val[i] >> 32);
     }
 
-    /* ---- write everything out: code + pool + string ---- */
-    memset(out, 0, (size_t)n * 4u);
-    memcpy(out, w, (size_t)n * 4u);
+    /* ---- write everything out: code + pool + string ----
+     *
+     * The capacity check is the WRITE, not a constant up front. The layout above
+     * may reach 96 words — the `n > 96` guard is what bounds it — i.e. 384
+     * bytes, while the precondition used to be "out_cap >= 256": a caller that
+     * satisfied it could still have had 384 bytes written into its buffer. Two
+     * numbers describing the same thing, kept in step by hand in two places, is
+     * how that happens; the produced size is the one that decides, so it is
+     * checked here. */
+    size_t total = (size_t)n * 4u;
+    if (total > out_cap) return -1;
+    memset(out, 0, total);
+    memcpy(out, w, total);
     memcpy(out + str_off_bytes, raw_string, raw_len);
 
-    return n * 4;
+    return (int)total;
 }
 
 typedef struct {
@@ -1003,7 +1015,6 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     int      label_at[L_LABEL_COUNT];
     int      n = 0;
 
-    if (out_cap < 256) return -1;
     for (int i = 0; i < L_LABEL_COUNT; i++) label_at[i] = -1;
 
 /* The limits below are the handler's own budget. Exceeding one is a refusal
@@ -1164,10 +1175,15 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
         }
     }
 
-    memset(out, 0, (size_t)n * 4u);
-    memcpy(out, w, (size_t)n * 4u);
+    /* The capacity check is the WRITE, not a constant up front — same reason as
+     * build_handler: the layout above may reach 96 words (384 bytes) while the
+     * precondition used to promise only 256. */
+    size_t total = (size_t)n * 4u;
+    if (total > out_cap) return -1;
+    memset(out, 0, total);
+    memcpy(out, w, total);
     memcpy(out + str_off_bytes, tail, sizeof(tail));
-    return n * 4;
+    return (int)total;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2306,6 +2322,38 @@ static int selftest(void) {
     int n = build_handler(buf, sizeof(buf), code_va, mount_va,
                           src_va, type_va, "/data/media");
     if (n <= 0) { fputs("selftest: build_handler failed\n", stderr); return 1; }
+
+    /* ---- the capacity contract is the size produced ----
+     *
+     * Not "out_cap >= some constant": the constant and the emitter's own budget
+     * are two descriptions of one thing, and they had already drifted apart
+     * (96 words = 384 bytes reachable vs. a promised 256). So the boundary is
+     * pinned on the produced size, both ways: a buffer of exactly `n` bytes must
+     * be accepted, and one byte less must be refused. This also catches the old
+     * behaviour, which refused anything under 256 even when the handler fit. */
+    {
+        uint8_t tight[512];
+        if (build_handler(tight, (size_t)n, code_va, mount_va,
+                          src_va, type_va, "/data/media") != n) {
+            fprintf(stderr, "selftest FAIL: буфер ровно в %d байт отвергнут —"
+                            " проверка ёмкости не совпадает с записью\n", n);
+            return 1;
+        }
+        if (build_handler(tight, (size_t)n - 1u, code_va, mount_va,
+                          src_va, type_va, "/data/media") != -1) {
+            fputs("selftest FAIL: буфер на байт меньше принят — запись выходит"
+                  " за ёмкость\n", stderr);
+            return 1;
+        }
+        uint8_t umtight[512];
+        int un = build_umount_handler(umtight, sizeof(umtight), code_va, mount_va);
+        if (un <= 0 ||
+            build_umount_handler(umtight, (size_t)un, code_va, mount_va) != un ||
+            build_umount_handler(umtight, (size_t)un - 1u, code_va, mount_va) != -1) {
+            fputs("selftest FAIL: граница ёмкости у обработчика umount2\n", stderr);
+            return 1;
+        }
+    }
 
     uint32_t *w = (uint32_t *)buf;
     int nw = n / 4;
