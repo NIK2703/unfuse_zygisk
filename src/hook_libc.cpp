@@ -257,11 +257,21 @@ bool needs_mode(int flags) {
     return (flags & O_CREAT) != 0 || (flags & O_TMPFILE) == O_TMPFILE;
 }
 
-// "Open with create": shape mode, syscall, ACL if new. A mode alone is not
-// enough: cross-app access needs the named 9997 ACL entry inherited from the dir
-// default ACL — fragile, since vold rebuilds /data/media/<user> and
-// Android/{data,obb,media} each boot and module/vold order is not guaranteed (on
-// device /data/media/0 default ACL was 1023, not 9997, hiding new root files).
+// "Open with create": shape mode, syscall, ACL if new. The shaped mode is what
+// keeps the grant alive — a file created 0600 has its ACL MASK cut to 0 by
+// posix_acl_create_masq, and the 9997 entry it inherited stops granting anything
+// (measured: touch -> 0660 with GROUP 9997 rw-; chmod 600 -> MASK ---). With the
+// mode shaped the parent's default ACL already gives the grant, so the write
+// below duplicates it; it stays because it is the only grant on the rename/link
+// path (rename applies no default ACL, see fix_after_move) and because it is the
+// fallback if that default ACL is ever wrong. It can be: vold re-enters
+// PrepareAndroidDirs (EmulatedVolume.cpp:436) and fscrypt_prepare_user_storage
+// (FsCrypt.cpp:1027) AFTER the module's ACL pass on every boot, and both call
+// SetDefaultAcl unconditionally while sdcardfs is off — measured 2026-10-08,
+// module pass 11:55:14 against vold 11:55:29.801 and 11:55:30.991. The 9997
+// default ACL survives that only because tools/vold-noacl.c makes vold's
+// setxattr a no-op; before that patch existed (v2.9.0) this write was the only
+// thing keeping new root files visible.
 int open_and_fix(int dirfd, const char *path, int flags, mode_t mode) {
     const bool storage = needs_mode(flags) && is_storage(dirfd, path);
     const bool existed = storage && exists_at(dirfd, path);
