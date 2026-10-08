@@ -334,6 +334,52 @@
 #define EXIT_NO_RESOLVE 2
 #define EXIT_NO_WRITE   3
 
+/* Why the ANCHOR did not resolve — one code per reason.
+ *
+ * Without these, every anchor failure is code 2 and says nothing about which
+ * assumption broke. That is not hypothetical: the vold 11–13 regression (the
+ * matcher required `adrp` and its `add` to be adjacent, so four releases were
+ * refused) surfaced as a bare 2 and took a disassembly session to explain. A
+ * distinct code names the shape that changed in one command, which is the
+ * difference between "не разобрать" and a fix.
+ *
+ * These are read by tools/vold-targets.sh, which prints them per image; the
+ * module's own scripts only ever ask --check and treat non-zero as "not
+ * patched", so adding codes is safe. */
+#define EXIT_AN_NO_SRC_STR   5   /* no "/dev/fuse" literal in the image       */
+#define EXIT_AN_NO_TYPE_STR  6   /* no "fuse" literal                         */
+#define EXIT_AN_SRC_AMBIG    7   /* "/dev/fuse" is not exactly one standalone
+                                  * string — the anchor cannot pick one       */
+#define EXIT_AN_NO_SITE      8   /* no `bl mount@plt` builds src/type into
+                                  * x0/x2 — the call shape changed           */
+#define EXIT_AN_NO_LAZYTIME  9   /* a site exists but none carries
+                                  * MS_LAZYTIME: cannot tell the emulated
+                                  * mount from the per-app one               */
+#define EXIT_AN_MULTI_LAZY  10   /* more than one does                      */
+#define EXIT_AN_MANY_SITES  18   /* more than 8 candidate call sites: the
+                                  * list is truncated and uniqueness can no
+                                  * longer be proven — refuse. Numbered after
+                                  * the handler-home group (11..17) because
+                                  * that group was added later; the anchor
+                                  * reasons are 5..10 and 18. */
+
+/* Why the handler could not get a home in the live process. There is no room in
+ * any image (see vold_exec_page), so these are the codes a release whose policy
+ * refuses something will actually produce. EP_SELF is the one that is ours, not
+ * vold's: it fails before ptrace is ever attempted. */
+#define EXIT_EP_ATTACH   11   /* ptrace attach to vold refused / no stop   */
+#define EXIT_EP_SCRATCH  12   /* vold could not map a scratch page         */
+#define EXIT_EP_WRITEPATH 13  /* could not write the exe path into vold    */
+#define EXIT_EP_OPEN     14   /* vold could not open its own binary        */
+#define EXIT_EP_EXECMAP  15   /* vold could not map it executable          */
+#define EXIT_EP_SELF     16   /* vold's own path could not be established,
+                               * so there is nothing to ask it to map      */
+#define EXIT_EP_NOREASON 17   /* vold_exec_page failed without recording why
+                               * — its own bug; never report success       */
+#define EXIT_USAGE       19   /* a command-line option was not understood.
+                               * Outside every other group: this one is about
+                               * the caller, not about vold. */
+
 /* arm64 instruction words used by the handler (see build_handler). Only these
  * two are emitted: a `nop` and a `mov x16, x0` were carried here as unused
  * spellings until 2026-10-08 and were dropped — an instruction word nobody
@@ -1222,14 +1268,38 @@ restore:
     return 0;
 }
 
-/* A private executable page taken from vold's own file. Returns the address,
- * or 0. `self_path` is vold's executable path (/proc/<pid>/exe). */
-static uint64_t vold_exec_page(pid_t pid, const char *self_path) {
-    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) return 0;
+/* A private executable page taken from vold's own file. Returns the address, or
+ * 0 with *why set to the step that failed.
+ *
+ * WHY a reason. This is not a fallback any more: measured with --room on
+ * 11/12/12L/13/14/15/16/17, the last PLT stub sits exactly at the end of the
+ * executable segment on every one of them (0 bytes of padding after it), so
+ * find_handler_room() never succeeds and this function is the ONLY way the
+ * handler gets a home. It is also the only part of the patch that can be refused
+ * by something outside the image — ptrace permission — and until now every
+ * failure here came out as a bare "не разобрать" (2), the same code as an anchor
+ * failure. Splitting it says which step was refused on a release whose policy
+ * differs, which is the whole difference between a diagnosis and a guess. */
+enum {
+    EP_OK        = 0,
+    EP_ATTACH    = 1,   /* PTRACE_ATTACH / waitpid refused or not a stop */
+    EP_SCRATCH   = 2,   /* mmap(PROT_READ|PROT_WRITE, ANON) inside vold failed */
+    EP_WRITEPATH = 3,   /* could not put the exe path into that page        */
+    EP_OPEN      = 4,   /* openat() inside vold failed                      */
+    EP_EXECMAP   = 5,   /* mmap(PROT_READ|PROT_EXEC, MAP_PRIVATE, fd) failed */
+};
+
+static uint64_t vold_exec_page(pid_t pid, const char *self_path, int *why) {
+    *why = EP_OK;
+    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
+        *why = EP_ATTACH;
+        return 0;
+    }
     {
         int status = 0;
         if (waitpid(pid, &status, 0) < 0 || !WIFSTOPPED(status)) {
             ptrace(PTRACE_DETACH, pid, NULL, NULL);
+            *why = EP_ATTACH;
             return 0;
         }
     }
@@ -1241,17 +1311,29 @@ static uint64_t vold_exec_page(pid_t pid, const char *self_path) {
     /* 1. a writable page to hold the path string */
     if (inj_syscall(pid, NR_MMAP, 0, 4096, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, (uint64_t)-1, 0,
-                    &scratch) != 0 || scratch <= 0) goto out;
-    if (mem_write(pid, (uint64_t)scratch, self_path, plen) != 0) goto out;
+                    &scratch) != 0 || scratch <= 0) {
+        *why = EP_SCRATCH;
+        goto out;
+    }
+    if (mem_write(pid, (uint64_t)scratch, self_path, plen) != 0) {
+        *why = EP_WRITEPATH;
+        goto out;
+    }
 
     /* 2. open the binary from inside vold */
     if (inj_syscall(pid, NR_OPENAT, (uint64_t)-100 /* AT_FDCWD */,
                     (uint64_t)scratch, O_RDONLY, 0, 0, 0,
-                    &fd) != 0 || fd <= 0) goto out;
+                    &fd) != 0 || fd <= 0) {
+        *why = EP_OPEN;
+        goto out;
+    }
 
     /* 3. map it executable, private; the page is ours to overwrite */
     if (inj_syscall(pid, NR_MMAP, 0, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE,
-                    (uint64_t)fd, 0, &home) != 0 || home <= 0) goto out_close;
+                    (uint64_t)fd, 0, &home) != 0 || home <= 0) {
+        *why = EP_EXECMAP;
+        goto out_close;
+    }
 
     result = (uint64_t)home;
 
@@ -1260,6 +1342,30 @@ out_close:
 out:
     ptrace(PTRACE_DETACH, pid, NULL, NULL);
     return result;
+}
+
+/* vold_exec_page()'s reasons, as exit codes. Kept beside it so the enum above
+ * and the #defines further up cannot drift apart unnoticed: adding a step to
+ * the function without a code here is a compile-time error only if this switch
+ * is exhaustive, which is why it has no `default:` — a new enumerator makes the
+ * compiler warn instead of silently reporting "не разобрать" again.
+ *
+ * EP_OK is deliberately NOT success here. This function is only reached when the
+ * address came back as 0, so EP_OK means "a failure path returned without
+ * recording why" — a bug in vold_exec_page, not a working patch. Mapping it to 0
+ * would report the patch as installed while nothing was written, which is the
+ * one outcome this whole file is built to make impossible. A dedicated code
+ * keeps that bug loud and names it instead of burying it in 2. */
+static int ep_exit_code(int why) {
+    switch (why) {
+        case EP_OK:        return EXIT_EP_NOREASON;
+        case EP_ATTACH:    return EXIT_EP_ATTACH;
+        case EP_SCRATCH:   return EXIT_EP_SCRATCH;
+        case EP_WRITEPATH: return EXIT_EP_WRITEPATH;
+        case EP_OPEN:      return EXIT_EP_OPEN;
+        case EP_EXECMAP:   return EXIT_EP_EXECMAP;
+    }
+    return EXIT_NO_RESOLVE;
 }
 #endif  /* __aarch64__ */
 
@@ -1670,14 +1776,18 @@ static void scan_back(const uint32_t *w, size_t nw, size_t k, uint64_t seg_va,
     }
 }
 
-/* Find the single `mount("/dev/fuse", ..., "fuse", ...)` call site. */
+/* Find the single `mount("/dev/fuse", ..., "fuse", ...)` call site.
+ *
+ * Returns 0, or a NEGATIVE reason (see anchor_exit_code) — not a bare -1: each
+ * way the anchor can fail is a different release-shape change and has to be
+ * tellable apart without a disassembler. */
 static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     enum { MAXSTR = 64 };
     StrLoc srcs[MAXSTR], types[MAXSTR];
     int nsrc = find_strings(s, FUSE_SRC, srcs, MAXSTR);
     int ntype = find_strings(s, FUSE_TYPE, types, MAXSTR);
     if (nsrc == 0) return -1;
-    if (ntype == 0) return -1;
+    if (ntype == 0) return -2;
 
     /* Keep only standalone occurrences. */
     StrLoc sstand[MAXSTR], tstand[MAXSTR];
@@ -1687,7 +1797,7 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     for (int i = 0; i < ntype; i++)
         if (types[i].standalone) tstand[nt++] = types[i];
 
-    if (ns != 1) return -1;
+    if (ns != 1) return -3;
     uint64_t want_src = sstand[0].va;
 
     /* scan_back() wants the type VAs as a plain array. */
@@ -1695,8 +1805,21 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     for (int t = 0; t < nt; t++) tvas[t] = tstand[t].va;
 
     /* Sweep executable segments for `bl <stub_va>`. */
-    FuseSite found[8];
+    enum { MAXSITE = 8 };
+    FuseSite found[MAXSITE];
     int nfound = 0;
+    /* Set when a matching site is found with found[] already full.
+     *
+     * This is not defensive padding: the count used to be incremented even when
+     * the site was NOT stored, and the MS_LAZYTIME filter below walks up to
+     * `nfound` — so a 9th matching site made it read past found[8]. A stack
+     * over-read that lands on a plausible-looking FuseSite hands build_handler()
+     * a garbage src_va, the handler is built for a path that is not "/data/media",
+     * and vold's mount(2) fails at runtime: no FUSE, no bind, /sdcard gone, and
+     * nothing in the tool says so. Refusing loudly is the only safe answer once
+     * the candidate list is truncated, because uniqueness can no longer be
+     * proven — which is exactly what the MS_LAZYTIME check exists to prove. */
+    bool too_many = false;
 
     for (int i = 0; i < s->phnum; i++) {
         const Elf64_Phdr *p = &s->ph[i];
@@ -1723,19 +1846,24 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
 
             if (sr.src_reg >= 0 && sr.type_reg >= 0 &&
                 sr.x0_from == sr.src_reg && sr.x2_from == sr.type_reg) {
-                if (nfound < 8) {
+                if (nfound < MAXSITE) {
                     found[nfound].src_va = sr.src_val;
                     found[nfound].type_va = sr.type_val;
                     found[nfound].flags = sr.w3_acc;
                     found[nfound].has_flags = sr.w3_seen;
+                    nfound++;
+                } else {
+                    too_many = true;
                 }
-                nfound++;
             }
         }
         free(w);
     }
 
-    if (nfound == 0) return -1;
+    /* Before the filter, not after: the filter is what the truncation would
+     * corrupt. */
+    if (too_many) return -7;
+    if (nfound == 0) return -4;
 
     /*
      * There are TWO such call sites in vold, and they must be treated
@@ -1773,12 +1901,26 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
 
     if (n_lazytime == 0) {
         /* Nothing distinguished by MS_LAZYTIME: refuse rather than guess. */
-        return -1;
+        return -5;
     }
-    if (n_lazytime > 1) return -1;
+    if (n_lazytime > 1) return -6;
 
     *out = keep[0];
     return 0;
+}
+
+/* find_fuse_site()'s negative reasons, as exit codes. */
+static int anchor_exit_code(int reason) {
+    switch (reason) {
+        case -1: return EXIT_AN_NO_SRC_STR;
+        case -2: return EXIT_AN_NO_TYPE_STR;
+        case -3: return EXIT_AN_SRC_AMBIG;
+        case -4: return EXIT_AN_NO_SITE;
+        case -5: return EXIT_AN_NO_LAZYTIME;
+        case -6: return EXIT_AN_MULTI_LAZY;
+        case -7: return EXIT_AN_MANY_SITES;
+        default: return EXIT_NO_RESOLVE;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -2627,6 +2769,13 @@ static void usage(void) {
           "               copy of /system/bin/vold before touching a device.\n"
           "  --check      resolve and report, patch nothing.\n"
           "  --dry-run    do everything except the writes.\n"
+          "  --room       answer one question and exit: is there room in the\n"
+          "               image (a zero run after the last PLT stub) for the\n"
+          "               handlers? 0 = yes, 1 = no, 2 = the stub did not\n"
+          "               resolve. No room is not a failure — the patch then\n"
+          "               asks vold to map a page of its own binary executable\n"
+          "               — but it is the part of the patch that can be refused,\n"
+          "               so it is worth knowing per release.\n"
           "  --wait SEC   seconds to wait for vold (default 3).\n"
           "  --pid PID    target this pid instead of finding vold.\n"
           "\n"
@@ -2644,14 +2793,33 @@ static void usage(void) {
           "the failure this tool exists to prevent.\n"
           "\n"
           "Exit codes: 0 ok; 1 no vold found; 2 anchor did not resolve;\n"
-          "            3 could not write.\n",
+          "            3 could not write; 4 no such file.\n"
+          "            Anchor failures are split by REASON so a release that\n"
+          "            changed shape says which assumption broke:\n"
+          "              5 no \"/dev/fuse\" literal      8 no matching call site\n"
+          "              6 no \"fuse\" literal           9 no MS_LAZYTIME site\n"
+          "              7 not exactly one standalone  10 more than one\n"
+          "                \"/dev/fuse\" string\n"
+          "              18 more than 8 candidate call sites — the list is\n"
+          "                 truncated, so uniqueness cannot be proven\n"
+          "            With no room in the image the handler goes into a page\n"
+          "            vold maps of its own binary; that is the step a hardened\n"
+          "            release can refuse, so it is split too:\n"
+          "              11 ptrace attach refused      14 vold could not open\n"
+          "              12 no scratch page in vold       its own binary\n"
+          "              13 could not write the path   15 could not map it\n"
+          "                                              executable\n"
+          "              16 vold's own path unknown (ours, before ptrace)\n"
+          "              17 vold_exec_page failed without naming a reason\n"
+          "            19 an option was not understood (usage error — the\n"
+          "               fault is on the command line, not in vold)\n",
           stdout);
 }
 
 int main(int argc, char **argv) {
     int wait_sec = 3;
     long pid_opt = 0;
-    bool check = false, dry_run = false, do_selftest = false;
+    bool check = false, dry_run = false, do_selftest = false, room = false;
     const char *file = NULL;
     const char *emit_file = NULL;
 
@@ -2664,6 +2832,8 @@ int main(int argc, char **argv) {
             check = true;
         } else if (!strcmp(argv[i], "--dry-run")) {
             dry_run = true;
+        } else if (!strcmp(argv[i], "--room")) {
+            room = true;
         } else if (!strcmp(argv[i], "--file") && i + 1 < argc) {
             file = argv[++i];
         } else if (!strcmp(argv[i], "--selftest")) {
@@ -2672,7 +2842,11 @@ int main(int argc, char **argv) {
             emit_file = argv[++i];
         } else {
             usage();
-            return 2;
+            /* NOT 2. 2 means "the anchor did not resolve", and a mistyped
+             * option reported as an anchor failure is the same lie the codes
+             * above exist to stop telling: it sends the reader to
+             * find_fuse_site() when the fault is on the command line. */
+            return EXIT_USAGE;
         }
     }
 
@@ -2746,11 +2920,33 @@ resolved_as_file:
         return EXIT_NO_RESOLVE;
     }
 
+    /* ---- --room: is there room IN THE IMAGE for the handler? ----------
+     *
+     * The only link of the chain a file could not answer, because --file used to
+     * return before find_handler_room(). It is a property of the image — a zero
+     * run after the last PLT stub — so it can be asked of a file, and the answer
+     * decides how much of the patch is at risk: room means the handler stays
+     * inside the image (no new mapping, no ptrace); no room means
+     * vold_exec_page() has to attach to vold with ptrace and make it map a page
+     * of its own binary executable, which is the part that can be refused.
+     *
+     * 0 = room in the image; 1 = none (the fallback is needed); 2 = the stub did
+     * not resolve. Nothing is written either way. */
+    if (room) {
+        uint64_t off = 0;
+        int have = (find_handler_room(&s, hm.res.stub_va, &off) == 0);
+        src_close(&s);
+        return have ? EXIT_OK : 1;
+    }
+
     FuseSite fs;
     memset(&fs, 0, sizeof(fs));
-    if (find_fuse_site(&s, hm.res.stub_va, &fs) != 0) {
-        src_close(&s);
-        return EXIT_NO_RESOLVE;
+    {
+        int ar = find_fuse_site(&s, hm.res.stub_va, &fs);
+        if (ar != 0) {
+            src_close(&s);
+            return anchor_exit_code(ar);
+        }
     }
 
     bool m_ours = stub_is_patched(hm.cur);
@@ -2824,16 +3020,19 @@ resolved_as_file:
         else {
             /* No room in the image. Ask vold to map a page of its own binary
              * executable — anonymous executable memory is refused (see the
-             * note above vold_exec_page). */
+             * note above vold_exec_page). Each way this can be refused has its
+             * own exit code: on a release whose policy differs, "11" and "14"
+             * are a diagnosis, "2" is not. */
             char self[4096];
             if (!pid_is_vold(s.pid, self, sizeof(self))) {
                 src_close(&s);
-                return EXIT_NO_RESOLVE;
+                return EXIT_EP_SELF;
             }
-            handler_abs = vold_exec_page(s.pid, self);
+            int why = EP_OK;
+            handler_abs = vold_exec_page(s.pid, self, &why);
             if (handler_abs == 0) {
                 src_close(&s);
-                return EXIT_NO_RESOLVE;
+                return ep_exit_code(why);
             }
         }
 #else
