@@ -2,7 +2,7 @@
  * proc-name-test.c — cmdline_is_vold() against the strings a device produces.
  *
  * The inputs are not invented: they are what /proc/<pid>/cmdline actually held
- * on the device (Android 16, marble), read by out/probe/procnames.sh, with the
+ * on the device (Android 16, marble), read by tools/proc-names-dump.sh, with the
  * NUL separators rewritten to spaces exactly as pid_is_vold() does before it
  * calls the rule:
  *
