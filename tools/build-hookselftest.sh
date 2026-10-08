@@ -94,7 +94,7 @@ echo "==> сборка $OUT"
     "$(hostpath "$ROOT/src/func_size.cpp")" \
     -o "$(hostpath "$OUT")" \
     -Wl,--build-id=none \
-    -ldl -llog
+    -ldl
 
 "$TOOLCHAIN/bin/llvm-strip" --strip-unneeded "$OUT" 2>/dev/null || true
 echo " ok $(wc -c < "$OUT") байт"

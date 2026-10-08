@@ -233,7 +233,6 @@ LDFLAGS=(
     -Wl,--build-id=none
     -static-libstdc++
     -ldl
-    -llog
 )
 
 # The utility links as a normal Android binary (dynamically, via bionic): it runs

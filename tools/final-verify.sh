@@ -5,7 +5,6 @@
 
 T=/data/local/tmp/hookselftest
 M=/data/adb/modules/unfuse_zygisk
-LOG=/data/adb/unfuse_zygisk.log
 
 if [ ! -x "$T" ]; then
     echo "нет $T — сначала: adb push out/hookselftest-arm64 $T && adb shell chmod 755 $T"
@@ -35,11 +34,15 @@ case "$rc" in
     3) echo "патч: не удалось записать (код 3)" ;;
     *) echo "патч: vold не найден (код $rc)" ;;
 esac
-echo "журнал патча:"
-grep -E 'vold-noacl|патч vold' "$LOG" | tail -4 | sed 's/^/  /'
 echo
 echo "инвариант /data/media/0 (ожидается ОК):"
-"$M/tools/storage-fix" --check /data/media/0 | sed 's/^/  /'
+"$M/tools/storage-fix" --check /data/media/0
+rc=$?
+if [ "$rc" = 0 ]; then
+    echo "  ОК"
+else
+    echo "  НЕТ (код $rc)"
+fi
 echo
 echo "default-ACL /data/media/0 (ожидается GROUP ... id=9997):"
 if [ -x /data/local/tmp/acl-dump ]; then

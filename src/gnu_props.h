@@ -1,23 +1,13 @@
 /*
  * gnu_props.h — read the AArch64 feature word out of a GNU property note.
  *
- * A PT_GNU_PROPERTY segment (or a .note.gnu.property section — same bytes) holds
- * NT_GNU_PROPERTY_TYPE_0 notes, and one of the properties inside is
- * GNU_PROPERTY_AARCH64_FEATURE_1_AND: a bitmask saying whether the image was
- * built for BTI, for PAC and for GCS. The loader reads it to decide whether to
- * map the image's executable pages with PROT_BTI, which is what makes bti c /
- * paciasp at a function entry enforced rather than inert.
+ * PT_GNU_PROPERTY segments (or .note.gnu.property sections -- same bytes) hold
+ * NT_GNU_PROPERTY_TYPE_0 notes; one property is the AArch64 feature bitmask
+ * (BTI, PAC, GCS) that makes the loader map executable pages PROT_BTI.
  *
- * Nothing here is Android- or AArch64-specific beyond the property number, so the
- * host self-test (tools/gnu-props-selftest.cpp) exercises exactly this code on
- * synthetic notes and on a real note dumped from an object file. The parser is
- * what stands between a hostile ELF and the app process: it runs on every launch,
- * in postAppSpecialize, so every read is bounded by the segment size the caller
- * passes and no field is trusted before it has been checked against the bytes
- * actually available.
- *
- * C-compatible on purpose, like android_ver.h: one definition, includable from the
- * C++ module and from a plain C tool.
+ * Runs on every launch, in postAppSpecialize, on a possibly hostile ELF: every
+ * read is bounded by the segment size the caller passes. C-compatible on
+ * purpose, like android_ver.h; exercised by tools/gnu-props-selftest.cpp.
  */
 
 #pragma once
@@ -29,8 +19,8 @@
 #define UNFUSE_PT_GNU_PROPERTY            0x6474e553u
 #define UNFUSE_NT_GNU_PROPERTY_TYPE_0     5u
 
-/* AAELF64: GNU_PROPERTY_AARCH64_FEATURE_1_AND. Read off a real note rather than
- * recalled — clang emits it as the first word of the description, e.g.
+/* AAELF64: GNU_PROPERTY_AARCH64_FEATURE_1_AND, read off a real note -- clang
+ * emits it as the first word of the description:
  *   00000000 04000000 10000000 05000000 474e5500
  *   00000010 000000c0 04000000 07000000 00000000
  * i.e. namesz=4, descsz=16, type=5, "GNU", then pr_type=0xc0000000,
@@ -44,11 +34,10 @@
 typedef struct {
     uint32_t features;  /* GNU_PROPERTY_AARCH64_FEATURE_1_AND; 0 when absent */
     int      has_note;  /* a well-formed GNU property note was seen */
-    int      matched;   /* the caller found the image; set by the caller */
+    int      matched;   /* set by the caller, which found the image */
 } UnfuseImageProps;
 
-/* Walks one note segment of `size` bytes at `base`. Reads nothing past
- * base + size, whatever the sizes inside claim. */
+/* Reads nothing past base + size, whatever the sizes inside claim. */
 static inline void unfuse_props_parse(const void *base, size_t size,
                                       UnfuseImageProps *out) {
     if (out == NULL) return;
@@ -57,7 +46,7 @@ static inline void unfuse_props_parse(const void *base, size_t size,
     const unsigned char *p = (const unsigned char *)base;
     size_t left = size;
 
-    /* Elf64_Nhdr: n_namesz, n_descsz, n_type — 4 bytes each. */
+    /* Elf64_Nhdr fields are 4 bytes each: n_namesz, n_descsz, n_type. */
     const size_t hdr = 12;
 
     while (left >= hdr) {
@@ -71,8 +60,7 @@ static inline void unfuse_props_parse(const void *base, size_t size,
 
         size_t total = hdr + name_p + desc_p;
         if (total > left) {
-            /* A final note is allowed to be unpadded; the name and the
-             * description still have to fit. */
+            /* A final note may be unpadded; name and description must fit. */
             total = hdr + namesz + descsz;
             if (total > left) break;
         }
@@ -84,8 +72,8 @@ static inline void unfuse_props_parse(const void *base, size_t size,
             memcmp(name, "GNU", 4) == 0) {
             out->has_note = 1;
 
-            /* Elf64_Prop: pr_type, pr_datasz, then pr_datasz bytes padded to 8.
-             * Bounded by the UNPADDED description size, as the ABI says. */
+            /* Elf64_Prop: pr_type, pr_datasz, then pr_datasz bytes padded to 8;
+             * bounded by the UNPADDED description size, as the ABI says. */
             size_t dleft = descsz;
             const unsigned char *d = desc;
             while (dleft >= 8) {

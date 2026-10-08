@@ -1,65 +1,28 @@
 #!/system/bin/sh
+# service.sh — late-boot stage: after vold has mounted the storages, repeat the
+# preparation (storage.sh). vold may restore the media_userdir_file label on
+# /data/media while preparing it, so that pass runs again here; it is idempotent.
 #
-# service.sh — repeat the preparation after vold mounts the storages, then
-# report the state.
-#
-# vold may have restored the media_userdir_file label while preparing
-# /data/media, so storage.sh runs again after it starts. The pass is idempotent.
-#
+# No journal: the stage leaves nothing behind but its exit code, and the answer
+# that used to be written here is the same one status.sh puts into module.prop.
 
 MODDIR=${MODDIR:-${0%/*}}
-LOG=/data/adb/unfuse_zygisk.log
-stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
-sh "$MODDIR/storage.sh" service
+sh "$MODDIR/storage.sh"
 
-# --- vold patch: confirmation -------------------------------------------------
-#
-# Repeated because the patch lives in process memory only, and at the
-# post-fs-data stage vold may not have existed yet. The step is idempotent, so
-# the repeat costs nothing: on an already patched vold the tool simply confirms
-# the patch is in place.
-#
-# There is deliberately no fallback of "repeated ACL passes" here. That was
-# needed while the patch could fail to install on a foreign vold build: vold had
-# to be chased with three passes at 15/30/75 seconds after boot, hidden from the
-# log. Now the trampoline address is derived from vold's own tables
-# (tools/vold-noacl.c), there is nothing to decline, and silent catch-up passes
-# would only mask a failure. If the patch does not install, the log says so, and
-# that is what needs fixing.
-#
+# vold-noacl: the patch lives in vold's process memory only, and vold may not
+# exist at post-fs-data, so it is repeated here; idempotent. No catch-up ACL
+# passes: the trampoline address comes from vold's tables (tools/vold-noacl.c) —
+# nothing to wait for, and silent retries would only mask a failure.
 NOACL="$MODDIR/tools/vold-noacl"
-if [ ! -x "$NOACL" ]; then
-    echo "[$(stamp)] service: нет $NOACL — vold перепишет default-ACL у /data/media/0" >>"$LOG"
-elif "$NOACL" >>"$LOG" 2>&1; then
-    echo "[$(stamp)] service: патч vold на месте — vold не пишет default-ACL" >>"$LOG"
-else
-    echo "[$(stamp)] service: патч vold НЕ встал — vold перепишет default-ACL у /data/media/0" >>"$LOG"
-fi
+[ -x "$NOACL" ] && "$NOACL" >/dev/null 2>&1
 
-# --- FUSE-off patch: confirmation --------------------------------------------
-#
-# Repeated for the same reason as vold-noacl: the patch lives in vold's memory
-# only, and at the post-fs-data stage vold may not have existed yet, or may have
-# been restarted by the framework since. The step is idempotent.
-#
-# A failure here is visible rather than merely inconvenient: if the patch is not
-# in place, vold mounts FUSE over the raw tree and apps go back to seeing that
-# instead of direct storage. So the log line says explicitly which of the two
-# happened, and status.sh puts the same answer in the module description.
-#
+# vold-fusefs: same reason — the patch lives in vold's memory only and the
+# framework may have restarted vold since post-fs-data; idempotent. A failure is
+# app-visible: vold mounts FUSE over the raw tree again — which is what
+# status.sh's description line answers.
 FUSEFS="$MODDIR/tools/vold-fusefs"
-if [ ! -x "$FUSEFS" ]; then
-    echo "[$(stamp)] service: нет $FUSEFS — FUSE останется смонтированным" >>"$LOG"
-elif "$FUSEFS" >>"$LOG" 2>&1; then
-    echo "[$(stamp)] service: FUSE отключён в vold — MountUserFuse перехвачен" >>"$LOG"
-else
-    echo "[$(stamp)] service: патч FUSE НЕ встал — vold смонтирует FUSE," \
-        "прямого доступа не будет" >>"$LOG"
-fi
+[ -x "$FUSEFS" ] && "$FUSEFS" >/dev/null 2>&1
 
-# --- the sign in the description ---------------------------------------------
-#
-# Reads the same patch state as the block above, and also runs on its own; it
-# does not care that the storage pass ran first.
+# status.sh reads the same patch state as the block above; it also runs alone.
 sh "$MODDIR/status.sh"

@@ -33,6 +33,27 @@
 #include "vold-fusefs.c"
 #undef main
 
+/* vold-fusefs.c prints nothing: the module tool reports by exit code. This
+ * developer tool does print — its output is its result — so it carries its own
+ * helpers instead of borrowing the tool's. */
+#include <stdarg.h>
+
+static void info(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    fputc('\n', stdout);
+    va_end(ap);
+}
+
+static void warn(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
 int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "/system/bin/vold";
 

@@ -56,28 +56,30 @@
  *
  * ------------------------- which releases
  *
- * The resolver is version-independent by construction — it reads vold's own tables, so
- * nothing here changes between 11 and 17 — but the EXPECTATION is not something to
- * assume. android_ver.h names the releases this was validated on and the AOSP site that
- * writes the ACL the patch disarms (11/12/12L/13: vold-<n>/Utils.cpp:192,
- * vold-14/15/16/17: :195/:195/:195/:196); the
- * release in force is printed with it, and one not in the table is marked as borrowing
- * the newest profile rather than being verified. --sdk overrides the detection, for
- * looking at an image that is not this device's. The refusal below is NOT version-
- * dependent: whatever the table says, exactly one call site or refuse.
+ * The resolver is version-independent by construction: it reads vold's own tables, so
+ * nothing here changes between 11 and 17 — and the tool consults no release table at
+ * all. The AOSP site that writes the ACL the patch disarms was measured per release
+ * (11/12/12L/13: vold-<n>/Utils.cpp:192, vold-14/15/16/17: :195/:195/:195/:196) and
+ * that measurement is what android_ver.h carries; it is the Zygisk module's hooks
+ * (src/hook_libc.cpp, via hooks_release()) that read it, because the module has a
+ * target count to compare. Nothing here does: the refusal below is NOT
+ * version-dependent — whatever the release, exactly one call site or refuse.
  *
  * ============================== when it refuses
  *
  * Two premises are checked; if EITHER fails the tool refuses (code 2) and writes
- * NOTHING — refusing beats a false success that leaves the race while the log denies
- * it. (1) setxattr is called EXACTLY ONCE (--dry-run prints "calls N"); 0 calls would
- * report success changing nothing, >1 would disarm unrelated code. (2) Stubs are 16-byte
- * spaced and shaped as above (lld without BTI/PAC); with -mbranch-protection=bti they are
- * 32 bytes and C stops being constant, caught on the second pair.
+ * NOTHING — refusing beats a false success that leaves the race unrecorded.
+ * (1) setxattr is called EXACTLY ONCE (--dry-run resolves the count and stops there);
+ * 0 calls would report success changing nothing, >1 would disarm unrelated code.
+ * (2) Stubs are 16-byte spaced and shaped as above (lld without BTI/PAC); with
+ * -mbranch-protection=bti they are 32 bytes and C stops being constant, caught on the
+ * second pair.
  *
- * Return codes (--file answers --check/--dry-run as on a live process and is never
- * modified): 0 patch present; 1 vold absent or --check saw an intact stub; 2 could not parse
- * the ELF, find the symbol or the stub; 3 could not write.
+ * The tool prints nothing, at any verbosity: an answer is its exit code, and that is
+ * what every caller reads (module/post-fs-data.sh, module/service.sh, status.sh).
+ * 0 patch present; 1 vold absent or --check saw an intact stub; 2 could not parse the
+ * ELF, find the symbol or the stub; 3 could not write. --file answers --check/--dry-run
+ * as on a live process and is never modified.
  *
  * /proc/<pid>/mem needs PTRACE_MODE_ATTACH on vold: invoke the tool as ONE simple
  * su -c command (a compound command lands in the shell domain, which may not ptrace vold;
@@ -91,7 +93,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -101,7 +102,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "android_ver.h"
 #include "vold-common.h"   /* the ELF-reading half both vold patchers share */
 
 #define TARGET_SYM "setxattr"
@@ -115,30 +115,6 @@ static const uint32_t PATCH_WORDS[2] = { PATCH_MOV0, PATCH_RET };
 #define EXIT_NO_VOLD    1
 #define EXIT_NO_RESOLVE 2
 #define EXIT_NO_WRITE   3
-
-static bool g_quiet = false;
-
-static void info(const char *fmt, ...) {
-    if (g_quiet) return;
-    va_list ap;
-    va_start(ap, fmt);
-    fputs("vold-noacl: ", stdout);
-    vprintf(fmt, ap);
-    fputc('\n', stdout);
-    va_end(ap);
-    /* stdout may be a log while stderr is not; flush so lines don't interleave. */
-    fflush(stdout);
-}
-
-static void warn(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    /* Whole line to stderr: mixing a stderr prefix with stdout text splits lines under `2>&1`. */
-    fputs("vold-noacl: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
 
 /* Already-patched stub, in either form this project writes into vold:
  *
@@ -252,8 +228,6 @@ static int collect_stubs(Src *s, Stubs *st) {
         uint8_t *buf = malloc(len);
         if (!buf) { stubs_free(st); return -1; }
         if (src_pread(s, p->p_vaddr, buf, len) != 0) {
-            warn("%s: не читается исполняемый сегмент 0x%llx", s->label,
-                 (unsigned long long)p->p_vaddr);
             free(buf);
             stubs_free(st);
             return -1;
@@ -317,27 +291,6 @@ static int count_call_sites(Src *s, uint64_t stub_va) {
     return hits;
 }
 
-/* Is the symbol's address taken (any .rela.dyn reloc)? Then one patched stub won't
- * cover that use. */
-static bool is_address_taken(Src *s, const Dyn *d, uint32_t sym_index) {
-    if (!d->reladyn || !d->relasz) return false;
-    size_t n = d->relasz / sizeof(Elf64_Rela);
-    if (n == 0 || n > 1000000) return false;
-    Elf64_Rela *rel = calloc(n, sizeof(Elf64_Rela));
-    if (!rel) return false;
-    bool found = false;
-    if (src_pread(s, d->reladyn, rel, n * sizeof(Elf64_Rela)) == 0) {
-        for (size_t i = 0; i < n; i++) {
-            if ((uint32_t)(rel[i].r_info >> 32) == sym_index) {
-                found = true;
-                break;
-            }
-        }
-    }
-    free(rel);
-    return found;
-}
-
 static int resolve(Src *s, Resolved *r) {
     memset(r, 0, sizeof(*r));
     r->reloc_index = -1;
@@ -364,14 +317,8 @@ static int resolve(Src *s, Resolved *r) {
         break;
     }
     if (r->reloc_index < 0) {
-        warn("%s: в .rela.plt нет JUMP_SLOT для \"%s\"", s->label, TARGET_SYM);
         free(rel);
         return EXIT_NO_RESOLVE;
-    }
-
-    if (is_address_taken(s, &d, r->sym_index)) {
-        warn("%s: адрес \"%s\" ещё и берётся (.rela.dyn) — патч трамплина "
-             "покроет только вызовы", s->label, TARGET_SYM);
     }
 
     /* 2. All stubs in one pass. */
@@ -396,26 +343,18 @@ static int resolve(Src *s, Resolved *r) {
         r->stub_va = va;
         r->already_patched = false;
     } else if (hits > 1) {
-        warn("%s: трамплинов на GOT-слот 0x%llx сразу %d — отказываюсь "
-             "угадывать", s->label, (unsigned long long)r->got_slot, hits);
         stubs_free(&st);
         return EXIT_NO_RESOLVE;
     } else {
         int64_t cand = (int64_t)r->plt_delta * 16 +
                        (int64_t)r->reloc_index * 16;
         if (cand <= 0) {
-            warn("%s: раскладка дала нелепый адрес трамплина (%lld)",
-                 s->label, (long long)cand);
             stubs_free(&st);
             return EXIT_NO_RESOLVE;
         }
         r->stub_va = (uint64_t)cand;
         r->already_patched = stubs_is_patched(&st, r->stub_va);
         if (!r->already_patched) {
-            warn("%s: трамплин \"%s\" не найден ни по GOT-слоту 0x%llx, "
-                 "ни как пропатченный по 0x%llx", s->label, TARGET_SYM,
-                 (unsigned long long)r->got_slot,
-                 (unsigned long long)r->stub_va);
             stubs_free(&st);
             return EXIT_NO_RESOLVE;
         }
@@ -428,9 +367,6 @@ static int resolve(Src *s, Resolved *r) {
      * nothing; >1 would also break unrelated code — both refuse. Works on an
      * already-patched vold: `bl` in .text is untouched, only the stub's `ldr` is gone. */
     if (r->call_sites != 1) {
-        warn("%s: \"%s\" вызывается %d раз(а), а ожидался ровно один — "
-             "отказываюсь (патч рассчитан на единственный вызов из "
-             "SetDefaultAcl)", s->label, TARGET_SYM, r->call_sites);
         stubs_free(&st);
         return EXIT_NO_RESOLVE;
     }
@@ -479,27 +415,18 @@ static int selftest(Src *s) {
     free(seen);
     free(rel);
 
-    info("%s: JUMP_SLOT %zu, сопоставлено %d, без трамплина %d, "
-         "неоднозначных %d, не JUMP_SLOT %d, повторов %d, "
-         "трамплинов всего %zu (пропатчено %zu)",
-         s->label, n, matched, missing, ambiguous, badtype, dupes,
-         st.n, st.npatched);
     size_t npatched = st.npatched;
     stubs_free(&st);
 
     bool explained = ((size_t)missing == npatched);
     bool ok = (matched + missing == (int)n) && ambiguous == 0 &&
               badtype == 0 && dupes == 0 && explained;
-    info("%s: сопоставление %s", s->label,
-         ok ? (npatched ? "взаимно однозначное (кроме пропатченных)"
-                        : "взаимно однозначное")
-            : "НЕПОЛНОЕ");
     return ok ? EXIT_OK : EXIT_NO_RESOLVE;
 }
 
 static void usage(void) {
     fputs("usage: vold-noacl [--wait SEC] [--pid PID] [--check] [--dry-run]\n"
-          "                  [--file ELF] [--selftest] [--sdk N] [--quiet]\n"
+          "                  [--file ELF] [--selftest]\n"
           "\n"
           "  --selftest   check that the mapping is one-to-one: every JUMP_SLOT\n"
           "               lands on exactly one stub, and the only JUMP_SLOTs\n"
@@ -513,7 +440,6 @@ static void usage(void) {
 int main(int argc, char **argv) {
     int  wait_sec = 0;
     long pid_opt = -1;
-    long sdk_opt = -1;
     bool check = false, dry_run = false, self = false;
     const char *file = NULL;
 
@@ -522,8 +448,6 @@ int main(int argc, char **argv) {
             wait_sec = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--pid") && i + 1 < argc) {
             pid_opt = strtol(argv[++i], NULL, 10);
-        } else if (!strcmp(argv[i], "--sdk") && i + 1 < argc) {
-            sdk_opt = strtol(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--file") && i + 1 < argc) {
             file = argv[++i];
         } else if (!strcmp(argv[i], "--check")) {
@@ -532,23 +456,14 @@ int main(int argc, char **argv) {
             dry_run = true;
         } else if (!strcmp(argv[i], "--selftest")) {
             self = true;
-        } else if (!strcmp(argv[i], "--quiet")) {
-            g_quiet = true;
         } else {
             usage();
             return EXIT_NO_RESOLVE;
         }
     }
 
-    /* The release in force: this system's, or --sdk for an image that is not this
-     * device's. It decides what the run is compared against and how the log
-     * reads — the resolution below reads the target's own tables either way,
-     * which is why 11 through 17 take the identical path. */
-    UnfusePick vp = unfuse_pick(sdk_opt > 0 ? (int)sdk_opt : unfuse_sdk());
-    char vbuf[192];
-    unfuse_ver_str(&vp, vbuf, sizeof(vbuf));
-    info("версия: %s; default-ACL пишет %s", vbuf, vp.v->vold_acl);
-
+    /* The resolution below reads the target's own ELF tables, so it takes the
+     * identical path on 11 through 17 — nothing here is release-dependent. */
     Src s;
     memset(&s, 0, sizeof(s));
     s.fd = -1;
@@ -560,7 +475,6 @@ int main(int argc, char **argv) {
         s.label = file;
         s.fd = open(file, O_RDONLY | O_CLOEXEC);
         if (s.fd < 0) {
-            warn("%s: %s", file, strerror(errno));
             return EXIT_NO_VOLD;
         }
         if (src_open_header(&s) != 0) {
@@ -574,59 +488,30 @@ int main(int argc, char **argv) {
             Resolved r;
             rc = resolve(&s, &r);
             if (rc == EXIT_OK) {
-                info("%s: %s -> dynsym[%u], .rela.plt[%d], GOT 0x%llx, "
-                     "трамплин 0x%llx (сдвиг раскладки %d), вызовов %d%s",
-                     s.label, TARGET_SYM, r.sym_index, r.reloc_index,
-                     (unsigned long long)r.got_slot,
-                     (unsigned long long)r.stub_va, r.plt_delta, r.call_sites,
-                     r.already_patched ? ", УЖЕ ПРОПАТЧЕН" : "");
 
                 /* The file is never modified, so only a live process is worth writing.
                  * But --check/--dry-run must answer identically here and there, or an
                  * offline check would lie about "no patch". */
                 uint8_t cur[16];
                 if (src_pread(&s, r.stub_va, cur, sizeof(cur)) == 0) {
-                    info("%s: сейчас в трамплине %02x %02x %02x %02x "
-                         "%02x %02x %02x %02x %02x %02x %02x %02x "
-                         "%02x %02x %02x %02x",
-                         s.label, cur[0], cur[1], cur[2], cur[3],
-                         cur[4], cur[5], cur[6], cur[7],
-                         cur[8], cur[9], cur[10], cur[11],
-                         cur[12], cur[13], cur[14], cur[15]);
 
                     bool bytes_patched =
                         memcmp(cur, PATCH_WORDS, sizeof(PATCH_WORDS)) == 0;
                     if (r.already_patched || bytes_patched) {
                         if (!bytes_patched) {
-                            warn("%s: трамплин опознан как пропатченный, но "
-                                 "байты не совпали (%02x %02x %02x %02x "
-                                 "%02x %02x %02x %02x)",
-                                 s.label, cur[0], cur[1], cur[2], cur[3],
-                                 cur[4], cur[5], cur[6], cur[7]);
                             src_close(&s);
                             return EXIT_NO_RESOLVE;
                         }
-                        info("%s: патч уже стоит (mov w0, #0; ret)", s.label);
                     } else {
                         uint64_t tgt = 0;
                         if (!decode_stub(cur, r.stub_va, &tgt) ||
                             tgt != r.got_slot) {
-                            warn("%s: в трамплине по 0x%llx не то, что "
-                                 "ожидалось — не трогаю",
-                                 s.label, (unsigned long long)r.stub_va);
                             src_close(&s);
                             return EXIT_NO_RESOLVE;
                         }
                         if (check) {
-                            info("%s: трамплин цел — патча нет (--check)",
-                                 s.label);
                             src_close(&s);
                             return 1;
-                        }
-                        if (!dry_run) {
-                            info("%s: файл не меняется — запись только в "
-                                 "живой процесс (--dry-run покажет адрес)",
-                                 s.label);
                         }
                     }
                 }
@@ -639,12 +524,9 @@ int main(int argc, char **argv) {
     pid_t pid;
     if (pid_opt > 0) {
         pid = (pid_t)pid_opt;
-        if (!pid_is_vold(pid, exe, sizeof(exe)))
-            warn("pid %ld не похож на vold — продолжаю", pid_opt);
     } else {
         pid = find_vold(wait_sec, exe, sizeof(exe));
         if (pid < 0) {
-            warn("vold не найден (ждал %d с)", wait_sec);
             return EXIT_NO_VOLD;
         }
     }
@@ -653,13 +535,9 @@ int main(int argc, char **argv) {
     /* exe is filled by identification (or empty for --pid); it is both filter and output. */
     int lb = find_load_base(pid, exe, &base, exe, sizeof(exe));
     if (lb == -1) {
-        warn("pid %d: /proc/%d/maps не читается — скорее всего нет "
-             "PTRACE_MODE_READ к этому процессу", (int)pid, (int)pid);
         return EXIT_NO_RESOLVE;
     }
     if (lb != 0) {
-        warn("pid %d: в /proc/%d/maps нет ни одного отображения с offset=0 и "
-             "путём — базу загрузки определить нечем", (int)pid, (int)pid);
         return EXIT_NO_RESOLVE;
     }
 
@@ -672,7 +550,6 @@ int main(int argc, char **argv) {
     s.label = exe[0] ? exe : "vold";
     s.fd = open(mempath, O_RDONLY | O_CLOEXEC);
     if (s.fd < 0) {
-        warn("%s: %s", mempath, strerror(errno));
         return EXIT_NO_RESOLVE;
     }
     if (src_open_header(&s) != 0) {
@@ -700,17 +577,10 @@ int main(int argc, char **argv) {
     }
 
     uint64_t run_addr = base + r.stub_va;
-    info("vold pid=%d база=0x%llx; %s -> .rela.plt[%d], GOT 0x%llx, "
-         "трамплин 0x%llx (в процессе 0x%llx), сдвиг раскладки %d, вызовов %d",
-         (int)pid, (unsigned long long)base, TARGET_SYM, r.reloc_index,
-         (unsigned long long)r.got_slot, (unsigned long long)r.stub_va,
-         (unsigned long long)run_addr, r.plt_delta, r.call_sites);
 
     /* Read the whole stub: 8 bytes suffice to compare, but decode_stub also checks `add` and `br`. */
     uint8_t cur[16];
     if (mem_read(pid, run_addr, cur, sizeof(cur)) != 0) {
-        warn("pid %d: не читается 0x%llx", (int)pid,
-             (unsigned long long)run_addr);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
@@ -718,14 +588,9 @@ int main(int argc, char **argv) {
     bool bytes_patched = memcmp(cur, PATCH_WORDS, sizeof(PATCH_WORDS)) == 0;
     if (r.already_patched || bytes_patched) {
         if (!bytes_patched) {
-            warn("трамплин опознан как пропатченный, но байты не совпали "
-                 "(%02x %02x %02x %02x %02x %02x %02x %02x) — не трогаю",
-                 cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6],
-                 cur[7]);
             src_close(&s);
             return EXIT_NO_RESOLVE;
         }
-        info("патч уже стоит (mov w0, #0; ret) — ничего не делаю");
         src_close(&s);
         return EXIT_OK;
     }
@@ -733,32 +598,20 @@ int main(int argc, char **argv) {
     /* Before writing, confirm the stub is adrp+ldr+add+br and its ldr reads our GOT slot. */
     uint64_t tgt = 0;
     if (!decode_stub(cur, r.stub_va, &tgt) || tgt != r.got_slot) {
-        warn("в трамплине по 0x%llx не то, что ожидалось "
-             "(%02x %02x %02x %02x %02x %02x %02x %02x "
-             "%02x %02x %02x %02x %02x %02x %02x %02x) — не трогаю",
-             (unsigned long long)run_addr,
-             cur[0], cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7],
-             cur[8], cur[9], cur[10], cur[11], cur[12], cur[13], cur[14],
-             cur[15]);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
 
     if (check) {
-        info("трамплин цел — патча нет (--check)");
         src_close(&s);
         return 1;
     }
     if (dry_run) {
-        info("--dry-run: записал бы %u байт по 0x%llx",
-             (unsigned)sizeof(PATCH_WORDS), (unsigned long long)run_addr);
         src_close(&s);
         return EXIT_OK;
     }
 
     if (mem_write(pid, run_addr, PATCH_WORDS, sizeof(PATCH_WORDS)) != 0) {
-        warn("не удалось записать 0x%llx: %s", (unsigned long long)run_addr,
-             strerror(errno));
         src_close(&s);
         return EXIT_NO_WRITE;
     }
@@ -766,14 +619,10 @@ int main(int argc, char **argv) {
     uint8_t back[8];
     if (mem_read(pid, run_addr, back, sizeof(back)) != 0 ||
         memcmp(back, PATCH_WORDS, sizeof(PATCH_WORDS)) != 0) {
-        warn("запись не подтвердилась чтением");
         src_close(&s);
         return EXIT_NO_WRITE;
     }
 
-    info("патч поставлен: %s в vold больше не пишет default-ACL "
-         "(mov w0, #0; ret по 0x%llx)", TARGET_SYM,
-         (unsigned long long)run_addr);
 
     src_close(&s);
     return EXIT_OK;

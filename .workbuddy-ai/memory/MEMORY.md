@@ -9,6 +9,7 @@ Zygisk-модуль: доступ приложений к `/data/media` без F
 - `./build.sh`, NDK `29.0.14206865`, **детерминированная** (неизменный md5 при изменённом исходнике = правка не доехала). ABI: `arm64-v8a`, `armeabi-v7a`.
 - Бинарники с устройства → `device/` (`.gitignore`). Файлы не удалять без согласия.
 - На живое устройство — **только атомарно** (временный файл + `mv -f`; `cp -f` поверх `zygisk/*.so` усекает inode → SIGBUS в zygote). Новая сборка **не активна до перезагрузки** (zn-daemon держит старый fd).
+- **Модуль не выдаёт ничего**: ни logcat, ни журнала, ни stdout — отчёт только кодом возврата (`usage()` и отчёты режимов `--emit`/`--selftest` — исключение). Логгирование **не заменять на `printf`**, а удалять целиком (указание Nikita). Дев-харнессы (`hookselftest.cpp`, `roomtest.c`, `final-verify.sh`, `device-e2e.sh`, `test-storage-fix.sh`) свой вывод сохраняют — он и есть результат. `-llog` больше не нужен нигде.
 
 ## Артефакты
 `module/zygisk/<abi>.so` + `storage-fix` (ACL 9997), `vold-noacl` (`setxattr`→no-op), `vold-fusefs` (PLT `mount`+`umount2`). `hook_libc.cpp` — режимы как у sdcardfs + ACL (12 целей), **не избыточен**. `unfuse_zygisk.cpp` — снимает изоляцию `Android/data`/`obb`.

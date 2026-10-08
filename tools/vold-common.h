@@ -6,23 +6,21 @@
  * currently contain". Both identify vold by its exe (not comm), read its ELF
  * header and program headers through /proc/<pid>/mem — or from the file itself
  * for --file — walk PT_DYNAMIC for .rela.plt, and resolve a name through
- * .dynsym/.dynstr. That half was copied between them, and by 2026-10-08 the two
- * copies had already drifted; it lives here so there is one copy to keep right.
+ * .dynsym/.dynstr. That half was copied between them; it lives here so there is
+ * one copy to keep right.
  *
- * Only that half is here. Each tool's own half stays in its own file, because
- * it is genuinely different: vold-noacl overwrites one trampoline in place with
+ * Only that half is here. Each tool's own half stays in its own file, because it
+ * is genuinely different: vold-noacl overwrites one trampoline in place with
  * `mov w0,#0 ; ret`, vold-fusefs redirects two of them to a generated arm64
- * handler. Nor is anything shared with the Zygisk module (src/): it patches a
- * different process, through a different mechanism (in-memory function entries,
+ * handler. Nothing is shared with the Zygisk module (src/): it patches a
+ * different process through a different mechanism (in-memory function entries,
  * not ELF tables).
  *
- * Two things that are not the "reading" half but are shared all the same, and
- * are here for the same reason:
+ * Two things that are not the "reading" half but are shared all the same:
  *
  *   - plt_layout_delta(): the .plt layout constant C, derived from relocation
- *     and trampoline pairs. Both patchers need it, it depends on nothing but
- *     the two tables, and by 2026-10-08 it existed twice — down to the wording
- *     of its refusals.
+ *     and trampoline pairs. Both patchers need it, and it depends on nothing but
+ *     the two tables.
  *   - STUB_PATCH_W0/W1: the 16-byte patch vold-fusefs writes over a trampoline.
  *     vold-noacl has to recognise that same shape, or its --selftest reports a
  *     redirected trampoline as "JUMP_SLOT without a trampoline" and lies about
@@ -32,33 +30,14 @@
  * programs, not a library, and nothing in it should acquire a symbol in either
  * binary.
  *
- * ============================== what had drifted
- *
- * The differences were all one-directional — the vold-noacl copy was the richer
- * one — so both are kept here as the union and neither tool loses anything:
- *
- *   - src_open_header: it names e_ident[EI_CLASS] in the "not ELF64" warning
- *     ("class=%u"), which is what tells a 32-bit image apart from a corrupt
- *     one; the vold-fusefs copy had dropped the argument.
- *   - Dyn / read_dynamic: it reads DT_RELA and DT_RELASZ into reladyn/relasz,
- *     which vold-noacl's is_address_taken() needs to spot a symbol whose
- *     address was taken; the vold-fusefs copy had no such fields. The two extra
- *     cases cost vold-fusefs nothing: it simply never looks at the fields.
- *
- * The other three that differed — src_pread, decode_stub, find_load_base —
- * differed only in comments, and the fuller comments are the ones kept.
- *
- * ============================== what is deliberately NOT here
- *
- * info() and warn() are not: each tool prefixes its own name ("vold-noacl: " /
- * "vold-fusefs: "), which is the entire point of them. The code below calls
- * both, so the two prototypes are the contract an including .c has to satisfy.
- *
- * Neither is the stub collection. vold-noacl wants a list of every trampoline
- * plus the ones already patched (Stubs, collect_stubs, stubs_*), while
- * vold-fusefs wants a single named stub and its original bytes (hook_resolve,
- * hook_stub_intact, hook_install). Those are two different jobs that happen to
- * walk the same segment, not one job written twice.
+ * Nothing here prints, and neither tool does: a failure is a return value that
+ * becomes an exit code, and every caller of both tools reads that code and not
+ * their output (module/post-fs-data.sh, module/service.sh, module/status.sh).
+ * So there is no info()/warn() pair for an including .c to define any more. The
+ * stub collection is not here either: vold-noacl wants every trampoline plus the
+ * already-patched ones (Stubs, collect_stubs, stubs_*), vold-fusefs a single
+ * named stub and its original bytes (hook_resolve, hook_stub_intact,
+ * hook_install).
  */
 
 #pragma once
@@ -68,7 +47,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -76,10 +54,6 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-/* Defined by each tool, with its own name as the prefix. */
-static void info(const char *fmt, ...);
-static void warn(const char *fmt, ...);
 
 /* The 16-byte trampoline patch vold-fusefs installs, as its two instruction
  * words: `ldr x17,#8` (which therefore reads the quad at +8) and `br x17`. The
@@ -179,35 +153,23 @@ static void src_close(Src *s) {
 }
 
 static int src_open_header(Src *s) {
-    if (src_pread(s, 0, &s->eh, sizeof(s->eh)) != 0) {
-        warn("%s: не читается шапка ELF", s->label);
-        return -1;
-    }
-    if (memcmp(s->eh.e_ident, ELFMAG, SELFMAG) != 0) {
-        warn("%s: это не ELF", s->label);
-        return -1;
-    }
+    if (src_pread(s, 0, &s->eh, sizeof(s->eh)) != 0) return -1;
+    if (memcmp(s->eh.e_ident, ELFMAG, SELFMAG) != 0) return -1;
+    /* ELF64 little-endian aarch64 only: the trampoline shape and the patch that
+     * overwrites it are both arm64, and a 32-bit vold is not supported by this
+     * mechanism at all. */
     if (s->eh.e_ident[EI_CLASS] != ELFCLASS64 ||
         s->eh.e_ident[EI_DATA] != ELFDATA2LSB) {
-        warn("%s: поддержан только ELF64 little-endian (class=%u)",
-             s->label, s->eh.e_ident[EI_CLASS]);
         return -1;
     }
-    if (s->eh.e_machine != EM_AARCH64) {
-        warn("%s: это не aarch64 (e_machine=%u) — 32-битный vold этим "
-             "механизмом не поддержан", s->label, s->eh.e_machine);
-        return -1;
-    }
-    if (s->eh.e_phnum == 0 || s->eh.e_phentsize != sizeof(Elf64_Phdr)) {
-        warn("%s: непонятная таблица программных заголовков", s->label);
-        return -1;
-    }
+    if (s->eh.e_machine != EM_AARCH64) return -1;
+    if (s->eh.e_phnum == 0 || s->eh.e_phentsize != sizeof(Elf64_Phdr)) return -1;
+
     s->phnum = s->eh.e_phnum;
     s->ph = calloc((size_t)s->phnum, sizeof(*s->ph));
     if (!s->ph) return -1;
     if (src_pread(s, s->eh.e_phoff, s->ph,
                   (size_t)s->phnum * sizeof(*s->ph)) != 0) {
-        warn("%s: не читаются программные заголовки", s->label);
         return -1;
     }
     return 0;
@@ -216,7 +178,6 @@ static int src_open_header(Src *s) {
 typedef struct {
     uint64_t symtab, strtab, strsz;
     uint64_t jmprel, pltrelsz, pltrel, relaent;
-    uint64_t reladyn, relasz;   /* needed to detect "address taken" */
 } Dyn;
 
 static int read_dynamic(Src *s, Dyn *d) {
@@ -229,15 +190,11 @@ static int read_dynamic(Src *s, Dyn *d) {
             break;
         }
     }
-    if (!va) {
-        warn("%s: нет PT_DYNAMIC", s->label);
-        return -1;
-    }
+    if (!va) return -1;
     if (sz > 4096) sz = 4096;
     Elf64_Dyn *dyn = calloc(sz / sizeof(Elf64_Dyn) + 1, sizeof(Elf64_Dyn));
     if (!dyn) return -1;
     if (src_pread(s, va, dyn, sz) != 0) {
-        warn("%s: не читается PT_DYNAMIC", s->label);
         free(dyn);
         return -1;
     }
@@ -250,40 +207,24 @@ static int read_dynamic(Src *s, Dyn *d) {
         case DT_JMPREL:  d->jmprel = dyn[i].d_un.d_ptr; break;
         case DT_PLTRELSZ: d->pltrelsz = dyn[i].d_un.d_val; break;
         case DT_PLTREL:  d->pltrel  = dyn[i].d_un.d_val; break;
-        case DT_RELA:    d->reladyn = dyn[i].d_un.d_ptr; break;
-        case DT_RELASZ:  d->relasz  = dyn[i].d_un.d_val; break;
         case DT_RELAENT: d->relaent = dyn[i].d_un.d_val; break;
         default: break;
         }
     }
 done:
     free(dyn);
-    if (!d->symtab || !d->strtab || !d->jmprel) {
-        warn("%s: в PT_DYNAMIC нет SYMTAB/STRTAB/JMPREL", s->label);
-        return -1;
-    }
-    if (d->pltrel != DT_RELA) {
-        warn("%s: DT_PLTREL=%llu, ожидался DT_RELA", s->label,
-             (unsigned long long)d->pltrel);
-        return -1;
-    }
-    if (d->relaent && d->relaent != sizeof(Elf64_Rela)) {
-        warn("%s: DT_RELAENT=%llu", s->label, (unsigned long long)d->relaent);
-        return -1;
-    }
+    if (!d->symtab || !d->strtab || !d->jmprel) return -1;
+    if (d->pltrel != DT_RELA) return -1;
+    if (d->relaent && d->relaent != sizeof(Elf64_Rela)) return -1;
     return 0;
 }
 
 static int load_relocs(Src *s, const Dyn *d, Elf64_Rela **out, size_t *nout) {
     size_t n = d->pltrelsz / sizeof(Elf64_Rela);
-    if (n == 0 || n > 200000) {
-        warn("%s: непонятный размер .rela.plt (%zu)", s->label, n);
-        return -1;
-    }
+    if (n == 0 || n > 200000) return -1;
     Elf64_Rela *rel = calloc(n, sizeof(Elf64_Rela));
     if (!rel) return -1;
     if (src_pread(s, d->jmprel, rel, n * sizeof(Elf64_Rela)) != 0) {
-        warn("%s: не читается .rela.plt", s->label);
         free(rel);
         return -1;
     }
@@ -317,17 +258,13 @@ static int plt_layout_delta(const uint64_t *stub_va, const uint64_t *stub_target
             delta = d;
             have = true;
         } else if (d != delta) {
-            warn("раскладка .plt нелинейна (релокация %zu даёт %lld, "
-                 "ожидалось %lld) — отказываюсь", i, (long long)d,
-                 (long long)delta);
+            /* A nonlinear layout means the stubs are not 16-byte spaced in
+             * relocation order (with -mbranch-protection=bti they are 32), so C
+             * is not a constant and the derivation below would lie. Refuse. */
             return -1;
         }
     }
-    if (!have) {
-        warn("не нашлось ни одной пары «релокация -> трамплин»: "
-             "раскладку .plt вывести не из чего");
-        return -1;
-    }
+    if (!have) return -1;
     return (int)delta;
 }
 

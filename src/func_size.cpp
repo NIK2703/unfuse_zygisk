@@ -1,16 +1,13 @@
 /*
  * func_size.cpp — function sizes from a library's .dynsym on disk.
  *
- * dladdr() gives the object path and base; pread reads the header, section table
- * and symbol table. Symbols are matched by st_value (= address - base), not by
- * name, so the string table is never read.
+ * Matched by st_value (= address - base), not by name, so the string table is
+ * never read; st_size, not the distance to the next symbol, which overstates
+ * the size (locals sit between exports). 0 = unknown, so it is not patched —
+ * every failure below is silent and lands in that same "unknown", which
+ * tools/hookselftest.cpp is where you see.
  *
- * st_size, not "distance to the next symbol": locals sit between exported
- * functions, so the distance overstates the size — worse than no check. st_size
- * == 0 means unknown, so the function is not patched.
- *
- * ~70 KB read once per process at hook install.
- */
+ * ~70 KB read once per process at hook install. */
 
 #include "func_size.h"
 
@@ -21,11 +18,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#include <android/log.h>
-
-#define LOG_TAG "UnfuseZygisk"
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 #ifndef STT_GNU_IFUNC
 #define STT_GNU_IFUNC 10
@@ -39,7 +31,6 @@ struct Target {
     bool found;           // a symbol with this st_value exists
 };
 
-// Reads exactly count bytes at off; false on short read.
 bool read_at(int fd, void *buf, size_t count, off_t off) {
     uint8_t *p = static_cast<uint8_t *>(buf);
     size_t done = 0;
@@ -51,8 +42,7 @@ bool read_at(int fd, void *buf, size_t count, off_t off) {
     return true;
 }
 
-// One pass over the symbol table, matching targets by st_value. Aliased symbols
-// (same st_value) take the largest size — safer.
+// Aliased symbols (same st_value) take the largest size.
 void scan_symtab(const uint8_t *tab, size_t count, size_t entsize,
                  Target *targets, int n) {
     for (size_t i = 0; i < count; i++) {
@@ -71,13 +61,9 @@ void scan_symtab(const uint8_t *tab, size_t count, size_t entsize,
     }
 }
 
-// Parses one object: header, sections, .dynsym.
 void scan_object(const char *path, Target *targets, int n) {
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        LOGW("размеры: не открыть %s", path);
-        return;
-    }
+    if (fd < 0) return;
 
     Elf64_Ehdr eh;
     if (!read_at(fd, &eh, sizeof eh, 0) ||
@@ -87,7 +73,6 @@ void scan_object(const char *path, Target *targets, int n) {
         eh.e_machine != EM_AARCH64 ||
         eh.e_shnum == 0 || eh.e_shentsize < sizeof(Elf64_Shdr)) {
         close(fd);
-        LOGW("размеры: %s не ELF64/AArch64", path);
         return;
     }
 
@@ -127,12 +112,10 @@ void func_sizes(void *const *fns, int n, unsigned *sizes) {
     Dl_info first;
     if (dladdr(fns[0], &first) == 0 || first.dli_fname == nullptr ||
         first.dli_fbase == nullptr || first.dli_fname[0] != '/') {
-        LOGW("размеры: не определить объект для %p", fns[0]);
         return;
     }
     const uintptr_t base = reinterpret_cast<uintptr_t>(first.dli_fbase);
 
-    // Targets in the same object: st_value = address - base.
     Target targets[32];
     int map[32];
     int m = 0;

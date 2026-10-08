@@ -79,7 +79,7 @@ struct acl_entry {
     uint32_t e_id;
 };
 
-static unsigned long stat_dirs, stat_files, stat_skipped, stat_errors;
+static unsigned long stat_errors;
 
 /* Read an ACL into entries: >=0 count, -1 error (errno set), -2 no attribute
  * (not an error for the caller — just "no ACL set"). */
@@ -202,28 +202,23 @@ static int fix_dir(const char *path, mode_t m, int traverse_only) {
     if (acl_apply(path, XATTR_ACL_DEFAULT, want) != 0) bad = 1;
 
     if (bad) {
-        fprintf(stderr, "storage-fix: %s: %s\n", path, strerror(errno));
         stat_errors++;
         return -1;
     }
-    stat_dirs++;
     return 0;
 }
 
 static int fix_file(const char *path, mode_t m) {
     if (acl_apply(path, XATTR_ACL_ACCESS, file_mode(m)) != 0) {
-        fprintf(stderr, "storage-fix: %s: %s\n", path, strerror(errno));
         stat_errors++;
         return -1;
     }
-    stat_files++;
     return 0;
 }
 
 static void walk(const char *dir) {
     DIR *d = opendir(dir);
     if (d == NULL) {
-        fprintf(stderr, "storage-fix: %s: %s\n", dir, strerror(errno));
         stat_errors++;
         return;
     }
@@ -242,28 +237,18 @@ static void walk(const char *dir) {
 
         struct stat st;
         if (lstat(child, &st) != 0) {
-            fprintf(stderr, "storage-fix: %s: %s\n", child, strerror(errno));
             stat_errors++;
         } else if (S_ISLNK(st.st_mode)) {
-            stat_skipped++; /* no ACL on a symlink, and none is needed */
+            /* no ACL on a symlink, and none is needed */
         } else if (S_ISDIR(st.st_mode)) {
             fix_dir(child, st.st_mode, 0);
             walk(child);
         } else if (S_ISREG(st.st_mode)) {
             fix_file(child, st.st_mode);
-        } else {
-            stat_skipped++;
         }
         free(child);
     }
     closedir(d);
-}
-
-static void perm_str(uint16_t p, char out[4]) {
-    out[0] = (p & 4) ? 'r' : '-';
-    out[1] = (p & 2) ? 'w' : '-';
-    out[2] = (p & 1) ? 'x' : '-';
-    out[3] = '\0';
 }
 
 static int check_paths(int argc, char **argv, int first) {
@@ -272,22 +257,13 @@ static int check_paths(int argc, char **argv, int first) {
     for (int i = first; i < argc; i++) {
         struct stat st;
         if (lstat(argv[i], &st) != 0) {
-            printf("ОШИБКА %s: %s\n", argv[i], strerror(errno));
             bad = 1;
             continue;
         }
 
         const int is_dir = S_ISDIR(st.st_mode);
-        uint16_t a = 0, d = 0;
-        const int ok_a = acl_allows_everybody(argv[i], XATTR_ACL_ACCESS, &a);
-        const int ok_d = !is_dir || acl_allows_everybody(argv[i], XATTR_ACL_DEFAULT, &d);
-
-        char sa[4], sd[4];
-        perm_str(a, sa);
-        perm_str(d, sd);
-
-        printf("%s %s  access=%s default=%s\n", (ok_a && ok_d) ? "ОК  " : "НЕТ ",
-               argv[i], ok_a ? sa : "нет 9997", is_dir ? (ok_d ? sd : "нет 9997") : "—");
+        const int ok_a = acl_allows_everybody(argv[i], XATTR_ACL_ACCESS, NULL);
+        const int ok_d = !is_dir || acl_allows_everybody(argv[i], XATTR_ACL_DEFAULT, NULL);
 
         if (!ok_a || !ok_d) bad = 1;
     }
@@ -322,12 +298,10 @@ int main(int argc, char **argv) {
         const char *root = argv[i];
         struct stat st;
         if (lstat(root, &st) != 0) {
-            fprintf(stderr, "storage-fix: %s: %s\n", root, strerror(errno));
             stat_errors++;
             continue;
         }
         if (!S_ISDIR(st.st_mode)) {
-            fprintf(stderr, "storage-fix: %s: не каталог\n", root);
             stat_errors++;
             continue;
         }
@@ -335,7 +309,5 @@ int main(int argc, char **argv) {
         if (!traverse_only) walk(root);
     }
 
-    printf("storage-fix: каталогов=%lu файлов=%lu пропущено=%lu ошибок=%lu\n", stat_dirs,
-           stat_files, stat_skipped, stat_errors);
     return stat_errors == 0 ? 0 : 1;
 }

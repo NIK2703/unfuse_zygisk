@@ -253,7 +253,6 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -342,27 +341,10 @@
 #define INSN_BTI_JC     0xd50324dfu   /* bti jc                       */
 #define INSN_RET        0xd65f03c0u   /* ret                          */
 
-static bool g_quiet = false;
-
-static void info(const char *fmt, ...) {
-    if (g_quiet) return;
-    va_list ap;
-    va_start(ap, fmt);
-    fputs("vold-fusefs: ", stdout);
-    vprintf(fmt, ap);
-    fputc('\n', stdout);
-    va_end(ap);
-    fflush(stdout);
-}
-
-static void warn(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    fputs("vold-fusefs: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
+/* Nothing below prints: this tool reports by exit code, and that is what every
+ * caller reads (module/post-fs-data.sh, module/service.sh, module/status.sh).
+ * The only output left is usage() on a bad invocation and the --selftest report,
+ * which is the result of a mode a developer asked for by name. */
 
 /* Build the replacement bytes for a stub: `ldr x17,#8 ; br x17 ; .quad handler`.
  *
@@ -954,42 +936,34 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     if (out_cap < 256) return -1;
     for (int i = 0; i < L_LABEL_COUNT; i++) label_at[i] = -1;
 
-/* The limits below are the handler's own budget, and they say so rather than
- * silently returning -1: a handler that outgrows its space would otherwise
- * fail as "не удалось собрать обработчик" with no way to tell which bound was
- * hit. */
+/* The limits below are the handler's own budget. Exceeding one is a refusal
+ * (return -1), not a truncated handler: a handler that outgrows its space must
+ * not be written into vold at all. */
 #define UE(x) do {                                                    \
-        if (n >= 72) {                                                \
-            warn("build_umount_handler: код длиннее 72 слов (n=%d)", n); \
-            return -1;                                                \
-        }                                                             \
+        if (n >= 72) return -1;                                       \
         w[n++] = (uint32_t)(x);                                       \
     } while (0)
 #define ULDR(slot, rt) do {                                           \
-        if (nfld >= 8) { warn("build_umount_handler: больше 8 литералов"); \
-                         return -1; }                                 \
+        if (nfld >= 8) return -1;                                     \
         fld_slot[nfld] = (uint32_t)(slot); fld_rt[nfld] = (uint32_t)(rt); \
         fld_at[nfld] = n; nfld++;                                     \
         UE(0);                     /* placeholder, fixed up below */  \
     } while (0)
 #define ULBL(l) do { label_at[l] = n; } while (0)
 #define UBC(cc, l) do {                                               \
-        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
-                          return -1; }                                  \
+        if (nfx >= 20) return -1;                                     \
         fx[nfx].at = n; fx[nfx].cond = (uint32_t)(cc);                \
         fx[nfx].label = (l); fx[nfx].kind = 0; fx[nfx].rt = -1;       \
         nfx++; UE(0);                                                 \
     } while (0)
 #define UB(l) do {                                                    \
-        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
-                          return -1; }                                  \
+        if (nfx >= 20) return -1;                                     \
         fx[nfx].at = n; fx[nfx].cond = 0;                             \
         fx[nfx].label = (l); fx[nfx].kind = 1; fx[nfx].rt = -1;       \
         nfx++; UE(0);                                                 \
     } while (0)
 #define UCBZNZ(reg, l) do {                                           \
-        if (nfx >= 20) { warn("build_umount_handler: больше 20 ветвей"); \
-                          return -1; }                                  \
+        if (nfx >= 20) return -1;                                     \
         fx[nfx].at = n; fx[nfx].cond = 0;                             \
         fx[nfx].label = (l); fx[nfx].kind = 2; fx[nfx].rt = (reg);    \
         nfx++; UE(0);                                                 \
@@ -1071,7 +1045,7 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     int str_off_bytes = n * 4;
     int str_words = (int)((sizeof(tail) + 3) / 4);   /* sizeof includes the NUL */
     n += str_words;
-    if (n > 96) { warn("build_umount_handler: %d слов не влезает в %d", n, 96); return -1; }
+    if (n > 96) return -1;
     uint64_t str_va = code_va + (uint64_t)str_off_bytes;
 
     uint64_t pool_val[U_POOL_COUNT];
@@ -1099,50 +1073,24 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     for (int i = 0; i < nfx; i++) {
         int at  = fx[i].at;
         int tgt = label_at[fx[i].label];
-        if (tgt < 0) {
-            warn("build_umount_handler: метка %d не выставлена (ветвь %d)",
-                 fx[i].label, i);
-            return -1;
-        }
+        if (tgt < 0) return -1;
         int64_t dw = (int64_t)tgt - (int64_t)at;
-        if (dw == 0) {
-            warn("build_umount_handler: ветвь %d на слове %d ведёт сама в себя",
-                 i, at);
-            return -1;
-        }
-        if (dw < -(1 << 18) || dw >= (1 << 18)) {
-            warn("build_umount_handler: ветвь %d вне imm19 (%lld слов)",
-                 i, (long long)dw);
-            return -1;
-        }
+        if (dw == 0) return -1;
+        if (dw < -(1 << 18) || dw >= (1 << 18)) return -1;
 
         if (fx[i].kind == 0) {
             w[at] = enc_b_cond(fx[i].cond, dw * 4);
             int64_t got = 0;
             int cc = dec_b_cond(&got, w[at]);
-            if (cc != (int)fx[i].cond || at + got != tgt) {
-                warn("build_umount_handler: b.cond %d: слово %08x дало "
-                     "cond=%d цель %d, ждали cond=%d цель %d",
-                     i, w[at], cc, (int)(at + got), (int)fx[i].cond, tgt);
-                return -1;
-            }
+            if (cc != (int)fx[i].cond || at + got != tgt) return -1;
         } else if (fx[i].kind == 1) {
             w[at] = enc_b(dw * 4);
-            if (at + dec_b(w[at]) != tgt) {
-                warn("build_umount_handler: b %d: слово %08x дало цель %d, "
-                     "ждали %d", i, w[at], (int)(at + dec_b(w[at])), tgt);
-                return -1;
-            }
+            if (at + dec_b(w[at]) != tgt) return -1;
         } else {
             w[at] = enc_cbnz_w(fx[i].rt, dw * 4);
             int rt = -1, nz = -1;
             int64_t got = dec_cbnz_w(w[at], &rt, &nz);
-            if (rt != fx[i].rt || nz != 1 || at + got != tgt) {
-                warn("build_umount_handler: cbnz %d: слово %08x дало rt=%d "
-                     "nz=%d цель %d, ждали rt=%d nz=1 цель %d",
-                     i, w[at], rt, nz, (int)(at + got), fx[i].rt, tgt);
-                return -1;
-            }
+            if (rt != fx[i].rt || nz != 1 || at + got != tgt) return -1;
         }
     }
 
@@ -1333,13 +1281,10 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
         }
     }
     if (nmatch == 0) {
-        warn("%s: в .rela.plt нет JUMP_SLOT для \"%s\"", s->label, sym);
         free(rel);
         return EXIT_NO_RESOLVE;
     }
     if (nmatch > 1) {
-        warn("%s: у \"%s\" %d JUMP_SLOT-релокаций — отказываюсь",
-             s->label, sym, nmatch);
         free(rel);
         return EXIT_NO_RESOLVE;
     }
@@ -1390,14 +1335,10 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
     if (hits == 1) {
         r->stub_va = direct;
     } else if (hits > 1) {
-        warn("%s: трамплинов на GOT-слот 0x%llx сразу %d — отказываюсь",
-             s->label, (unsigned long long)r->got_slot, hits);
         return EXIT_NO_RESOLVE;
     } else {
         int64_t cand = (int64_t)r->plt_delta * 16 + (int64_t)r->reloc_index * 16;
         if (cand <= 0) {
-            warn("%s: раскладка дала нелепый адрес трамплина (%lld)",
-                 s->label, (long long)cand);
             return EXIT_NO_RESOLVE;
         }
         r->stub_va = (uint64_t)cand;
@@ -1590,7 +1531,6 @@ static bool decode_w3_mov(uint32_t w, uint32_t *acc) {
 }
 
 typedef struct {
-    uint64_t site;       /* VA of `bl <mount@plt>` */
     uint64_t src_va;     /* VA of the "/dev/fuse" literal used here */
     uint64_t type_va;    /* VA of the "fuse" literal used here */
     uint32_t flags;      /* value loaded into w3, if seen */
@@ -1598,20 +1538,13 @@ typedef struct {
 } FuseSite;
 
 /* Find the single `mount("/dev/fuse", ..., "fuse", ...)` call site. */
-static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
-                          char *detail, size_t detlen) {
+static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     enum { MAXSTR = 64 };
     StrLoc srcs[MAXSTR], types[MAXSTR];
     int nsrc = find_strings(s, FUSE_SRC, srcs, MAXSTR);
     int ntype = find_strings(s, FUSE_TYPE, types, MAXSTR);
-    if (nsrc == 0) {
-        snprintf(detail, detlen, "строка \"%s\" не найдена", FUSE_SRC);
-        return -1;
-    }
-    if (ntype == 0) {
-        snprintf(detail, detlen, "строка \"%s\" не найдена", FUSE_TYPE);
-        return -1;
-    }
+    if (nsrc == 0) return -1;
+    if (ntype == 0) return -1;
 
     /* Keep only standalone occurrences. */
     StrLoc sstand[MAXSTR], tstand[MAXSTR];
@@ -1621,12 +1554,7 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
     for (int i = 0; i < ntype; i++)
         if (types[i].standalone) tstand[nt++] = types[i];
 
-    if (ns != 1) {
-        snprintf(detail, detlen,
-                 "\"%s\" как отдельная строка встречается %d раз (внутри "
-                 "других строк — %d); ожидалось одно", FUSE_SRC, ns, nsrc - ns);
-        return -1;
-    }
+    if (ns != 1) return -1;
     uint64_t want_src = sstand[0].va;
 
     /* Sweep executable segments for `bl <stub_va>`. */
@@ -1711,7 +1639,6 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
             if (src_reg >= 0 && type_reg >= 0 &&
                 x0_from == src_reg && x2_from == type_reg) {
                 if (nfound < 8) {
-                    found[nfound].site = pc;
                     found[nfound].src_va = src_val;
                     found[nfound].type_va = type_val;
                     found[nfound].flags = w3_acc;
@@ -1723,12 +1650,7 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
         free(w);
     }
 
-    if (nfound == 0) {
-        snprintf(detail, detlen,
-                 "не найден вызов mount(\"%s\", …, \"%s\", …) через трамплин "
-                 "0x%llx", FUSE_SRC, FUSE_TYPE, (unsigned long long)stub_va);
-        return -1;
-    }
+    if (nfound == 0) return -1;
 
     /*
      * There are TWO such call sites in vold, and they must be treated
@@ -1750,50 +1672,27 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
      * call as well. That is why the handler re-tests MS_LAZYTIME on x3 at
      * runtime — see "how the call is recognised". The two checks have to agree;
      * if this one ever picks a site that the handler's test rejects, nothing is
-     * intercepted and the log says so.
+     * intercepted and nothing says so.
      */
     enum { MAXCAND = 8 };
     FuseSite keep[MAXCAND];
     int nkeep = 0;
-    int n_lazytime = 0, n_nolazy = 0;
+    int n_lazytime = 0;
     for (int i = 0; i < nfound; i++) {
         bool lazy = found[i].has_flags && (found[i].flags & MS_LAZYTIME);
         if (lazy) {
             n_lazytime++;
             if (nkeep < MAXCAND) keep[nkeep++] = found[i];
-        } else {
-            n_nolazy++;
         }
     }
 
     if (n_lazytime == 0) {
         /* Nothing distinguished by MS_LAZYTIME: refuse rather than guess. */
-        int off = 0;
-        off += snprintf(detail + off, detlen - (size_t)off,
-                        "вызовов mount(\"%s\", …, \"%s\", …) найдено %d, но ни "
-                        "у одного нет MS_LAZYTIME (0x%x) — отказываюсь; "
-                        "кандидаты:", FUSE_SRC, FUSE_TYPE, nfound, MS_LAZYTIME);
-        for (int i = 0; i < nfound && i < MAXCAND; i++)
-            off += snprintf(detail + off, detlen - (size_t)off,
-                            " 0x%lx(flags=0x%x)",
-                            (unsigned long)found[i].site,
-                            found[i].has_flags ? found[i].flags : 0u);
         return -1;
     }
-    if (n_lazytime > 1) {
-        snprintf(detail, detlen,
-                 "вызовов с MS_LAZYTIME насчитано %d — отказываюсь", n_lazytime);
-        return -1;
-    }
+    if (n_lazytime > 1) return -1;
 
     *out = keep[0];
-    snprintf(detail, detlen,
-             "вызов найден по 0x%lx: x0<-\"%s\"@0x%lx, x2<-\"%s\"@0x%lx, "
-             "w3=0x%x (MS_LAZYTIME отличает MountUserFuse от AppFuse; "
-             "без LAZYTIME — %d шт.)",
-             (unsigned long)keep[0].site, FUSE_SRC,
-             (unsigned long)keep[0].src_va, FUSE_TYPE,
-             (unsigned long)keep[0].type_va, keep[0].flags, n_nolazy);
     return 0;
 }
 
@@ -1963,8 +1862,6 @@ static int umount_handler_exec_selftest(void) {
     munmap(mem, pgsz);
 
     if (bad) return 1;
-    info("selftest: обработчик umount2 прогнан на %zu путях — ок",
-         sizeof(cases) / sizeof(cases[0]));
     return 0;
 #endif
 }
@@ -1990,8 +1887,6 @@ static int handlers_fit_selftest(void) {
                         "а find_handler_room ищет 512\n", a_len + b);
         return 1;
     }
-    info("selftest: оба обработчика — %d + %d = %d байт (потолок 512)",
-         a, b, a_len + b);
     return 0;
 }
 
@@ -2270,7 +2165,6 @@ static int selftest(void) {
     if (handlers_fit_selftest() != 0) return 1;
     if (umount_handler_exec_selftest() != 0) return 1;
 
-    info("selftest: ок — %d байт, пул и оба пути на месте", n);
     return 0;
 }
 
@@ -2303,8 +2197,6 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
         }
     }
     if (!seg) {
-        warn("%s: трамплин 0x%llx не в исполняемом сегменте", s->label,
-             (unsigned long long)stub_va);
         return -1;
     }
 
@@ -2343,8 +2235,6 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
     size_t need = 512;               /* generous: handler is ~200 bytes */
     if (at + need > len) {
         free(buf);
-        warn("%s: после последнего трамплина лишь %zu байт — мало",
-             s->label, len > at ? len - at : 0);
         return -1;
     }
 
@@ -2366,8 +2256,6 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
     }
 
     free(buf);
-    warn("%s: в исполняемом сегменте нет нулевой области на %zu байт",
-         s->label, need);
     return -1;
 }
 
@@ -2405,37 +2293,20 @@ static int hook_resolve(Src *s, Hook *h, const char *sym) {
          * we must not patch. */
         if (mem_read(s->pid, s->base + h->res.got_slot, &h->real,
                      sizeof(h->real)) != 0) {
-            warn("%s: не читается GOT-слот \"%s\" (0x%llx)", s->label, sym,
-                 (unsigned long long)(s->base + h->res.got_slot));
             return EXIT_NO_RESOLVE;
         }
         if (!h->real) {
-            warn("%s: GOT-слот \"%s\" пуст — процесс ещё не слинкован, "
-                 "отказываюсь", s->label, sym);
             return EXIT_NO_RESOLVE;
         }
         if (mem_read(s->pid, h->run_stub, h->cur, sizeof(h->cur)) != 0) {
-            warn("%s: не читается трамплин \"%s\" по 0x%llx", s->label, sym,
-                 (unsigned long long)h->run_stub);
             return EXIT_NO_RESOLVE;
         }
     } else {
         if (src_pread(s, h->res.stub_va, h->cur, sizeof(h->cur)) != 0) {
-            warn("%s: не читается трамплин \"%s\"", s->label, sym);
             return EXIT_NO_RESOLVE;
         }
     }
 
-    info("%s: %s -> .rela.plt[%d], GOT 0x%llx, трамплин 0x%llx "
-         "(в процессе 0x%llx), сдвиг раскладки %d",
-         s->label, sym, h->res.reloc_index,
-         (unsigned long long)h->res.got_slot,
-         (unsigned long long)h->res.stub_va,
-         (unsigned long long)h->run_stub, h->res.plt_delta);
-    if (s->is_proc)
-        info("%s: GOT \"%s\"@0x%llx -> 0x%llx", s->label, sym,
-             (unsigned long long)(s->base + h->res.got_slot),
-             (unsigned long long)h->real);
     return EXIT_OK;
 }
 
@@ -2449,8 +2320,6 @@ static int hook_install(Src *s, Hook *h, uint64_t handler_va) {
     uint8_t patch[STUB_PATCH_LEN];
     build_stub_patch(patch, handler_va);
     if (mem_write(s->pid, h->run_stub, patch, sizeof(patch)) != 0) {
-        warn("%s: не переписать трамплин \"%s\" 0x%llx: %s", s->label, h->sym,
-             (unsigned long long)h->run_stub, strerror(errno));
         return EXIT_NO_WRITE;
     }
 
@@ -2465,8 +2334,6 @@ static int hook_install(Src *s, Hook *h, uint64_t handler_va) {
     uint8_t chk[STUB_PATCH_LEN];
     if (mem_read(s->pid, h->run_stub, chk, sizeof(chk)) != 0 ||
         !stub_is_patched(chk)) {
-        warn("%s: трамплин \"%s\" после записи не подтверждается — возможно, "
-             "частичная запись", s->label, h->sym);
         mem_write(s->pid, h->run_stub, h->cur, sizeof(h->cur));
         return EXIT_NO_WRITE;
     }
@@ -2474,10 +2341,6 @@ static int hook_install(Src *s, Hook *h, uint64_t handler_va) {
     uint64_t got = 0;
     if (lit >= 0 && lit + 8 <= STUB_PATCH_LEN) memcpy(&got, chk + lit, 8);
     if (lit < 0 || lit + 8 > STUB_PATCH_LEN || got != handler_va) {
-        warn("%s: трамплин \"%s\" ведёт на 0x%llx, а обработчик на 0x%llx — "
-             "откатываю (vold ушёл бы в SIGSEGV на первом же вызове \"%s\")",
-             s->label, h->sym, (unsigned long long)got,
-             (unsigned long long)handler_va, h->sym);
         mem_write(s->pid, h->run_stub, h->cur, sizeof(h->cur));
         return EXIT_NO_WRITE;
     }
@@ -2511,21 +2374,18 @@ static int emit_handlers(const char *path) {
 
     int a = build_handler(buf, sizeof(buf), code_va, mount_va,
                           src_va, type_va, RAW_PATH);
-    if (a <= 0) { warn("--emit: build_handler вернул %d", a); return EXIT_NO_RESOLVE; }
+    if (a <= 0) return EXIT_NO_RESOLVE;
     int a_len = (a + 7) & ~7;
     uint64_t um_va = code_va + (uint64_t)a_len;
     int b = build_umount_handler(buf + a_len, sizeof(buf) - (size_t)a_len,
                                  um_va, umount_va);
-    if (b <= 0) { warn("--emit: build_umount_handler вернул %d", b); return EXIT_NO_RESOLVE; }
+    if (b <= 0) return EXIT_NO_RESOLVE;
 
     FILE *f = fopen(path, "wb");
-    if (!f) { warn("--emit: не открыть %s: %s", path, strerror(errno)); return EXIT_NO_WRITE; }
+    if (!f) return EXIT_NO_WRITE;
     size_t wrote = fwrite(buf, 1, (size_t)(a_len + b), f);
     fclose(f);
-    if (wrote != (size_t)(a_len + b)) {
-        warn("--emit: записалось %zu из %d байт", wrote, a_len + b);
-        return EXIT_NO_WRITE;
-    }
+    if (wrote != (size_t)(a_len + b)) return EXIT_NO_WRITE;
 
     printf("handlers.bin: %d байт\n", a_len + b);
     printf("  \"%s\"   @ 0x%llx .. 0x%llx (%d байт)\n",
@@ -2573,7 +2433,6 @@ static void usage(void) {
           "  --dry-run    do everything except the writes.\n"
           "  --wait SEC   seconds to wait for vold (default 3).\n"
           "  --pid PID    target this pid instead of finding vold.\n"
-          "  --quiet      only report failure.\n"
           "\n"
           "Verification chain, cheapest first:\n"
           "  vold-fusefs --selftest\n"
@@ -2611,8 +2470,6 @@ int main(int argc, char **argv) {
             dry_run = true;
         } else if (!strcmp(argv[i], "--file") && i + 1 < argc) {
             file = argv[++i];
-        } else if (!strcmp(argv[i], "--quiet")) {
-            g_quiet = true;
         } else if (!strcmp(argv[i], "--selftest")) {
             do_selftest = true;
         } else if (!strcmp(argv[i], "--emit") && i + 1 < argc) {
@@ -2636,7 +2493,6 @@ int main(int argc, char **argv) {
         s.label = file;
         s.fd = open(file, O_RDONLY | O_CLOEXEC);
         if (s.fd < 0) {
-            warn("не открыть %s: %s", file, strerror(errno));
             return EXIT_NO_RESOLVE;
         }
         if (src_open_header(&s) != 0) { src_close(&s); return EXIT_NO_RESOLVE; }
@@ -2647,19 +2503,15 @@ int main(int argc, char **argv) {
         pid_t pid;
         if (pid_opt > 0) {
             pid = (pid_t)pid_opt;
-            if (!pid_is_vold(pid, exe, sizeof(exe)))
-                warn("pid %ld не похож на vold — продолжаю", pid_opt);
         } else {
             pid = find_vold(wait_sec, exe, sizeof(exe));
             if (pid < 0) {
-                warn("vold не найден (ждал %d с)", wait_sec);
                 return EXIT_NO_VOLD;
             }
         }
 
         uint64_t base = 0;
         if (find_load_base(pid, exe, &base, exe, sizeof(exe)) != 0) {
-            warn("не читается /proc/%d/maps", (int)pid);
             return EXIT_NO_RESOLVE;
         }
 
@@ -2672,9 +2524,6 @@ int main(int argc, char **argv) {
         snprintf(mempath, sizeof(mempath), "/proc/%d/mem", (int)pid);
         s.fd = open(mempath, O_RDONLY | O_CLOEXEC);
         if (s.fd < 0) {
-            warn("/proc/%d/maps не читается — скорее всего нет "
-                 "PTRACE_MODE_READ к этому процессу (%s)", (int)pid,
-                 strerror(errno));
             return EXIT_NO_RESOLVE;
         }
         if (src_open_header(&s) != 0) { src_close(&s); return EXIT_NO_RESOLVE; }
@@ -2703,44 +2552,30 @@ resolved_as_file:
 
     FuseSite fs;
     memset(&fs, 0, sizeof(fs));
-    char fdetail[512];
-    if (find_fuse_site(&s, hm.res.stub_va, &fs, fdetail, sizeof(fdetail)) != 0) {
-        warn("%s: %s", s.label, fdetail);
+    if (find_fuse_site(&s, hm.res.stub_va, &fs) != 0) {
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
-    info("%s: %s", s.label, fdetail);
 
     bool m_ours = stub_is_patched(hm.cur);
     bool u_ours = stub_is_patched(hu.cur);
 
     if (m_ours || u_ours) {
         if (m_ours && u_ours) {
-            info("%s: оба патча уже стоят (\"%s\" и \"%s\") — ничего не делаю",
-                 s.label, TARGET_SYM, TARGET_SYM2);
             src_close(&s);
             return EXIT_OK;
         }
         /* Half a patch. Saying "OK" here would be a lie with consequences: the
          * volume would mount with two layers and unmount one. */
-        warn("%s: патч стоит только наполовину (\"%s\": %s, \"%s\": %s) — "
-             "vold в таком состоянии не снимает то, что монтирует; "
-             "нужен перезапуск vold", s.label,
-             TARGET_SYM, m_ours ? "есть" : "нет",
-             TARGET_SYM2, u_ours ? "есть" : "нет");
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
 
     if (!hook_stub_intact(&hm)) {
-        warn("%s: трамплин \"%s\" не тот, что ожидался — не трогаю",
-             s.label, TARGET_SYM);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
     if (!hook_stub_intact(&hu)) {
-        warn("%s: трамплин \"%s\" не тот, что ожидался — не трогаю",
-             s.label, TARGET_SYM2);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
@@ -2748,12 +2583,9 @@ resolved_as_file:
     if (!s.is_proc) {
         /* A file is answered exactly as --check/--dry-run on a process would be. */
         if (check) {
-            info("%s: трамплины \"%s\" и \"%s\" целы — патча нет (--check)",
-                 s.label, TARGET_SYM, TARGET_SYM2);
             src_close(&s);
             return 1;
         }
-        info("%s: файл не меняется — запись только в живой процесс", s.label);
         src_close(&s);
         return EXIT_OK;
     }
@@ -2761,16 +2593,10 @@ resolved_as_file:
     /* ---- live process ---- */
 
     if (check) {
-        info("%s: трамплины \"%s\" и \"%s\" целы — патча нет (--check)",
-             s.label, TARGET_SYM, TARGET_SYM2);
         src_close(&s);
         return 1;
     }
     if (dry_run) {
-        info("--dry-run: записал бы обработчики в свободный хвост .plt-страницы "
-             "и по 16 байт по 0x%llx (\"%s\") и 0x%llx (\"%s\")",
-             (unsigned long long)hm.run_stub, TARGET_SYM,
-             (unsigned long long)hu.run_stub, TARGET_SYM2);
         src_close(&s);
         return EXIT_OK;
     }
@@ -2793,7 +2619,6 @@ resolved_as_file:
      * first because it leaves no new mapping and no trace in /proc/<pid>/maps.
      */
     uint64_t handler_abs = 0;
-    bool handler_in_mapping = false;
     {
         uint64_t off = 0;
         if (find_handler_room(&s, hm.res.stub_va, &off) == 0) {
@@ -2806,26 +2631,17 @@ resolved_as_file:
              * note above vold_exec_page). */
             char self[4096];
             if (!pid_is_vold(s.pid, self, sizeof(self))) {
-                warn("%s: в .plt места нет, и путь к исполняемому файлу не узнать",
-                     s.label);
                 src_close(&s);
                 return EXIT_NO_RESOLVE;
             }
             handler_abs = vold_exec_page(s.pid, self);
             if (handler_abs == 0) {
-                warn("%s: в .plt места нет, и исполняемую страницу из %s"
-                     " получить не удалось", s.label, self);
                 src_close(&s);
                 return EXIT_NO_RESOLVE;
             }
-            handler_in_mapping = true;
-            info("%s: в .plt места нет — взял исполняемую страницу из %s"
-                 " (0x%llx)", s.label, self, (unsigned long long)handler_abs);
         }
 #else
         else {
-            warn("%s: не нашлось свободного места под обработчики в .plt-странице",
-                 s.label);
             src_close(&s);
             return EXIT_NO_RESOLVE;
         }
@@ -2841,7 +2657,6 @@ resolved_as_file:
                              s.base + fs.src_va, s.base + fs.type_va,
                              RAW_PATH);
     if (hlen <= 0) {
-        warn("%s: не удалось собрать обработчик \"%s\"", s.label, TARGET_SYM);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
@@ -2851,22 +2666,14 @@ resolved_as_file:
                                      sizeof(hbuf) - (size_t)h1_len,
                                      um_handler_abs, hu.real);
     if (u_len <= 0) {
-        warn("%s: не удалось собрать обработчик \"%s\"", s.label, TARGET_SYM2);
         src_close(&s);
         return EXIT_NO_RESOLVE;
     }
     int total = h1_len + u_len;
 
-    info("%s: обработчики по 0x%llx%s: \"%s\" %d байт, \"%s\" %d байт "
-         "(всего %d)",
-         s.label, (unsigned long long)handler_abs,
-         handler_in_mapping ? " [запрошенная страница]" : " (в .plt)",
-         TARGET_SYM, hlen, TARGET_SYM2, u_len, total);
 
     /* 1) write both handlers into the chosen home */
     if (mem_write(s.pid, handler_abs, hbuf, (size_t)total) != 0) {
-        warn("%s: не записать обработчики по 0x%llx: %s", s.label,
-             (unsigned long long)handler_abs, strerror(errno));
         src_close(&s);
         return EXIT_NO_WRITE;
     }
@@ -2878,7 +2685,6 @@ resolved_as_file:
         /* Roll back: the region was verified all-zero before we wrote, so
          * restoring it to zero returns vold to its pre-patch state (neither
          * stub is touched yet, so nothing is redirecting). */
-        warn("%s: обработчики не читаются обратно — возвращаю нули", s.label);
         uint8_t zeros[1024];
         memset(zeros, 0, (size_t)total);
         mem_write(s.pid, handler_abs, zeros, (size_t)total);
@@ -2900,8 +2706,6 @@ resolved_as_file:
         /* Undo the first. A vold with the mount hook but not the teardown hook
          * is worse than an unpatched vold — that is the regression itself — so
          * falling back to "unpatched" is the only safe outcome here. */
-        warn("%s: \"%s\" не встал — снимаю \"%s\" и стираю обработчики",
-             s.label, TARGET_SYM2, TARGET_SYM);
         mem_write(s.pid, hm.run_stub, hm.cur, sizeof(hm.cur));
         uint8_t zeros[1024];
         memset(zeros, 0, (size_t)total);
@@ -2910,11 +2714,6 @@ resolved_as_file:
         return EXIT_NO_WRITE;
     }
 
-    info("%s: патч поставлен — \"%s\" 0x%llx -> 0x%llx, \"%s\" 0x%llx -> 0x%llx",
-         s.label, TARGET_SYM, (unsigned long long)hm.run_stub,
-         (unsigned long long)handler_abs,
-         TARGET_SYM2, (unsigned long long)hu.run_stub,
-         (unsigned long long)um_handler_abs);
     src_close(&s);
     return EXIT_OK;
 }
