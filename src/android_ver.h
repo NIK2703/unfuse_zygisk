@@ -4,7 +4,7 @@
  *
  * This is NOT a per-release byte fork. Both patchers read the target's own ELF
  * tables, so neither holds an offset to swap, and 11, 12, 12L, 13, 14, 15, 16 and
- * 17 all resolve through the same code: same 22 listed libc entry points, same
+ * 17 all resolve through the same code: same 12 listed libc entry points, same
  * single setxattr call in vold. What differs per release is the EXPECTATION — how
  * many of those entry points the module's list actually covers there, and which
  * AOSP site writes the ACL that vold-noacl disarms. The table records those, so a
@@ -48,12 +48,14 @@ typedef struct {
  *
  *   libc: 14, 15, 16 and 17 yield the same 9 distinct roots (__open_2, __openat_2,
  *         fchmod, fchmodat, linkat, mkdirat, open, openat, renameat2), and
- *         open64/open and openat64/openat share those addresses, so 11 of the 22
- *         listed targets come out covered. 11, 12, 12L and 13 yield TEN: renameat is
- *         a syscall stub of its own there and is patched as a root, so 12 are
- *         covered. The verifier counts roots rather than names because aliases share
- *         an address; 11 was measured on-device (Android 16, hookselftest) and the
- *         rest follow from a classification it finds identical, target for target.
+ *         open64/open and openat64/openat share those addresses, so 11 of the 12
+ *         listed targets are patched there — the twelfth, renameat, is a thunk onto
+ *         the patched renameat2 and is covered through it. 11, 12, 12L and 13 yield
+ *         TEN: renameat is a syscall stub of its own there and is patched as a root,
+ *         so all 12 are patched. The verifier counts roots rather than names because
+ *         aliases share an address; 11 was measured on-device (Android 16,
+ *         hookselftest) and the rest follow from a classification it finds identical,
+ *         target for target.
  *   vold:  setxattr is called exactly once and the stub resolves on all eight
  *         (11/12/12L/13: Utils.cpp:192, 14/15/16: :195, 17: :196), each binary
  *         carries exactly one R_AARCH64_JUMP_SLOT for it, and it is the only
@@ -66,10 +68,16 @@ typedef struct {
  * "переходник" and the root count fell from 10 to 9. The rename family is covered
  * either way — through renameat on 11/12/12L/13, through renameat2 later — and that
  * is why renameat is in kHooks at all: leaning on the renameat2 chain alone would
- * leave rename() unpatched on those four.
+ * leave rename() unpatched on those four. rename itself is in kHooks on no release:
+ * as a thunk it is covered through renameat there and through renameat2 later.
  *
- * Everything else the patch does is identical on all eight; only the verifier's
- * summary line moves, and it has two unrelated causes.
+ * Everything else the patch does is identical on all eight. Only the verifier's
+ * summary line moves, and it has two unrelated causes. The paragraphs below are
+ * about the ten names kHooks[] does NOT list — they keep the labels those names
+ * used to carry, because that classification is the measurement behind dropping
+ * them: a name that resolves, classifies as a thunk and is skipped does nothing
+ * but colour the report. With them gone the report has twelve entries, and on
+ * 14/15/16/17 the only one not patched is renameat.
  *
  * 17 alone is built with -mbranch-protection=standard, so its thunks open with
  * bti c and are 4 bytes longer: mkdir (16 -> 20), mkstemp and mkostemp (16 -> 20)

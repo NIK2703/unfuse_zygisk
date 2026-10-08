@@ -6,10 +6,11 @@
  * requested mode, so 0600 create/chmod zeroes the mask (posix_acl_create_masq)
  * and the entry dies -> EACCES. sdcardfs instead synthesises 0770 dirs / 0660
  * files, gid 9997 (mask=0007). Patch bionic entry points to shape the mode
- * pre-syscall: open/creat group rw + other cleared; mkdir also group x; chmod
- * never narrowed; rename/link into storage adds ACL (rename skips the default
- * ACL); mkstemp 0600 -> 0660. Only roots are patched; thunks up to 32 bytes are
- * skipped (they reach the root via .plt). Entry patching covers
+ * pre-syscall: open/openat group rw + other cleared; mkdirat also group x;
+ * fchmod/fchmodat never narrowed; renameat/renameat2/linkat into storage adds the
+ * ACL (rename skips the default ACL). Only roots are patched; a thunk is skipped,
+ * and its calls reach the root through .plt, so creat, mkdir, chmod, rename, link
+ * and the mkstemp family need no entry of their own. Entry patching covers
  * loaded/later-dlopen'd/dlsym'd calls and needs no trampoline (handlers syscall
  * directly); handlers must be reentrant (syscalls only). arm64 only.
  *
@@ -18,13 +19,17 @@
  * hooks_install() refuses the release when libc declares BTI but the module was
  * built without it. See patch_entry for why bti jc and x17 specifically.
  *
- * The target list below is version-independent — the same names resolve on every
- * release, and what comes out of it is 10 roots on 11/12/12L/13 and 9 on
- * 14/15/16/17, 12 and 11 targets once open64/open and openat64/openat are counted as
- * the aliases they are — but the COUNT is not something to assume: android_ver.h
- * names the
- * releases this was validated on and what each covers, and hooks_release()
- * reports a release that comes out otherwise.
+ * kHooks[] lists the roots, renameat among them — a root of its own on
+ * 11/12/12L/13, and the only way rename() is covered there. The names it does NOT
+ * list (creat, creat64, mkdir, chmod, rename, link, mkstemp, mkostemp, mkstemps,
+ * mkostemps) are absent because they are thunks on every one of the eight
+ * validated releases: the engine would resolve each, classify it, and skip it, so
+ * listing one would add a name that is never patched. That coverage is not
+ * assumed — hookselftest.cpp creates through creat/mkstemp/mkstemps and renames
+ * through rename, then checks the mode that comes out, and
+ * tools/verify-hook-targets.py unwinds the same chains statically. android_ver.h
+ * names the releases and what each covers; the COUNT is not something to assume,
+ * and hooks_release() reports a release that comes out otherwise.
  *
  *   tools/verify-hook-targets.py device/libc/libc-arm64.so
  */
@@ -272,10 +277,6 @@ extern "C" int h_openat(int dirfd, const char *path, int flags, mode_t mode) {
     return open_and_fix(dirfd, path, flags, mode);
 }
 
-extern "C" int h_creat(const char *path, mode_t mode) {
-    return open_and_fix(AT_FDCWD, path, O_CREAT | O_WRONLY | O_TRUNC, mode);
-}
-
 // Mode-less fortify variants. If O_CREAT still arrives (caller error; bionic
 // aborts), use 0660, not 0, which would zero the ACL mask.
 extern "C" int h_open_2(const char *path, int flags) {
@@ -286,12 +287,6 @@ extern "C" int h_openat_2(int dirfd, const char *path, int flags) {
     return open_and_fix(dirfd, path, flags, needs_mode(flags) ? 0666 : 0);
 }
 
-extern "C" int h_mkdirat(int dirfd, const char *path, mode_t mode);
-
-extern "C" int h_mkdir(const char *path, mode_t mode) {
-    return h_mkdirat(AT_FDCWD, path, mode);
-}
-
 extern "C" int h_mkdirat(int dirfd, const char *path, mode_t mode) {
     const bool storage = is_storage(dirfd, path);
     if (storage) mode = as_sdcardfs_dir(mode);
@@ -299,11 +294,6 @@ extern "C" int h_mkdirat(int dirfd, const char *path, mode_t mode) {
     const int r = static_cast<int>(syscall(SYS_mkdirat, dirfd, path, mode));
     if (r == 0 && storage) fix_created_dir(dirfd, path);
     return r;
-}
-
-extern "C" int h_chmod(const char *path, mode_t mode) {
-    if (is_storage(AT_FDCWD, path)) mode = widen_existing(AT_FDCWD, path, mode, 0);
-    return static_cast<int>(syscall(SYS_fchmodat, AT_FDCWD, path, mode, 0));
 }
 
 extern "C" int h_fchmodat(int dirfd, const char *path, mode_t mode, int at_flags) {
@@ -331,12 +321,6 @@ void fix_after_move(int dirfd, const char *dst, int src_dirfd, const char *src) 
     fix_object(dst);
 }
 
-extern "C" int h_rename(const char *oldp, const char *newp) {
-    const int r = static_cast<int>(syscall(SYS_renameat, AT_FDCWD, oldp, AT_FDCWD, newp));
-    if (r == 0) fix_after_move(AT_FDCWD, newp, AT_FDCWD, oldp);
-    return r;
-}
-
 extern "C" int h_renameat(int olddirfd, const char *oldp, int newdirfd, const char *newp) {
     const int r = static_cast<int>(syscall(SYS_renameat, olddirfd, oldp, newdirfd, newp));
     if (r == 0) fix_after_move(newdirfd, newp, olddirfd, oldp);
@@ -350,91 +334,19 @@ extern "C" int h_renameat2(int olddirfd, const char *oldp, int newdirfd, const c
     return r;
 }
 
-extern "C" int h_link(const char *oldp, const char *newp) {
-    const int r = static_cast<int>(syscall(SYS_linkat, AT_FDCWD, oldp, AT_FDCWD, newp, 0));
-    if (r == 0) fix_after_move(AT_FDCWD, newp, AT_FDCWD, oldp);
-    return r;
-}
-
 extern "C" int h_linkat(int olddirfd, const char *oldp, int newdirfd, const char *newp, int flags) {
     const int r = static_cast<int>(syscall(SYS_linkat, olddirfd, oldp, newdirfd, newp, flags));
     if (r == 0) fix_after_move(newdirfd, newp, olddirfd, oldp);
     return r;
 }
 
-// mkstemp creates 0600 — exactly what zeroes the ACL mask. The original cannot
-// be called (entry overwritten), so reimplement: fill six "X" randomly and
-// open(O_CREAT|O_EXCL), retrying on EEXIST. Same contract.
-
-constexpr char kLetters[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-uint64_t rand64() {
-    uint64_t v = 0;
-    if (syscall(SYS_getrandom, &v, sizeof v, 0) == static_cast<long>(sizeof v)) return v;
-
-    // getrandom unavailable — monotonic time + tid.
-    struct {
-        long sec;
-        long nsec;
-    } ts {};
-    syscall(SYS_clock_gettime, 1 /* CLOCK_MONOTONIC */, &ts);
-    uint64_t f = static_cast<uint64_t>(ts.nsec) * 2654435761u;
-    f ^= static_cast<uint64_t>(ts.sec) << 17;
-    f ^= static_cast<uint64_t>(syscall(SYS_gettid)) * 40503u;
-    return f;
-}
-
-int mkstemp_impl(char *tmpl, int suffixlen, int extra_flags, mode_t mode) {
-    if (tmpl == nullptr) {
-        errno = EINVAL;
-        return -1;
-    }
-    const size_t len = strlen(tmpl);
-    if (suffixlen < 0 || len < static_cast<size_t>(6 + suffixlen)) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    char *x = tmpl + len - 6 - static_cast<size_t>(suffixlen);
-    for (int i = 0; i < 6; i++) {
-        if (x[i] != 'X') {
-            errno = EINVAL;
-            return -1;
-        }
-    }
-
-    for (int attempt = 0; attempt < 128; attempt++) {
-        const uint64_t r = rand64();
-        for (int i = 0; i < 6; i++) x[i] = kLetters[(r >> (i * 6)) & 63];
-
-        const int fd = static_cast<int>(
-            syscall(SYS_openat, AT_FDCWD, tmpl, O_CREAT | O_EXCL | O_RDWR | extra_flags, mode));
-        if (fd >= 0) return fd;
-        if (errno != EEXIST) return -1;
-    }
-
-    errno = EEXIST;
-    return -1;
-}
-
-// 0600 kept outside storage (private there); in storage it reads as 0660 anyway.
-mode_t mkstemp_mode(const char *tmpl) {
-    return is_storage(AT_FDCWD, tmpl) ? as_sdcardfs_file(0600) : 0600;
-}
-
-extern "C" int h_mkstemp(char *tmpl) { return mkstemp_impl(tmpl, 0, 0, mkstemp_mode(tmpl)); }
-
-extern "C" int h_mkostemp(char *tmpl, int flags) {
-    return mkstemp_impl(tmpl, 0, flags, mkstemp_mode(tmpl));
-}
-
-extern "C" int h_mkstemps(char *tmpl, int suffixlen) {
-    return mkstemp_impl(tmpl, suffixlen, 0, mkstemp_mode(tmpl));
-}
-
-extern "C" int h_mkostemps(char *tmpl, int suffixlen, int flags) {
-    return mkstemp_impl(tmpl, suffixlen, flags, mkstemp_mode(tmpl));
-}
+// The mkstemp family (mkstemp, mkostemp, mkstemps, mkostemps) is NOT hooked, and
+// needs no reimplementation. It does create 0600 — exactly what zeroes the ACL
+// mask — but bionic reaches its own open through open@plt, so the patched open
+// entry sees the 0600, widens it to 0660 and writes the ACL itself. A handler
+// here would have to reimplement mkstemp (the original cannot be called once its
+// entry is overwritten) purely to do what open already does. hookselftest.cpp
+// checks this end to end on the device, through mkstemp and mkstemps.
 
 #if defined(__aarch64__)
 
@@ -691,33 +603,26 @@ struct HookDef {
     void *handler;
 };
 
-// Only roots are patched; thunks (creat, mkdir, chmod, link, rename, renameat,
-// mkstemp...) stay listed but are detected and skipped — their calls reach the
-// root via .plt. Listing them patches a ROM where a thunk is the real impl and
-// makes each name's fate explicit.
+// Roots only. A thunk needs no entry here: the engine would resolve it, classify
+// it and skip it anyway (tail_call_target), because its calls already reach the
+// root through .plt. Listing a name that is never patched buys nothing and hides
+// the real coverage behind a label, so that coverage is checked where it can be
+// measured instead — hookselftest.cpp on the device, verify-hook-targets.py
+// statically. renameat is the one entry that is a root on some releases and a
+// thunk on others, and it is listed for the four where it is the root (header).
 const HookDef kHooks[] = {
     {"open", reinterpret_cast<void *>(h_open)},
     {"open64", reinterpret_cast<void *>(h_open)},
     {"openat", reinterpret_cast<void *>(h_openat)},
     {"openat64", reinterpret_cast<void *>(h_openat)},
-    {"creat", reinterpret_cast<void *>(h_creat)},
-    {"creat64", reinterpret_cast<void *>(h_creat)},
     {"__open_2", reinterpret_cast<void *>(h_open_2)},
     {"__openat_2", reinterpret_cast<void *>(h_openat_2)},
-    {"mkdir", reinterpret_cast<void *>(h_mkdir)},
     {"mkdirat", reinterpret_cast<void *>(h_mkdirat)},
-    {"chmod", reinterpret_cast<void *>(h_chmod)},
     {"fchmod", reinterpret_cast<void *>(h_fchmod)},
     {"fchmodat", reinterpret_cast<void *>(h_fchmodat)},
-    {"rename", reinterpret_cast<void *>(h_rename)},
     {"renameat", reinterpret_cast<void *>(h_renameat)},
     {"renameat2", reinterpret_cast<void *>(h_renameat2)},
-    {"link", reinterpret_cast<void *>(h_link)},
     {"linkat", reinterpret_cast<void *>(h_linkat)},
-    {"mkstemp", reinterpret_cast<void *>(h_mkstemp)},
-    {"mkostemp", reinterpret_cast<void *>(h_mkostemp)},
-    {"mkstemps", reinterpret_cast<void *>(h_mkstemps)},
-    {"mkostemps", reinterpret_cast<void *>(h_mkostemps)},
 };
 
 constexpr int kHookCount = static_cast<int>(sizeof(kHooks) / sizeof(kHooks[0]));
@@ -768,8 +673,9 @@ int hooks_install(int *total) {
     unsigned sizes[kHookCount];
     func_sizes(fns, kHookCount, sizes);
 
-    // Step 3: patch only >= patch size and not a thunk (a long thunk like mkdir
-    // is patchable but pointless — its calls already reach the patched root).
+    // Step 3: patch only >= patch size and not a thunk (a thunk that clears the
+    // gate — renameat from 14 on — is still skipped: patching it would be
+    // pointless, its calls already reach the patched renameat2).
     // Only the ok count is returned; the other outcomes live in g_state, which
     // hooks_report() prints.
     int ok = 0;
