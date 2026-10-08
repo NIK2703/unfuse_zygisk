@@ -161,68 +161,12 @@ static bool looks_patched(const uint8_t *p) {
     return w3 == 0xd61f0220u;
 }
 
-typedef struct {
-    uint64_t *target;
-    uint64_t *va;
-    size_t    n;
-    size_t    cap;
-    uint64_t *patched;
-    size_t    npatched;
-    size_t    pcap;
-} Stubs;
-
-static void stubs_free(Stubs *st) {
-    free(st->target);
-    free(st->va);
-    free(st->patched);
-    memset(st, 0, sizeof(*st));
-}
-
-static int stubs_add(Stubs *st, uint64_t target, uint64_t va) {
-    if (st->n == st->cap) {
-        size_t cap = st->cap ? st->cap * 2 : 512;
-        uint64_t *t = realloc(st->target, cap * sizeof(uint64_t));
-        uint64_t *v = realloc(st->va, cap * sizeof(uint64_t));
-        if (!t || !v) { free(t); free(v); return -1; }
-        st->target = t;
-        st->va = v;
-        st->cap = cap;
-    }
-    st->target[st->n] = target;
-    st->va[st->n] = va;
-    st->n++;
-    return 0;
-}
-
-static int stubs_add_patched(Stubs *st, uint64_t va) {
-    if (st->npatched == st->pcap) {
-        size_t cap = st->pcap ? st->pcap * 2 : 16;
-        uint64_t *p = realloc(st->patched, cap * sizeof(uint64_t));
-        if (!p) return -1;
-        st->patched = p;
-        st->pcap = cap;
-    }
-    st->patched[st->npatched++] = va;
-    return 0;
-}
-
-static uint64_t stubs_lookup(const Stubs *st, uint64_t target, int *hits) {
-    uint64_t va = 0;
-    *hits = 0;
-    for (size_t i = 0; i < st->n; i++) {
-        if (st->target[i] == target) {
-            va = st->va[i];
-            (*hits)++;
-        }
-    }
-    return va;
-}
-
-static bool stubs_is_patched(const Stubs *st, uint64_t va) {
-    for (size_t i = 0; i < st->npatched; i++)
-        if (st->patched[i] == va) return true;
-    return false;
-}
+/* The Stubs container: two parallel arrays of (GOT slot, trampoline VA) plus
+ * the trampolines already carrying the patch. Moved to its own header so
+ * tools/stubs-oom-test.c can drive the growth path directly — see the top of
+ * tools/stubs.h for why that needs a header rather than an include of this
+ * file. The code is unchanged; the tools built from it are byte-identical. */
+#include "stubs.h"
 
 /* One pass over executable PT_LOADs: collect canonical stubs, note patched ones. */
 static int collect_stubs(Src *s, Stubs *st) {
@@ -270,7 +214,13 @@ typedef struct {
     bool     already_patched;
 } Resolved;
 
-/* Count `bl`/`b` targets pointing at the stub — report how many vold sites call it. */
+/* Count `bl`/`b` targets pointing at the stub — report how many vold sites call it.
+ *
+ * Returns -1 if an executable segment cannot be read, and the caller refuses on
+ * anything that is not exactly 1 — so a failed read is a refusal, not a smaller
+ * count. That direction matters: the count is a gate ("setxattr is called once,
+ * from SetDefaultAcl"), and under-counting a symbol with two call sites to one
+ * would open the gate instead of closing it. */
 static int count_call_sites(Src *s, uint64_t stub_va) {
     int hits = 0;
     for (int i = 0; i < s->phnum; i++) {
@@ -279,10 +229,10 @@ static int count_call_sites(Src *s, uint64_t stub_va) {
         if (p->p_filesz < 4) continue;
         size_t len = (size_t)p->p_filesz;
         uint8_t *buf = malloc(len);
-        if (!buf) return hits;
+        if (!buf) return -1;
         if (src_pread(s, p->p_vaddr, buf, len) != 0) {
             free(buf);
-            continue;
+            return -1;
         }
         for (uint64_t off = 0; off + 4 <= len; off += 4) {
             uint32_t w;

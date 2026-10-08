@@ -30,10 +30,17 @@
  * programs, not a library, and nothing in it should acquire a symbol in either
  * binary.
  *
- * Nothing here prints, and neither tool does: a failure is a return value that
- * becomes an exit code, and every caller of both tools reads that code and not
- * their output (module/post-fs-data.sh, module/service.sh, module/status.sh).
- * So there is no info()/warn() pair for an including .c to define any more. The
+ * Nothing here prints, and the PATCH path of neither tool does: a failure there
+ * is a return value that becomes an exit code, and every caller of both tools
+ * reads that code and not their output (module/post-fs-data.sh, module/service.sh,
+ * module/status.sh). So there is no info()/warn() pair for an including .c to
+ * define any more.
+ *
+ * Two developer subcommands do print, and the module never calls either: --emit
+ * describes the blob it just wrote (stdout), and --selftest writes its FAIL lines
+ * to stderr while passing silently — a self-test that failed without saying which
+ * assertion failed would be worse than useless. Neither is logging: both report
+ * on a thing that was asked for, and the patch path stays mute. The
  * stub collection is not here either: vold-noacl wants every trampoline plus the
  * already-patched ones (Stubs, collect_stubs, stubs_*), vold-fusefs a single
  * named stub and its original bytes (hook_resolve, hook_stub_intact,
@@ -54,6 +61,11 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/* base_name() and cmdline_is_vold(): the name rules, in their own header so
+ * tools/proc-name-test.c can exercise them on a host (this file pulls in
+ * <elf.h>, which MSYS2 does not ship). */
+#include "proc-name.h"
 
 /* The 16-byte trampoline patch vold-fusefs installs, as its two instruction
  * words: `ldr x17,#8` (which therefore reads the quad at +8) and `br x17`. The
@@ -82,11 +94,6 @@ static int read_all(const char *path, void *buf, size_t len, size_t *got) {
     close(fd);
     if (got) *got = off;
     return 0;
-}
-
-static const char *base_name(const char *p) {
-    const char *s = strrchr(p, '/');
-    return s ? s + 1 : p;
 }
 
 /* Same parse for a file (--file) and a live process; only VA->byte differs: a file
@@ -392,11 +399,11 @@ static bool pid_is_vold(pid_t pid, char *exe, size_t exelen) {
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_all(path, buf, sizeof(buf) - 1, &got) == 0 && got > 0) {
         buf[got] = '\0';
+        /* /proc/<pid>/cmdline is argv with NUL separators; the rule below wants
+         * them as spaces so the arguments read as one string. */
         for (size_t i = 0; i + 1 < got; i++)
             if (buf[i] == '\0') buf[i] = ' ';
-        char *p = buf;
-        while (*p == ' ') p++;
-        if (strncmp(base_name(p), "vold", 4) == 0) {
+        if (cmdline_is_vold(buf)) {
             if (exe) snprintf(exe, exelen, "%s", "/system/bin/vold");
             return true;
         }
