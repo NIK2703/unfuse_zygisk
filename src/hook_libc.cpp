@@ -22,9 +22,12 @@
  * kHooks[] lists the roots, renameat among them — a root of its own on
  * 11/12/12L/13, and the only way rename() is covered there. The names it does NOT
  * list (creat, creat64, mkdir, chmod, rename, link, mkstemp, mkostemp, mkstemps,
- * mkostemps) are absent because they are thunks on every one of the eight
- * validated releases: the engine would resolve each, classify it, and skip it, so
- * listing one would add a name that is never patched. That coverage is not
+ * mkostemps) are absent because they are tail branches onto a root on every one of
+ * the eight validated releases: the engine would resolve each, classify it, and skip
+ * it, so listing one would add a name that is never patched. (Which of the two skip
+ * labels such a name gets depends only on its length against the 20-byte gate —
+ * creat at 12 bytes reads "коротка", chmod at 20 reads "переходник" — and neither is
+ * a patch.) That coverage is not
  * assumed — hookselftest.cpp creates through creat/mkstemp/mkstemps and renames
  * through rename, then checks the mode that comes out, and
  * tools/verify-hook-targets.py unwinds the same chains statically. android_ver.h
@@ -603,13 +606,15 @@ struct HookDef {
     void *handler;
 };
 
-// Roots only. A thunk needs no entry here: the engine would resolve it, classify
-// it and skip it anyway (tail_call_target), because its calls already reach the
-// root through .plt. Listing a name that is never patched buys nothing and hides
-// the real coverage behind a label, so that coverage is checked where it can be
-// measured instead — hookselftest.cpp on the device, verify-hook-targets.py
-// statically. renameat is the one entry that is a root on some releases and a
-// thunk on others, and it is listed for the four where it is the root (header).
+// Roots only. A tail branch onto a root needs no entry here: the engine would
+// resolve it, classify it and skip it anyway — by the size gate if it is shorter
+// than the patch, by tail_call_target otherwise — because its calls already reach
+// the root through .plt. Listing a name that is never patched buys nothing and
+// hides the real coverage behind a label, so that coverage is checked where it can
+// be measured instead: hookselftest.cpp on the device, verify-hook-targets.py
+// statically. renameat is the one entry that is a root on some releases and a bare
+// tail branch onto renameat2 on the others, and it is listed for the four where it
+// is the root (header).
 const HookDef kHooks[] = {
     {"open", reinterpret_cast<void *>(h_open)},
     {"open64", reinterpret_cast<void *>(h_open)},
@@ -673,9 +678,11 @@ int hooks_install(int *total) {
     unsigned sizes[kHookCount];
     func_sizes(fns, kHookCount, sizes);
 
-    // Step 3: patch only >= patch size and not a thunk (a thunk that clears the
-    // gate — renameat from 14 on — is still skipped: patching it would be
-    // pointless, its calls already reach the patched renameat2).
+    // Step 3: patch only >= patch size and not a thunk. Both gates are live and the
+    // order matters: a tail branch shorter than the patch never reaches the thunk
+    // test (renameat from 14 on is 8 bytes, so it reads "коротка"), while one at or
+    // above the gate is caught by tail_call_target (chmod 20, rename and link 28).
+    // Neither is patched, and either way its calls already reach the root via .plt.
     // Only the ok count is returned; the other outcomes live in g_state, which
     // hooks_report() prints.
     int ok = 0;

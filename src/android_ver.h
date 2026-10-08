@@ -64,8 +64,10 @@ typedef struct {
  * 11, 12, 12L and 13 are the releases that differ in WHAT is patched, and they
  * differ upward. Their SYSCALLS.TXT still lists renameat as a syscall of its own, so
  * renameat is a leaf the module patches as a root and rename is a thunk onto it.
- * From 14 on, renameat moved into rename.cpp as a thunk onto renameat2: it became a
- * "переходник" and the root count fell from 10 to 9. The rename family is covered
+ * From 14 on, renameat moved into rename.cpp as a tail branch onto renameat2 — a
+ * bare 8 bytes on 16 (measured: verify-hook-targets.py chases it to renameat2@plt),
+ * so it falls to the SIZE gate and reads "коротка", not "переходник". The root count
+ * falls from 10 to 9 either way. The rename family is covered
  * either way — through renameat on 11/12/12L/13, through renameat2 later — and that
  * is why renameat is in kHooks at all: leaning on the renameat2 chain alone would
  * leave rename() unpatched on those four. rename itself is in kHooks on no release:
@@ -77,7 +79,7 @@ typedef struct {
  * used to carry, because that classification is the measurement behind dropping
  * them: a name that resolves, classifies as a thunk and is skipped does nothing
  * but colour the report. With them gone the report has twelve entries, and on
- * 14/15/16/17 the only one not patched is renameat.
+ * 14/15/16/17 the only one not patched is renameat — as "коротка".
  *
  * 17 alone is built with -mbranch-protection=standard, so its thunks open with
  * bti c and are 4 bytes longer: mkdir (16 -> 20), mkstemp and mkostemp (16 -> 20)
