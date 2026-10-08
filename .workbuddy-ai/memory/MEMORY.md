@@ -304,6 +304,39 @@ ls -l /proc/$(pidof zn-daemon)/fd | grep unfuse
   имена там **остаются проверяемыми**: доказать, что их цепочка доходит до
   пропатченного корня, и есть работа этого инструмента.
 
+**Устранено в третьей итерации (2026-10-08), коммит `1097b59`.**
+
+- **Мёртвый код:** `saw_call` в `find_fuse_site()` (объявлена, присвоена,
+  погашена `(void)`, не читалась нигде); недостижимый страж `if (!found)` в
+  `main()` — к этому месту `found` всегда true; параметр
+  `resolve(..., want_call_sites)`, равный `true` в обоих вызовах; нечитаемый
+  `int total` в `unfuse_zygisk.cpp` (out-параметр `hooks_install` читает только
+  `hookselftest.cpp`).
+- **Дублирование:** `.plt`-раскладка (`C = va - 16*i`) существовала дважды —
+  `plt_delta_emit()` в `vold-fusefs.c` и `plt_delta()` в `vold-noacl.c`,
+  вплоть до текстов отказов. Теперь одна `plt_layout_delta()` в
+  `vold-common.h`. Туда же `STUB_PATCH_W0/W1`: 16-байтовый патч трамплина
+  пишет `vold-fusefs`, распознаёт `vold-noacl`, а слова были выписаны в обоих
+  файлах — теперь писатель и читатель разойтись не могут.
+- **Ложные комментарии:** `post-fs-data.sh` говорил, что FUSE-монтирование
+  «не делается вовсе» (делается — `vold-fusefs` кладёт bind поверх него);
+  `hook_libc.h` в примере отчёта ссылался на метку `skip`, которой
+  `hooks_report()` не выдаёт; `storage-fix.c` — «for kernels without sdcardfs»,
+  хотя условие ветки `external_storage.sdcardfs.enabled=0`, а не поддержка ядром.
+
+**Замер на эталонном vold** (`device/bin/vold`, `tools/elf-plt-map.py`):
+473/473 JUMP_SLOT сходятся с трамплином, неоднозначных 0; у `mount`,
+`umount2` и `setxattr` **одна и та же** C = `0xF9A40` (`stub_va = C +
+16*reloc_index` — ровно то, что выводит `plt_layout_delta`); у `setxattr`
+ровно 1 вызов в `.text`, у `mount` — 21.
+
+**Хост-сборка патчеров — тупик, не повторять.** `cc` в песочнице это ucrt64
+mingw-w64 gcc 15.2; `vold-fusefs.c`/`vold-noacl.c` им не собрать: на машине
+нет `elf.h` (ближайший — в sysroot NDK, и через `-idirafter` он тянет
+`asm/types.h`), а mingw-овый `fcntl.h` не знает `O_CLOEXEC` и нет `pread`.
+Селфтесты патчеров — aarch64 и запускают машинный код обработчика: только
+устройство.
+
 ## Проверка после перезагрузки — регресса нет (2026-10-08)
 
 Механика: `hookselftest` линкует `hook_libc.cpp` **прямо в себя**, поэтому новый
