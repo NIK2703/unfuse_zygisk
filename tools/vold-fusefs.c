@@ -577,6 +577,25 @@ static uint32_t enc_b(int64_t byte_delta) {                   /* b #delta */
     int64_t d = byte_delta >> 2;
     return 0x14000000u | (uint32_t)(d & 0x3ffffff);
 }
+/* --- the three the anchor test needs -----------------------------------
+ *
+ * Nothing in the handler emission uses these; they exist so anchor_selftest()
+ * can write a call site out as instructions instead of as magic words. That is
+ * the whole point of that test: it asserts the *matcher*, which is what decides
+ * whether vold can be patched at all. */
+static uint32_t enc_adrp(int rd, uint64_t pc, uint64_t target) {  /* adrp Rd, target */
+    int64_t delta = (int64_t)((target & ~0xfffULL) - (pc & ~0xfffULL)) >> 12;
+    uint32_t immlo = (uint32_t)delta & 0x3u;
+    uint32_t immhi = ((uint32_t)delta >> 2) & 0x7ffffu;
+    return 0x90000000u | (immlo << 29) | (immhi << 5) | (uint32_t)rd;
+}
+static uint32_t enc_movk_w(int rd, uint32_t imm16) {   /* movk Wd, #imm16, lsl 16 */
+    return 0x72a00000u | ((imm16 & 0xffffu) << 5) | (uint32_t)rd;
+}
+static uint32_t enc_bl(uint64_t pc, uint64_t target) {        /* bl target */
+    int64_t d = (int64_t)(target - pc) >> 2;
+    return 0x94000000u | (uint32_t)(d & 0x3ffffff);
+}
 /* Decoders for the same two forms, used to prove an emitted branch actually
  * reaches its label instead of merely having the right word count. */
 static int64_t dec_b(uint32_t w) {
@@ -1438,39 +1457,63 @@ static int find_strings(Src *s, const char *needle, StrLoc *out, int max) {
     return n;
 }
 
-/* Decode `adrp`+`add`/`ldr` sequences: return the value a register holds after
- * a two-instruction address-building pair, or 0 if w0/w1 is not such a pair.
- * Handles `add Rd, Rn, #imm` and `ldr Rd, [Rn, #imm]` for the small-literal
- * case, both with Rn == the adrp destination. */
-static bool decode_adrp_pair(uint32_t w0, uint32_t w1, uint64_t pc,
-                             int *rd_out, uint64_t *val_out) {
-    if ((w0 & 0x9f000000u) != 0x90000000u) return false;
-    int rd = (int)(w0 & 0x1fu);
-    uint32_t immlo = (w0 >> 29) & 0x3u;
-    uint32_t immhi = (w0 >> 5) & 0x7ffffu;
+/* The page address an `adrp Rd, label` computes, given the instruction's own
+ * address. */
+static uint64_t adrp_page(uint64_t pc, uint32_t w) {
+    uint32_t immlo = (w >> 29) & 0x3u;
+    uint32_t immhi = (w >> 5) & 0x7ffffu;
     uint32_t v = (immhi << 2) | immlo;
     int64_t sv = (int64_t)(int32_t)(v << 11) >> 11;
-    uint64_t page = (pc & ~0xfffULL) + (uint64_t)(sv << 12);
+    return (pc & ~0xfffULL) + (uint64_t)(sv << 12);
+}
 
-    if ((w1 & 0xffc00000u) == 0x91000000u) {           /* add Rd, Rn, #imm */
-        int rn = (int)((w1 >> 5) & 0x1fu);
-        int rr = (int)(w1 & 0x1fu);
-        if (rn != rd) return false;
-        uint32_t imm12 = (w1 >> 10) & 0xfffu;
-        *rd_out = rr;
-        *val_out = page + (uint64_t)imm12;
-        return true;
+/* Building the address of a literal is a PAIR of instructions — `adrp Rn, page`
+ * plus a later `add Rd, Rn, #imm` (or `ldr Rd, [Rn, #imm]`) — but not
+ * necessarily an ADJACENT pair. The compiler is free to interleave two of them,
+ * and vold 11/12/12L/13 does exactly that:
+ *
+ *     adrp x21, 0x13000     ; "/dev/fuse"
+ *     adrp x22, 0x1c000     ; "fuse"
+ *     add  x21, x21, #0x73
+ *     add  x22, x22, #0x1f6
+ *
+ * The first version of this matcher required w[j] == adrp and w[j+1] == its
+ * add. On those four releases it therefore decoded neither register, found no
+ * call site at all, and the tool refused vold with "anchor did not resolve" —
+ * i.e. the FUSE patch silently did not exist on Android 11–13. What carries the
+ * meaning is the register, not the distance between the two halves.
+ *
+ * The scan runs BACKWARDS from the call, so it meets the `add` first and the
+ * `adrp` after it. Each register therefore remembers the last `add`/`ldr` it
+ * was given (the one nearest the call wins), and an `adrp` closes every pending
+ * entry that names it as its base. */
+typedef struct {
+    bool     live;
+    int      base;   /* Rn of the pending add/ldr */
+    uint64_t off;    /* its #imm12, already scaled for the ldr form */
+} Pending;
+
+/* Record `add Rd, Rn, #imm12` / `ldr Rd, [Rn, #imm12]` as pending on Rd.
+ * Returns Rd, or -1 if `w` is neither form. */
+static int pending_put(uint32_t w, Pending *p) {
+    int rd, rn;
+    uint64_t off;
+
+    if ((w & 0xffc00000u) == 0x91000000u) {            /* add Rd, Rn, #imm12 */
+        off = (w >> 10) & 0xfffu;
+    } else if ((w & 0xffc00000u) == 0xf9400000u) {     /* ldr Rd, [Rn, #imm12] */
+        off = (uint64_t)((w >> 10) & 0xfffu) * 8u;
+    } else {
+        return -1;
     }
-    if ((w1 & 0xffc00000u) == 0xf9400000u) {           /* ldr Rd, [Rn,#imm] */
-        int rn = (int)((w1 >> 5) & 0x1fu);
-        int rr = (int)(w1 & 0x1fu);
-        if (rn != rd) return false;
-        uint32_t imm12 = (w1 >> 10) & 0xfffu;
-        *rd_out = rr;
-        *val_out = page + (uint64_t)imm12 * 8u;
-        return true;
+    rd = (int)(w & 0x1fu);
+    rn = (int)((w >> 5) & 0x1fu);
+    if (!p[rd].live) {
+        p[rd].live = true;
+        p[rd].base = rn;
+        p[rd].off  = off;
     }
-    return false;
+    return rd;
 }
 
 /* `mov x0, xN` (alias of `orr x0, xzr, xN`): 0xaa0003e0 | (N << 16).
@@ -1537,6 +1580,96 @@ typedef struct {
     bool     has_flags;  /* whether w3 was decoded */
 } FuseSite;
 
+/* Everything one call site's prologue tells us. */
+typedef struct {
+    int      src_reg, type_reg;   /* registers holding the two literals */
+    uint64_t src_val, type_val;   /* and which literals they hold */
+    int      x0_from, x2_from;    /* registers moved into x0 / x2 */
+    uint32_t w3_acc;              /* mount flags, as built by mov/movk */
+    bool     w3_seen;
+} SiteRegs;
+
+/* Walk back from the `bl` at w[k] over the straight-line block that sets up the
+ * call, and decode it into `out`.
+ *
+ * This is split out of find_fuse_site() so it can be exercised on a synthetic
+ * instruction buffer: the matcher is the part that decides whether vold can be
+ * patched at all, and it has already been wrong once (the interleaved adrp
+ * pairs of vold 11–13, see pending_put above), silently, on four releases. A
+ * test that needs a real vold image cannot run everywhere; this one needs 40
+ * bytes of array.
+ *
+ * We track, per register, the last literal it was loaded with, and the last
+ * source register moved into x0/x2. The window closes at the first CONDITIONAL
+ * control-flow instruction: inside a conditional block the reading is no longer
+ * safe (the register may hold something else on the other path). Unconditional
+ * calls (`bl`) are fine — the real code has a `bl StringPrintf` just before the
+ * address setup, and the argument registers are re-loaded after it. A
+ * `b`/`ret`/`br` ends the window too.
+ *
+ * Not required: x4 == NULL. The handler does not use x4, and vold builds it
+ * with `csel` from an empty std::string (which is NULL in practice but not a
+ * literal `mov x4, xzr`), so demanding a literal NULL would reject the very
+ * site we want. */
+static void scan_back(const uint32_t *w, size_t nw, size_t k, uint64_t seg_va,
+                      uint64_t want_src, const uint64_t *type_vas, int ntype,
+                      SiteRegs *out) {
+    memset(out, 0, sizeof(*out));
+    out->src_reg  = -1;
+    out->type_reg = -1;
+    out->x0_from  = -1;
+    out->x2_from  = -1;
+
+    Pending pend[32];
+    memset(pend, 0, sizeof(pend));
+
+    size_t lo = (k > 32) ? k - 32 : 0;
+
+    for (size_t j = k; j-- > lo; ) {
+        uint32_t a = w[j];
+        uint64_t apc = seg_va + (uint64_t)j * 4u;
+
+        /* A conditional branch closes the window. */
+        if ((a & 0xff000010u) == 0x54000000u ||   /* b.cond  */
+            (a & 0x7e000000u) == 0x34000000u ||   /* cbz/cbnz */
+            (a & 0x7e000000u) == 0x36000000u)     /* tbz/tbnz */
+            break;
+
+        /* Structure ends: unconditional branch / return. */
+        if ((a & 0x7c000000u) == 0x14000000u ||   /* b (not bl) */
+            (a & 0xfffffc1fu) == 0xd61f0000u ||   /* br/blr     */
+            a == 0xd65f03c0u)                     /* ret        */
+            break;
+
+        if ((a & 0x9f000000u) == 0x90000000u) {   /* adrp Rn, page */
+            int rn = (int)(a & 0x1fu);
+            uint64_t page = adrp_page(apc, a);
+            for (int r = 0; r < 32; r++) {
+                if (!pend[r].live || pend[r].base != rn) continue;
+                uint64_t val = page + pend[r].off;
+                pend[r].live = false;   /* the nearest adrp wins */
+                if (val == want_src) {
+                    out->src_reg = r;
+                    out->src_val = val;
+                }
+                for (int t = 0; t < ntype; t++) {
+                    if (val == type_vas[t]) {
+                        out->type_reg = r;
+                        out->type_val = val;
+                    }
+                }
+            }
+        } else {
+            pending_put(a, pend);
+        }
+
+        int from;
+        if (mov_to_x0(a, &from)) out->x0_from = from;
+        if (mov_to_x2(a, &from)) out->x2_from = from;
+        if (decode_w3_mov(a, &out->w3_acc)) out->w3_seen = true;
+    }
+}
+
 /* Find the single `mount("/dev/fuse", ..., "fuse", ...)` call site. */
 static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     enum { MAXSTR = 64 };
@@ -1556,6 +1689,10 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
 
     if (ns != 1) return -1;
     uint64_t want_src = sstand[0].va;
+
+    /* scan_back() wants the type VAs as a plain array. */
+    uint64_t tvas[MAXSTR];
+    for (int t = 0; t < nt; t++) tvas[t] = tstand[t].va;
 
     /* Sweep executable segments for `bl <stub_va>`. */
     FuseSite found[8];
@@ -1581,68 +1718,16 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
             uint64_t tgt = pc + (uint64_t)(imm << 2);
             if (tgt != stub_va) continue;
 
-            /* Walk back over the straight-line block that sets up the call.
-             *
-             * We track, per register, the last literal it was loaded with, and
-             * the last source register moved into x0/x2. The window closes at
-             * the first CONDITIONAL control-flow instruction: inside a
-             * conditional block the reading is no longer safe (the register
-             * may hold something else on the other path). Unconditional calls
-             * (`bl`) are fine — the real code has a `bl StringPrintf` just
-             * before the address setup, and the argument registers are
-             * re-loaded after it. A `b`/`ret`/`br` ends the window too.
-             *
-             * Not required: x4 == NULL. The handler does not use x4, and
-             * vold builds it with `csel` from an empty std::string (which is
-             * NULL in practice but not a literal `mov x4, xzr`), so demanding
-             * a literal NULL would reject the very site we want. */
-            int src_reg = -1, type_reg = -1;
-            uint64_t src_val = 0, type_val = 0;
-            int x0_from = -1;
-            int x2_from = -1;
-            uint32_t w3_acc = 0;
-            bool w3_seen = false;
-            size_t lo = (k > 32) ? k - 32 : 0;
+            SiteRegs sr;
+            scan_back(w, nw, k, p->p_vaddr, want_src, tvas, nt, &sr);
 
-            for (size_t j = k; j-- > lo; ) {
-                uint32_t a = w[j];
-                uint64_t apc = p->p_vaddr + (uint64_t)j * 4u;
-
-                /* A conditional branch closes the window. */
-                if ((a & 0xff000010u) == 0x54000000u ||   /* b.cond  */
-                    (a & 0x7e000000u) == 0x34000000u ||   /* cbz/cbnz */
-                    (a & 0x7e000000u) == 0x36000000u)     /* tbz/tbnz */
-                    break;
-
-                /* Structure ends: unconditional branch / return. */
-                if ((a & 0x7c000000u) == 0x14000000u ||   /* b (not bl) */
-                    (a & 0xfffffc1fu) == 0xd61f0000u ||   /* br/blr     */
-                    a == 0xd65f03c0u)                     /* ret        */
-                    break;
-
-                /* adrp+add/ldr pairs: j holds adrp, j+1 holds the pair */
-                if (j + 1 < nw) {
-                    int rd; uint64_t val;
-                    if (decode_adrp_pair(a, w[j + 1], apc, &rd, &val)) {
-                        if (val == want_src) { src_reg = rd; src_val = val; }
-                        for (int t = 0; t < nt; t++)
-                            if (val == tstand[t].va) { type_reg = rd; type_val = val; }
-                    }
-                }
-
-                int from;
-                if (mov_to_x0(a, &from)) x0_from = from;
-                if (mov_to_x2(a, &from)) x2_from = from;
-                if (decode_w3_mov(a, &w3_acc)) w3_seen = true;
-            }
-
-            if (src_reg >= 0 && type_reg >= 0 &&
-                x0_from == src_reg && x2_from == type_reg) {
+            if (sr.src_reg >= 0 && sr.type_reg >= 0 &&
+                sr.x0_from == sr.src_reg && sr.x2_from == sr.type_reg) {
                 if (nfound < 8) {
-                    found[nfound].src_va = src_val;
-                    found[nfound].type_va = type_val;
-                    found[nfound].flags = w3_acc;
-                    found[nfound].has_flags = w3_seen;
+                    found[nfound].src_va = sr.src_val;
+                    found[nfound].type_va = sr.type_val;
+                    found[nfound].flags = sr.w3_acc;
+                    found[nfound].has_flags = sr.w3_seen;
                 }
                 nfound++;
             }
@@ -1887,6 +1972,116 @@ static int handlers_fit_selftest(void) {
                         "а find_handler_room ищет 512\n", a_len + b);
         return 1;
     }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * anchor_selftest — the call-site matcher, on a synthetic prologue
+ *
+ * find_fuse_site() decides whether vold can be patched at all: if it finds no
+ * site the tool exits 2 and the FUSE patch is simply not installed. It has been
+ * wrong once, silently, on four releases at the same time (vold 11/12/12L/13
+ * interleave the two adrp/add pairs; the matcher required them adjacent), and
+ * nothing in this file would have noticed — the handler checks all pass, they
+ * just never run.
+ *
+ * The real images cannot be used here: they are not in the tree, and a test
+ * that needs one cannot run on a clean checkout. So the two prologue shapes are
+ * written out as instructions instead. Both must decode to the same call site.
+ * ------------------------------------------------------------------ */
+static int anchor_selftest(void) {
+    /* A page-aligned fake segment, and the two literals inside it. */
+    const uint64_t seg  = 0x10000;
+    const uint64_t srcv = 0x10123;      /* "/dev/fuse" */
+    const uint64_t typev = 0x10456;     /* "fuse"      */
+    const uint64_t stub = 0x20000;      /* where `bl` goes */
+    const uint32_t want_w3 = 0x0200040eu;   /* MS_LAZYTIME | MS_… */
+
+    struct { const char *what; uint32_t w[12]; int n; } cases[2];
+    memset(cases, 0, sizeof(cases));
+
+    /* Shape 1 — adjacent pairs (vold 14/15/16/17). */
+    cases[0].what = "вплотную (14+)";
+    cases[0].n = 8;
+    cases[0].w[0] = enc_adrp(21, seg + 0, srcv);
+    cases[0].w[1] = enc_add_imm(21, 21, (unsigned)(srcv - seg));
+    cases[0].w[2] = enc_adrp(22, seg + 8, typev);
+    cases[0].w[3] = enc_add_imm(22, 22, (unsigned)(typev - seg));
+    cases[0].w[4] = enc_movz_w(3, 0x40eu);
+    cases[0].w[5] = enc_movk_w(3, 0x200u);
+    cases[0].w[6] = enc_mov_reg(0, 21);
+    cases[0].w[7] = enc_mov_reg(2, 22);
+
+    /* Shape 2 — the two pairs interleaved (vold 11/12/12L/13). This is the
+     * shape that used to decode to nothing. */
+    cases[1].what = "вразбивку (11–13)";
+    cases[1].n = 9;
+    cases[1].w[0] = enc_adrp(21, seg + 0, srcv);
+    cases[1].w[1] = enc_adrp(22, seg + 4, typev);
+    cases[1].w[2] = enc_add_imm(21, 21, (unsigned)(srcv - seg));
+    cases[1].w[3] = enc_mov_reg(25, 8);                    /* unrelated filler */
+    cases[1].w[4] = enc_add_imm(22, 22, (unsigned)(typev - seg));
+    cases[1].w[5] = enc_movz_w(3, 0x40eu);
+    cases[1].w[6] = enc_movk_w(3, 0x200u);
+    cases[1].w[7] = enc_mov_reg(0, 21);
+    cases[1].w[8] = enc_mov_reg(2, 22);
+
+    uint64_t tvas[1] = { typev };
+
+    for (int c = 0; c < 2; c++) {
+        uint32_t code[12];
+        memcpy(code, cases[c].w, sizeof(code));
+        size_t npro = (size_t)cases[c].n;
+        /* the `bl` sits one word past the prologue */
+        code[npro] = enc_bl(seg + (uint64_t)npro * 4u, stub);
+
+        SiteRegs sr;
+        scan_back(code, npro + 1, npro, seg, srcv, tvas, 1, &sr);
+
+        if (sr.src_reg != 21 || sr.x0_from != 21) {
+            fprintf(stderr, "anchor FAIL (%s): \"/dev/fuse\" -> x%d (mov из x%d),"
+                            " ждали x21\n", cases[c].what, sr.src_reg, sr.x0_from);
+            return 1;
+        }
+        if (sr.type_reg != 22 || sr.x2_from != 22) {
+            fprintf(stderr, "anchor FAIL (%s): \"fuse\" -> x%d (mov из x%d),"
+                            " ждали x22\n", cases[c].what, sr.type_reg, sr.x2_from);
+            return 1;
+        }
+        if (sr.src_val != srcv || sr.type_val != typev) {
+            fprintf(stderr, "anchor FAIL (%s): литералы %#llx/%#llx,"
+                            " ждали %#llx/%#llx\n", cases[c].what,
+                    (unsigned long long)sr.src_val,
+                    (unsigned long long)sr.type_val,
+                    (unsigned long long)srcv, (unsigned long long)typev);
+            return 1;
+        }
+        if (!sr.w3_seen || sr.w3_acc != want_w3) {
+            fprintf(stderr, "anchor FAIL (%s): флаги %#x (seen %d), ждали %#x\n",
+                    cases[c].what, sr.w3_acc, (int)sr.w3_seen, want_w3);
+            return 1;
+        }
+    }
+
+    /* And the negative: a prologue that builds neither literal must decode to
+     * nothing. Without this, "returns a site" could be satisfied by a matcher
+     * that simply returns the first registers it sees. */
+    {
+        uint32_t code[4];
+        code[0] = enc_adrp(21, seg + 0, seg + 0x800);
+        code[1] = enc_add_imm(21, 21, 0x40);
+        code[2] = enc_mov_reg(0, 21);
+        code[3] = enc_bl(seg + 12, stub);
+        SiteRegs sr;
+        scan_back(code, 4, 3, seg, srcv, tvas, 1, &sr);
+        if (sr.src_reg >= 0 || sr.type_reg >= 0) {
+            fprintf(stderr, "anchor FAIL: чужой литерал распознан как место"
+                            " вызова (src x%d, type x%d)\n",
+                    sr.src_reg, sr.type_reg);
+            return 1;
+        }
+    }
+
     return 0;
 }
 
@@ -2162,6 +2357,7 @@ static int selftest(void) {
         }
     }
 
+    if (anchor_selftest() != 0) return 1;
     if (handlers_fit_selftest() != 0) return 1;
     if (umount_handler_exec_selftest() != 0) return 1;
 

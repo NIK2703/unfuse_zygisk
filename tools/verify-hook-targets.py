@@ -54,6 +54,12 @@ BTYPE=call, а переход не через x16/x17 — с BTYPE=jump, кот�
 
 Код возврата: 0 — все цели пригодны или покрыты; 1 — есть непокрытая цель;
 2 — ошибка разбора.
+
+Образ не AArch64 (armeabi-v7a) — это код 1, а не 0: правка входа в libc для
+этой ABI не реализована (patch_entry() в src/hook_libc.cpp возвращает false),
+поэтому ни одна цель на нём не патчится. Строка «не AArch64» в таблице была и
+раньше, но итог и код возврата оставались нулевыми, то есть скрипт, читающий
+код, видел зелёный свет там, где не покрыто ничего.
 """
 
 import argparse
@@ -534,6 +540,13 @@ def analyse(elf, arch64=True):
             notes.append("не AArch64 — правка входа не реализована")
             row["verdict"] = "skip"
             rows.append(_finish(row, notes))
+            # Every target is uncovered here, not merely absent: patch_entry()
+            # is compiled out for this ABI (src/hook_libc.cpp returns false), so
+            # nothing on this image can be patched by this module. Reporting
+            # that as a pass would be a false green — the per-line note is not
+            # enough, because the summary and the exit code are what a script
+            # reads. See report() for the same statement at file level.
+            bad = True
             continue
 
         if s.type == STT_GNU_IFUNC:
@@ -683,6 +696,18 @@ def report(path, elf, rows, roots, addr_name, collisions, bad, patched, tool,
     print("итог: ok=%d  пропущено=%d  нельзя=%d" % (n_ok, n_skip, n_bad))
     print("корней патчится: %d — %s"
           % (len(roots), ", ".join(sorted(addr_name.values()))))
+
+    if elf.machine != MACHINE_AARCH64:
+        # A file-level statement, not a per-line note: this image cannot be
+        # patched by this module at all, so "ok=0" here is a finding, and the
+        # exit code says so (see analyse()).
+        print()
+        print("ЭТОТ ОБРАЗ НЕ AArch64 (%s): правка входа в libc для этой ABI не"
+              % elf.machine_name())
+        print("реализована — patch_entry() в src/hook_libc.cpp для неё возвращает")
+        print("false, то есть ни одна из %d целей не патчится. Модуль собирается и"
+              % len(rows))
+        print("для armeabi-v7a, так что это пробел в покрытии ABI, а не ошибка образа.")
 
     if collisions:
         print("НАЛОЖЕНИЕ патчей (ближе %d байт):" % PATCH_SIZE)
