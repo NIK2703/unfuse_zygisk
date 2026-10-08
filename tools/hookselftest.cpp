@@ -9,8 +9,12 @@
  *   4. .plt thunk coverage works: creat, mkstemp(s), mkdtemp are not patched
  *      (shorter than the patch) but get the coerced mode via .plt to the patched
  *      root — empirical proof of the preflight coverage claim;
- *   5. paths outside storage are untouched: 0600 stays 0600;
- *   6. a narrow-mode file is really openable by ANOTHER uid: the process drops to
+ *   5. every patched root is CALLED, not merely rewritten: openat with a dirfd,
+ *      __open_2/__openat_2, fchmod(fd), linkat-in. The other sections reach
+ *      their handlers only through a wrapper (open, mkdir, chmod, rename) or
+ *      not at all, so without this the entry bytes are the only coverage;
+ *   6. paths outside storage are untouched: 0600 stays 0600;
+ *   7. a narrow-mode file is really openable by ANOTHER uid: the process drops to
  *      app rights (uid 10398, group 9997) and opens it — the whole point.
  * Run (on device, as root): /data/local/tmp/hookselftest
  */
@@ -276,6 +280,24 @@ void test_thunk_coverage() {
     printf("  mkstemps()      -> %03o\n", m3);
     check((m3 & 0777) == 0660, "mkstemps() покрыт через mktemp_internal -> open@plt");
 
+    char tmpl4[] = "/data/media/0/.hooktest/mkostempXXXXXX";
+    const int fdo1 = mkostemp(tmpl4, O_CLOEXEC);
+    if (fdo1 < 0) printf("      mkostemp -> %s\n", strerror(errno));
+    else close(fdo1);
+    remember(tmpl4);
+    const mode_t mo1 = mode_of(tmpl4);
+    printf("  mkostemp()      -> %03o\n", mo1);
+    check((mo1 & 0777) == 0660, "mkostemp() покрыт через mktemp_internal -> open@plt");
+
+    char tmpl5[] = "/data/media/0/.hooktest/mkostempsXXXXXX.txt";
+    const int fdo2 = mkostemps(tmpl5, 4, O_CLOEXEC);
+    if (fdo2 < 0) printf("      mkostemps -> %s\n", strerror(errno));
+    else close(fdo2);
+    remember(tmpl5);
+    const mode_t mo2 = mode_of(tmpl5);
+    printf("  mkostemps()     -> %03o\n", mo2);
+    check((mo2 & 0777) == 0660, "mkostemps() покрыт через mktemp_internal -> open@plt");
+
     // mkdtemp is a directory: mktemp_internal -> mkdir@plt.
     char tmpl3[] = "/data/media/0/.hooktest/mkdtempXXXXXX";
     char *d = mkdtemp(tmpl3);
@@ -366,8 +388,108 @@ void test_no_inherit() {
           "хук дописал ACL с группой 9997 без наследования");
 }
 
+// The roots below are patched but reached by no wrapper used in sections 3-4:
+// openat via dirfd (h_open always passes AT_FDCWD), the fortify pair, fchmod
+// (chmod goes through fchmodat) and linkat. Without this section their entry
+// bytes — checked in section 2 — are their only coverage.
+void test_roots_direct() {
+    printf("\n== 7. Каждый пропатченный корень вызван напрямую ==\n");
+
+    // openat with a dirfd and a relative name: the dirfd branch of is_storage(),
+    // which h_open (AT_FDCWD) never takes.
+    const int dfd = open("/data/media/0/.hooktest", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        printf("      open(каталог) -> %s\n", strerror(errno));
+        check(false, "openat: открыть каталог");
+    } else {
+        const char *full = "/data/media/0/.hooktest/openat0600";
+        unlinkat(dfd, "openat0600", 0);
+        const int fd = openat(dfd, "openat0600", O_CREAT | O_TRUNC | O_RDWR, 0600);
+        if (fd < 0) printf("      openat -> %s\n", strerror(errno));
+        else close(fd);
+        remember(full);
+        const mode_t m = mode_of(full);
+        printf("  openat(dirfd, 0600) -> %03o\n", m);
+        check((m & 0777) == 0660, "openat(относительно dirfd, 0600) даёт 0660");
+        check(has_group_9997(full), "openat дописывает ACL с группой 9997");
+        close(dfd);
+    }
+
+    // The fortify pair takes no mode argument. Reached through dlsym, which is
+    // also how an indirect call to the patched entry (bti jc landing pad) is
+    // exercised. O_CREAT is the branch hook_libc.cpp singles out: bionic's own
+    // __open_2 would abort on it.
+    typedef int (*open2_t)(const char *, int);
+    typedef int (*openat2_t)(int, const char *, int);
+    const auto open_2 = reinterpret_cast<open2_t>(dlsym(RTLD_DEFAULT, "__open_2"));
+    const auto openat_2 = reinterpret_cast<openat2_t>(dlsym(RTLD_DEFAULT, "__openat_2"));
+
+    if (open_2 == nullptr) {
+        printf("  __open_2: нет символа — хук пропущен\n");
+    } else {
+        const char *p = "/data/media/0/.hooktest/open2_0600";
+        const int fd = open_2(p, O_CREAT | O_TRUNC | O_RDWR);
+        if (fd < 0) printf("      __open_2 -> %s\n", strerror(errno));
+        else close(fd);
+        remember(p);
+        const mode_t m = mode_of(p);
+        printf("  __open_2(O_CREAT)   -> %03o\n", m);
+        check((m & 0777) == 0660, "__open_2(O_CREAT) даёт 0660");
+        check(has_group_9997(p), "__open_2 дописывает ACL с группой 9997");
+    }
+
+    if (openat_2 == nullptr) {
+        printf("  __openat_2: нет символа — хук пропущен\n");
+    } else {
+        const char *p = "/data/media/0/.hooktest/openat2_0600";
+        const int fd = openat_2(AT_FDCWD, p, O_CREAT | O_TRUNC | O_RDWR);
+        if (fd < 0) printf("      __openat_2 -> %s\n", strerror(errno));
+        else close(fd);
+        remember(p);
+        const mode_t m = mode_of(p);
+        printf("  __openat_2(O_CREAT) -> %03o\n", m);
+        check((m & 0777) == 0660, "__openat_2(O_CREAT) даёт 0660");
+        check(has_group_9997(p), "__openat_2 дописывает ACL с группой 9997");
+    }
+
+    // fchmod on a descriptor already held: the fd_is_storage path.
+    const char *pf = "/data/media/0/.hooktest/fchmod0600";
+    const int ffd = open(pf, O_CREAT | O_TRUNC | O_RDWR, 0660);
+    if (ffd < 0) {
+        printf("      open -> %s\n", strerror(errno));
+        check(false, "fchmod: подготовить файл");
+    } else {
+        if (fchmod(ffd, 0600) != 0) printf("      fchmod -> %s\n", strerror(errno));
+        close(ffd);
+        const mode_t m = mode_of(pf);
+        printf("  fchmod(fd, 0600)    -> %03o\n", m);
+        check((m & 0777) == 0660, "fchmod(fd, 0600) не сужает режим");
+    }
+    remember(pf);
+
+    // linkat into storage from outside: the same fix_after_move as rename-in,
+    // but reached through linkat, which nothing else calls.
+    const char *lsrc = "/data/local/tmp/.hooktest_link_src";
+    const char *ldst = "/data/media/0/.hooktest/linked0600";
+    unlink(lsrc);
+    unlink(ldst);
+    const int lfd = open(lsrc, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (lfd >= 0) close(lfd);
+    remember(ldst);
+    if (linkat(AT_FDCWD, lsrc, AT_FDCWD, ldst, 0) != 0) {
+        printf("      linkat -> %s\n", strerror(errno));
+        check(false, "linkat: перенос в хранилище");
+    } else {
+        const mode_t m = mode_of(ldst);
+        printf("  linkat(в хранилище) -> %03o\n", m);
+        check((m & 0777) == 0660, "linkat-in даёт 0660");
+        check(has_group_9997(ldst), "linkat-in дописывает ACL с группой 9997");
+    }
+    unlink(lsrc);
+}
+
 void test_non_storage() {
-    printf("\n== 7. Гейт путей и поведение вне хранилища ==\n");
+    printf("\n== 8. Гейт путей и поведение вне хранилища ==\n");
 
     check(hooks_path_is_storage("/storage/emulated/0/Download/x") == 1,
           "гейт: /storage/emulated/... — хранилище");
@@ -409,7 +531,7 @@ void drop_to_app() {
 }
 
 void test_other_uid() {
-    printf("\n== 8. Доступ ДРУГОГО uid к созданному с узким режимом ==\n");
+    printf("\n== 9. Доступ ДРУГОГО uid к созданному с узким режимом ==\n");
 
     const char *paths[] = {
         "/data/media/0/.hooktest/open0600",
@@ -417,6 +539,11 @@ void test_other_uid() {
         "/data/media/0/.hooktest/chmod0600",
         "/data/media/0/.hooktest/renamed_in",
         "/data/media/0/.hooktest/nodflt/child0600",
+        "/data/media/0/.hooktest/openat0600",
+        "/data/media/0/.hooktest/open2_0600",
+        "/data/media/0/.hooktest/openat2_0600",
+        "/data/media/0/.hooktest/fchmod0600",
+        "/data/media/0/.hooktest/linked0600",
     };
 
     drop_to_app();
@@ -433,7 +560,7 @@ void test_other_uid() {
 }
 
 void cleanup() {
-    printf("\n== 9. Уборка (уже из-под прав приложения) ==\n");
+    printf("\n== 10. Уборка (уже из-под прав приложения) ==\n");
     for (int i = g_created_n - 1; i >= 0; i--) {
         if (unlink(g_created[i]) != 0 && errno != ENOENT && errno != EISDIR) {
             printf("  удалить %s: %s\n", g_created[i], strerror(errno));
@@ -630,6 +757,7 @@ int main(int argc, char **argv) {
     test_thunk_coverage();
     test_rename_in();
     test_no_inherit();
+    test_roots_direct();
     test_non_storage();
 
     printf("\n== Итог до сброса прав: успешно %d, провалено %d ==\n", g_pass, g_fail);

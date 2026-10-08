@@ -247,15 +247,10 @@ CFLAGS=(
     -Wall
     -Wextra
     -Wno-unused-parameter
-    # Only vold-noacl.c includes android_ver.h — the release table, whose two
-    # columns are its own: the AOSP site that writes the default ACL, and the
-    # libc target count the Zygisk module compares against. vold-fusefs.c and
-    # storage-fix.c do not include it, and an unused -I costs them nothing.
-    # The two patchers also include tools/vold-common.h, the ELF-reading half
-    # they share. A quoted include resolves next to the including file, so that
-    # one needs no -I at all.
-    # Translated because the compiler is a Windows binary under MSYS.
-    -I"$(hostpath "$HERE/src")"
+    # No -I: the two patchers include tools/vold-common.h, and a quoted include
+    # resolves next to the including file. android_ver.h is not included here at
+    # all — only src/hook_libc.cpp uses it, and the module's own CXXFLAGS carry
+    # the -I for it.
 )
 
 # --------------------------------------------------------------- build
