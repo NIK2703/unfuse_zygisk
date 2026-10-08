@@ -347,7 +347,12 @@
  * module's own scripts only ever ask --check and treat non-zero as "not
  * patched", so adding codes is safe. */
 #define EXIT_AN_NO_SRC_STR   5   /* no "/dev/fuse" literal in the image       */
-#define EXIT_AN_NO_TYPE_STR  6   /* no "fuse" literal                         */
+#define EXIT_AN_NO_TYPE_STR  6   /* no "fuse" literal — UNREACHABLE while
+                                  * FUSE_TYPE is a substring of FUSE_SRC:
+                                  * every "/dev/fuse\0" match CONTAINS "fuse\0"
+                                  * at +5, so nsrc > 0 forces ntype > 0. Kept as
+                                  * a guard for a future change of either
+                                  * constant; not a diagnosis you can hit. */
 #define EXIT_AN_SRC_AMBIG    7   /* "/dev/fuse" is not exactly one standalone
                                   * string — the anchor cannot pick one       */
 #define EXIT_AN_NO_SITE      8   /* no `bl mount@plt` builds src/type into
@@ -1787,6 +1792,11 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out) {
     int nsrc = find_strings(s, FUSE_SRC, srcs, MAXSTR);
     int ntype = find_strings(s, FUSE_TYPE, types, MAXSTR);
     if (nsrc == 0) return -1;
+    /* Unreachable today, and provably so: FUSE_TYPE ("fuse") is a substring of
+     * FUSE_SRC ("/dev/fuse"), so any image that got past the line above already
+     * contains a "fuse" literal. Verified on all 8 images: each "/dev/fuse\0"
+     * match contains "fuse\0" at +5. The check stays because it is what would
+     * catch FUSE_TYPE ceasing to be a substring — it is a guard, not a reason. */
     if (ntype == 0) return -2;
 
     /* Keep only standalone occurrences. */
