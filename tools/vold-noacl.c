@@ -167,8 +167,9 @@ static bool looks_patched(const uint8_t *p) {
     memcpy(&w3, p + 12, 4);
 
     /* Redirected to an absolute handler address; the quad at +8 is the handler
-     * and is not part of the shape. */
-    if (w0 == 0x58000051u && w1 == 0xd61f0220u) return true;
+     * and is not part of the shape. The two words come from vold-common.h, so
+     * this reader cannot drift from the writer in vold-fusefs.c. */
+    if (w0 == STUB_PATCH_W0 && w1 == STUB_PATCH_W1) return true;
 
     if (w0 != PATCH_MOV0 || w1 != PATCH_RET) return false;
     if ((w2 & 0xffc00000u) != 0x91000000u) return false;
@@ -337,35 +338,7 @@ static bool is_address_taken(Src *s, const Dyn *d, uint32_t sym_index) {
     return found;
 }
 
-/* .plt layout: for every relocation whose stub was found, C = va - 16*i must be
- * identical. Returns C/16 or -1. */
-static int plt_delta(const Stubs *st, const Elf64_Rela *rel, size_t nrel) {
-    bool have = false;
-    int64_t delta = 0;
-    for (size_t i = 0; i < nrel; i++) {
-        int hits = 0;
-        uint64_t va = stubs_lookup(st, rel[i].r_offset, &hits);
-        if (hits != 1) continue;
-        int64_t d = ((int64_t)va - (int64_t)i * 16) / 16;
-        if (!have) {
-            delta = d;
-            have = true;
-        } else if (d != delta) {
-            warn("раскладка .plt нелинейна (релокация %zu даёт %lld, "
-                 "ожидалось %lld) — отказываюсь", i, (long long)d,
-                 (long long)delta);
-            return -1;
-        }
-    }
-    if (!have) {
-        warn("не нашлось ни одной пары «релокация -> трамплин»: "
-             "раскладку .plt вывести не из чего");
-        return -1;
-    }
-    return (int)delta;
-}
-
-static int resolve(Src *s, Resolved *r, bool want_call_sites) {
+static int resolve(Src *s, Resolved *r) {
     memset(r, 0, sizeof(*r));
     r->reloc_index = -1;
     r->plt_delta = -1;
@@ -409,7 +382,7 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
     }
 
     /* 3. .plt layout from foreign pairs — works even when the symbol's own ldr is gone. */
-    r->plt_delta = plt_delta(&st, rel, nrel);
+    r->plt_delta = plt_layout_delta(st.va, st.target, st.n, rel, nrel);
     free(rel);
     if (r->plt_delta < 0) {
         stubs_free(&st);
@@ -448,20 +421,18 @@ static int resolve(Src *s, Resolved *r, bool want_call_sites) {
         }
     }
 
-    if (want_call_sites) {
-        r->call_sites = count_call_sites(s, r->stub_va);
+    r->call_sites = count_call_sites(s, r->stub_va);
 
-        /* The patch's PREMISE, not the layout: it only makes sense because vold calls
-         * setxattr once, from SetDefaultAcl. 0 calls would report success changing
-         * nothing; >1 would also break unrelated code — both refuse. Works on an
-         * already-patched vold: `bl` in .text is untouched, only the stub's `ldr` is gone. */
-        if (r->call_sites != 1) {
-            warn("%s: \"%s\" вызывается %d раз(а), а ожидался ровно один — "
-                 "отказываюсь (патч рассчитан на единственный вызов из "
-                 "SetDefaultAcl)", s->label, TARGET_SYM, r->call_sites);
-            stubs_free(&st);
-            return EXIT_NO_RESOLVE;
-        }
+    /* The patch's PREMISE, not the layout: it only makes sense because vold calls
+     * setxattr once, from SetDefaultAcl. 0 calls would report success changing
+     * nothing; >1 would also break unrelated code — both refuse. Works on an
+     * already-patched vold: `bl` in .text is untouched, only the stub's `ldr` is gone. */
+    if (r->call_sites != 1) {
+        warn("%s: \"%s\" вызывается %d раз(а), а ожидался ровно один — "
+             "отказываюсь (патч рассчитан на единственный вызов из "
+             "SetDefaultAcl)", s->label, TARGET_SYM, r->call_sites);
+        stubs_free(&st);
+        return EXIT_NO_RESOLVE;
     }
     stubs_free(&st);
     return EXIT_OK;
@@ -601,7 +572,7 @@ int main(int argc, char **argv) {
             rc = selftest(&s);
         } else {
             Resolved r;
-            rc = resolve(&s, &r, true);
+            rc = resolve(&s, &r);
             if (rc == EXIT_OK) {
                 info("%s: %s -> dynsym[%u], .rela.plt[%d], GOT 0x%llx, "
                      "трамплин 0x%llx (сдвиг раскладки %d), вызовов %d%s",
@@ -722,7 +693,7 @@ int main(int argc, char **argv) {
     }
 
     Resolved r;
-    int rc = resolve(&s, &r, true);
+    int rc = resolve(&s, &r);
     if (rc != EXIT_OK) {
         src_close(&s);
         return rc;

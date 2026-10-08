@@ -1,5 +1,6 @@
 /*
- * storage-fix — permissions on the raw /data/media tree for kernels without sdcardfs.
+ * storage-fix — permissions on the raw /data/media tree when sdcardfs is not the
+ *               one handing them out.
  *
  * sdcardfs synthesises rights: from the mount's mask/gid it gives any process in
  * group 9997 (AID_EVERYBODY) 0770 dirs and 0660 files regardless of the lower FS.

@@ -272,8 +272,8 @@ public:
 
         // Now specialised: this is app code, with its rights and namespace. The
         // libc patch cannot leak from here, unlike from preAppSpecialize.
-        int total = 0;
-        const int installed = hooks_install(&total);
+        // The attempts count is not wanted here — hookselftest.cpp is what reads it.
+        const int installed = hooks_install(nullptr);
 
         if (!log_once_) return;
 

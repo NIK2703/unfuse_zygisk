@@ -14,7 +14,9 @@
 // are skipped). Repeat calls are no-ops.
 int hooks_install(int *total);
 
-// Report like "open=ok open64=alias renameat2=skip ..." — for the self-test.
+// Report like "open=ok open64=alias renameat=коротка ..." — one token per entry
+// of kHooks[], in order; the labels are ok/alias/нет/СБОЙ/переходник/коротка/
+// размер?. For the self-test.
 void hooks_report(char *buf, size_t len);
 
 // Writes the Android release the hooks ran on ("android 17 (sdk 37,

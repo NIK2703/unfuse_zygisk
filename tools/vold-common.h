@@ -16,6 +16,18 @@
  * different process, through a different mechanism (in-memory function entries,
  * not ELF tables).
  *
+ * Two things that are not the "reading" half but are shared all the same, and
+ * are here for the same reason:
+ *
+ *   - plt_layout_delta(): the .plt layout constant C, derived from relocation
+ *     and trampoline pairs. Both patchers need it, it depends on nothing but
+ *     the two tables, and by 2026-10-08 it existed twice — down to the wording
+ *     of its refusals.
+ *   - STUB_PATCH_W0/W1: the 16-byte patch vold-fusefs writes over a trampoline.
+ *     vold-noacl has to recognise that same shape, or its --selftest reports a
+ *     redirected trampoline as "JUMP_SLOT without a trampoline" and lies about
+ *     the mapping. One definition, two readers.
+ *
  * Everything here is `static`: this is a header included by two single-file
  * programs, not a library, and nothing in it should acquire a symbol in either
  * binary.
@@ -68,6 +80,16 @@
 /* Defined by each tool, with its own name as the prefix. */
 static void info(const char *fmt, ...);
 static void warn(const char *fmt, ...);
+
+/* The 16-byte trampoline patch vold-fusefs installs, as its two instruction
+ * words: `ldr x17,#8` (which therefore reads the quad at +8) and `br x17`. The
+ * quad at +8 is the handler address and is not part of the shape.
+ *
+ * vold-noacl reads the same two words in looks_patched(), so a vold carrying
+ * both patches still counts right. The words live here rather than in
+ * vold-fusefs.c so the writer and the reader cannot drift. */
+#define STUB_PATCH_W0 0x58000051u   /* ldr x17, #8 */
+#define STUB_PATCH_W1 0xd61f0220u   /* br  x17     */
 
 static int read_all(const char *path, void *buf, size_t len, size_t *got) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -268,6 +290,45 @@ static int load_relocs(Src *s, const Dyn *d, Elf64_Rela **out, size_t *nout) {
     *out = rel;
     *nout = n;
     return 0;
+}
+
+/* The .plt layout constant, from foreign pairs: for any relocation whose stub
+ * was found, C = va - 16*i must be the same number — that is what "the stubs are
+ * 16-byte spaced and in relocation order" means, and it is what lets a patched
+ * trampoline (whose own `ldr` is gone, so it can no longer be matched by GOT
+ * slot) still be located on a later run. Returns C/16, or -1 if the pairs
+ * disagree or there are none.
+ *
+ * Takes the two parallel arrays rather than either tool's own container: both
+ * hold (va, target) pairs, and this reads nothing else. */
+static int plt_layout_delta(const uint64_t *stub_va, const uint64_t *stub_target,
+                            size_t nstubs, const Elf64_Rela *rel, size_t nrel) {
+    bool have = false;
+    int64_t delta = 0;
+    for (size_t i = 0; i < nrel; i++) {
+        int hits = 0;
+        uint64_t va = 0;
+        for (size_t j = 0; j < nstubs; j++) {
+            if (stub_target[j] == rel[i].r_offset) { va = stub_va[j]; hits++; }
+        }
+        if (hits != 1) continue;
+        int64_t d = ((int64_t)va - (int64_t)i * 16) / 16;
+        if (!have) {
+            delta = d;
+            have = true;
+        } else if (d != delta) {
+            warn("раскладка .plt нелинейна (релокация %zu даёт %lld, "
+                 "ожидалось %lld) — отказываюсь", i, (long long)d,
+                 (long long)delta);
+            return -1;
+        }
+    }
+    if (!have) {
+        warn("не нашлось ни одной пары «релокация -> трамплин»: "
+             "раскладку .plt вывести не из чего");
+        return -1;
+    }
+    return (int)delta;
 }
 
 static int sym_name(Src *s, const Dyn *d, uint32_t idx, char *out, size_t outlen) {

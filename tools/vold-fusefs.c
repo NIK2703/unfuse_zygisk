@@ -392,8 +392,8 @@ static void warn(const char *fmt, ...) {
 #define STUB_PATCH_LEN 16
 static void build_stub_patch(uint8_t out[STUB_PATCH_LEN], uint64_t handler_va) {
     uint32_t w[2];
-    w[0] = 0x58000051u;                     /* ldr x17, #8  (reads stub+8) */
-    w[1] = 0xd61f0220u;                     /* br  x17                     */
+    w[0] = STUB_PATCH_W0;                   /* ldr x17, #8  (reads stub+8) */
+    w[1] = STUB_PATCH_W1;                   /* br  x17                     */
     memcpy(out + 0, &w[0], 4);
     memcpy(out + 4, &w[1], 4);
     memcpy(out + 8, &handler_va, 8);        /* +8..+15 — fits, nothing spilled */
@@ -403,7 +403,7 @@ static bool stub_is_patched(const uint8_t *p) {
     uint32_t w0, w1;
     memcpy(&w0, p + 0, 4);
     memcpy(&w1, p + 4, 4);
-    return w0 == 0x58000051u && w1 == 0xd61f0220u;
+    return w0 == STUB_PATCH_W0 && w1 == STUB_PATCH_W1;
 }
 
 /* Where the patch's `ldr x17,#imm` will read its literal from, as a byte offset
@@ -1296,36 +1296,6 @@ out:
 }
 #endif  /* __aarch64__ */
 
-/* .plt layout: C = va - 16*i must be constant across foreign pairs. */
-static int plt_delta_emit(const uint64_t *stub_va, const uint64_t *stub_target,
-                          size_t nstubs, const Elf64_Rela *rel, size_t nrel) {
-    bool have = false;
-    int64_t delta = 0;
-    for (size_t i = 0; i < nrel; i++) {
-        int hits = 0;
-        uint64_t va = 0;
-        for (size_t j = 0; j < nstubs; j++) {
-            if (stub_target[j] == rel[i].r_offset) { va = stub_va[j]; hits++; }
-        }
-        if (hits != 1) continue;
-        int64_t d = ((int64_t)va - (int64_t)i * 16) / 16;
-        if (!have) {
-            delta = d;
-            have = true;
-        } else if (d != delta) {
-            warn("раскладка .plt нелинейна (релокация %zu даёт %lld, "
-                 "ожидалось %lld) — отказываюсь", i, (long long)d,
-                 (long long)delta);
-            return -1;
-        }
-    }
-    if (!have) {
-        warn("не нашлось ни одной пары «релокация -> трамплин»");
-        return -1;
-    }
-    return (int)delta;
-}
-
 /* Locate the PLT stub for one imported symbol.
  *
  * `sym` is the symbol name to look up in .rela.plt; the two the module needs
@@ -1404,7 +1374,7 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
         free(buf);
     }
 
-    r->plt_delta = plt_delta_emit(stub_va, stub_tg, nstubs, rel, nrel);
+    r->plt_delta = plt_layout_delta(stub_va, stub_tg, nstubs, rel, nrel);
     if (r->plt_delta < 0) {
         free(stub_va); free(stub_tg); free(rel);
         return EXIT_NO_RESOLVE;
@@ -1704,7 +1674,6 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
             int x2_from = -1;
             uint32_t w3_acc = 0;
             bool w3_seen = false;
-            bool saw_call = false;
             size_t lo = (k > 32) ? k - 32 : 0;
 
             for (size_t j = k; j-- > lo; ) {
@@ -1723,10 +1692,6 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
                     a == 0xd65f03c0u)                     /* ret        */
                     break;
 
-                /* A `bl` is allowed: remember that the block is not "pure",
-                 * but do not stop on it. */
-                if ((a & 0xfc000000u) == 0x94000000u) saw_call = true;
-
                 /* adrp+add/ldr pairs: j holds adrp, j+1 holds the pair */
                 if (j + 1 < nw) {
                     int rd; uint64_t val;
@@ -1743,7 +1708,6 @@ static int find_fuse_site(Src *s, uint64_t stub_va, FuseSite *out,
                 if (decode_w3_mov(a, &w3_acc)) w3_seen = true;
             }
 
-            (void)saw_call;
             if (src_reg >= 0 && type_reg >= 0 &&
                 x0_from == src_reg && x2_from == type_reg) {
                 if (nfound < 8) {
@@ -2832,10 +2796,8 @@ resolved_as_file:
     bool handler_in_mapping = false;
     {
         uint64_t off = 0;
-        bool found = false;
         if (find_handler_room(&s, hm.res.stub_va, &off) == 0) {
             handler_abs = s.base + off;
-            found = true;
         }
 #if defined(__aarch64__)
         else {
@@ -2857,7 +2819,6 @@ resolved_as_file:
                 return EXIT_NO_RESOLVE;
             }
             handler_in_mapping = true;
-            found = true;
             info("%s: в .plt места нет — взял исполняемую страницу из %s"
                  " (0x%llx)", s.label, self, (unsigned long long)handler_abs);
         }
@@ -2869,10 +2830,6 @@ resolved_as_file:
             return EXIT_NO_RESOLVE;
         }
 #endif
-        if (!found) {
-            src_close(&s);
-            return EXIT_NO_RESOLVE;
-        }
     }
 
     /* Both handlers share the one zero run, laid out back to back: the mount

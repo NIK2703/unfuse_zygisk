@@ -18,8 +18,10 @@
 #
 # The third has to happen before vold prepares the user's storage rather than
 # after: tools/vold-fusefs is pointed at vold to redirect its mount()
-# trampoline, so the FUSE mount for emulated storage is turned into a bind of the
-# raw tree instead of being made at all.
+# trampoline, so MountUserFuse() ends with a bind of the raw /data/media tree
+# stacked on top of the FUSE mount it asked for. The FUSE mount is still made —
+# its fd is part of the contract with MediaProvider's daemon — but nothing
+# reaches it, because the bind is the topmost mount at the path.
 #
 
 MODDIR=${MODDIR:-${0%/*}}
