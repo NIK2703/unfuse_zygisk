@@ -14,6 +14,9 @@
  * The patch is 20 bytes with a leading bti jc — see patch_entry; -1 from
  * hooks_bti_report when libc declares BTI but the module was built without it.
  *
+ * A patched entry can be taken away by another in-process patcher (the GCam port
+ * does exactly that) — see "сторож входа" below, which puts it back.
+ *
  * The root COUNT is measured, not assumed: hookselftest.cpp on the device and
  * tools/verify-hook-targets.py device/libc/libc-arm64.so statically;
  * android_ver.h names the releases and hooks_release() reports any that comes
@@ -39,6 +42,7 @@
 
 #include <dlfcn.h>
 #include <link.h>  // dl_iterate_phdr, ElfW: the branch-protection preflight
+#include <pthread.h>
 
 namespace {
 
@@ -567,6 +571,88 @@ bool g_ver_ready = false;
 void *g_patched[kHookCount];
 int g_patched_n = 0;
 
+// What the guard below re-checks: entry and the handler its literal must hold.
+struct Guarded {
+    void *entry;
+    void *handler;
+};
+Guarded g_guarded[kHookCount];
+int g_guarded_n = 0;
+
+// --- Сторож входа -----------------------------------------------------------
+//
+// Свой патч может снести чужой: порт GCam (com.android.MGC_9_7_047) достаёт из
+// ассетов codec_*.lck и dlopen-ит их; внутри лежит собственный патчер кода,
+// который тоже закрывает входы open/openat. Root ему не нужен — правится своё
+// адресное пространство, как и нам под uid приложения.
+//
+// Он замечает чужой переходник на входе и строит свой трамплин, который ЧИТАЕТ
+// указатель по entry+12 и прыгает по нему. Но entry+12 — это середина его же
+// собственного 16-байтного переходника (литерал по entry+8), и он затирает наши
+// полслова своим старшим. Выходит 0x0000002d00000075: младшие 32 бита чужие
+// (0x00000075), выравнивания нет -> br x17 ловит BUS_ADRALN и приложение падает.
+// На устройстве: чужой патч на ~432 мс от запуска, падение ещё через ~35 мс; с
+// выключенными хуками (флаг no_hooks) порт патчит чистое место, трамплина не
+// строит, и ничего не падает.
+//
+// Проверено подстановкой форм прямо в живой процесс (форма порта, форма модуля,
+// bti jc заменён на nop, литерал сдвинут на +16) — падает ЛЮБАЯ: порт считает
+// чужим хуком любой переходник на входе, а не конкретно наш.
+//
+// Значит, дело не в форме патча, а в том, кто первый: надо вернуть свой
+// переходник, пока чужой трамплин не пущен в ход. Вернув его, мы кладём по
+// entry+12 адрес обработчика — и чужой трамплин попадает в него, а не в мусор,
+// так что даже повторный патч порта процесс не роняет.
+//
+// Опрос дешёвый (12 входов по три слова) и по времени ограничен: частый — первые
+// три секунды, дальше редкий, чтобы поймать и ленивый патчер, не жгя процессор.
+#if defined(__aarch64__)
+
+constexpr unsigned kGuardFastSteps = 30000;  // 30000 * 100 мкс = 3 с
+constexpr unsigned kGuardFastUs = 100;
+constexpr unsigned kGuardSlowUs = 100000;
+
+bool stub_intact(const Guarded &g) {
+    const volatile uint32_t *w = static_cast<const volatile uint32_t *>(g.entry);
+    if (w[0] != kBitJc || w[1] != kLdrX17 || w[2] != kBrX17) return false;
+
+    // Литерал читаем как есть: он по entry+12, то есть выровнен по 4, а не по 8.
+    const volatile uint64_t *lit =
+        reinterpret_cast<const volatile uint64_t *>(static_cast<const char *>(g.entry) + 12);
+    return *lit == reinterpret_cast<uint64_t>(g.handler);
+}
+
+void *guard_main(void *) {
+    for (unsigned step = 0;; step++) {
+        for (int i = 0; i < g_guarded_n; i++) {
+            if (!stub_intact(g_guarded[i])) {
+                patch_entry(g_guarded[i].entry, g_guarded[i].handler);
+            }
+        }
+        usleep(step < kGuardFastSteps ? kGuardFastUs : kGuardSlowUs);
+    }
+    return nullptr;
+}
+
+void guard_start() {
+    if (g_guarded_n == 0) return;
+
+    pthread_attr_t at;
+    if (pthread_attr_init(&at) != 0) return;
+    pthread_attr_setstacksize(&at, 64 * 1024);
+
+    pthread_t t;
+    if (pthread_create(&t, &at, guard_main, nullptr) == 0) pthread_detach(t);
+    pthread_attr_destroy(&at);
+}
+
+#else
+
+// На v7a переходников нет вовсе, сторожить нечего.
+void guard_start() {}
+
+#endif
+
 bool already_patched(void *fn) {
     for (int i = 0; i < g_patched_n; i++) {
         if (g_patched[i] == fn) return true;
@@ -633,11 +719,19 @@ int hooks_install(int *total) {
         if (patch_entry(fn, kHooks[i].handler)) {
             g_state[i] = State::Ok;
             if (g_patched_n < kHookCount) g_patched[g_patched_n++] = fn;
+            if (g_guarded_n < kHookCount) {
+                g_guarded[g_guarded_n].entry = fn;
+                g_guarded[g_guarded_n].handler = kHooks[i].handler;
+                g_guarded_n++;
+            }
             ok++;
         } else {
             g_state[i] = State::Failed;
         }
     }
+
+    // Входы пропатчены — теперь их надо удержать за собой (см. сторож входа).
+    guard_start();
 
 // No log: the caller prints this tally once per boot, this runs per launch.
     return ok;
