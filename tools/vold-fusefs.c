@@ -1759,12 +1759,33 @@ static void scan_back(const uint32_t *w, size_t nw, size_t k, uint64_t seg_va,
                 if (!pend[r].live || pend[r].base != rn) continue;
                 uint64_t val = page + pend[r].off;
                 pend[r].live = false;   /* the nearest adrp wins */
-                if (val == want_src) {
+                /* "Nearest wins" is the rule for the RESULT too, not only for
+                 * which adrp closes a pending entry.
+                 *
+                 * The scan runs backwards, so the first binding found is the one
+                 * nearest the call — i.e. the value the register actually holds
+                 * there. Without the `out->... < 0` guards an older binding of
+                 * the same literal silently displaced it, and then the
+                 * `x0_from == src_reg` test below could fail on a call site that
+                 * is perfectly correct: the site is rejected, find_fuse_site()
+                 * returns -4, and the FUSE patch is not installed on that
+                 * release. That is the same shape as the interleaved-adrp
+                 * regression (vold 11-13, see pending_put): a layout the
+                 * compiler is free to choose, a matcher that assumed it, and no
+                 * sound at the time. A window that loads one literal into two
+                 * registers is entirely ordinary — the compiler is free to keep
+                 * both, and the block before the call also holds an unrelated
+                 * StringPrintf setup (see the real window in the header comment).
+                 *
+                 * On the 8 images checked so far every one of these fields is
+                 * written exactly once per window, so this changes nothing
+                 * there; anchor_selftest() has the two-register case. */
+                if (val == want_src && out->src_reg < 0) {
                     out->src_reg = r;
                     out->src_val = val;
                 }
                 for (int t = 0; t < ntype; t++) {
-                    if (val == type_vas[t]) {
+                    if (val == type_vas[t] && out->type_reg < 0) {
                         out->type_reg = r;
                         out->type_val = val;
                     }
@@ -1775,8 +1796,13 @@ static void scan_back(const uint32_t *w, size_t nw, size_t k, uint64_t seg_va,
         }
 
         int from;
-        if (mov_to_x0(a, &from)) out->x0_from = from;
-        if (mov_to_x2(a, &from)) out->x2_from = from;
+        if (mov_to_x0(a, &from) && out->x0_from < 0) out->x0_from = from;
+        if (mov_to_x2(a, &from) && out->x2_from < 0) out->x2_from = from;
+        /* w3 is the one field that MUST accumulate instead of taking the first
+         * hit: the flags are built by two instructions (`mov w3,#lo` and
+         * `movk w3,#hi,lsl#16`), and because the scan is backwards the high half
+         * is seen first. Each write owns one half and never clobbers the other —
+         * see decode_w3_mov. */
         if (decode_w3_mov(a, &out->w3_acc)) out->w3_seen = true;
     }
 }
@@ -2138,8 +2164,9 @@ static int handlers_fit_selftest(void) {
  * just never run.
  *
  * The real images cannot be used here: they are not in the tree, and a test
- * that needs one cannot run on a clean checkout. So the two prologue shapes are
- * written out as instructions instead. Both must decode to the same call site.
+ * that needs one cannot run on a clean checkout. So the three prologue shapes
+ * are written out as instructions instead. All three must decode to the same
+ * call site — the third is the one where a field is bound twice.
  * ------------------------------------------------------------------ */
 static int anchor_selftest(void) {
     /* A page-aligned fake segment, and the two literals inside it. */
@@ -2149,7 +2176,7 @@ static int anchor_selftest(void) {
     const uint64_t stub = 0x20000;      /* where `bl` goes */
     const uint32_t want_w3 = 0x0200040eu;   /* MS_LAZYTIME | MS_… */
 
-    struct { const char *what; uint32_t w[12]; int n; } cases[2];
+    struct { const char *what; uint32_t w[20]; int n; } cases[3];
     memset(cases, 0, sizeof(cases));
 
     /* Shape 1 — adjacent pairs (vold 14/15/16/17). */
@@ -2178,11 +2205,41 @@ static int anchor_selftest(void) {
     cases[1].w[7] = enc_mov_reg(0, 21);
     cases[1].w[8] = enc_mov_reg(2, 22);
 
+    /* Shape 3 — every field bound TWICE, the stale binding older (further from
+     * the call) than the live one. Reading a register's value means reading its
+     * last write before the call, so the NEAREST binding is the answer; keeping
+     * the first one seen while scanning forwards — which is what "overwrite on
+     * every hit" amounts to, since the scan is backwards — returns the stale
+     * one, `x0_from == src_reg` then fails, and a perfectly good call site is
+     * rejected. The compiler is free to keep a second copy of a literal live in
+     * another register, so this is not a hypothetical shape. */
+    cases[2].what = "поле связано дважды";
+    cases[2].n = 15;
+    cases[2].w[0]  = enc_adrp(24, seg + 0, srcv);          /* stale "/dev/fuse" */
+    cases[2].w[1]  = enc_add_imm(24, 24, (unsigned)(srcv - seg));
+    cases[2].w[2]  = enc_mov_reg(0, 25);                  /* stale move to x0 */
+    cases[2].w[3]  = enc_adrp(26, seg + 12, typev);        /* stale "fuse"     */
+    cases[2].w[4]  = enc_add_imm(26, 26, (unsigned)(typev - seg));
+    cases[2].w[5]  = enc_mov_reg(2, 27);                  /* stale move to x2 */
+    cases[2].w[6]  = enc_adrp(21, seg + 24, srcv);         /* live pair        */
+    cases[2].w[7]  = enc_add_imm(21, 21, (unsigned)(srcv - seg));
+    cases[2].w[8]  = enc_adrp(22, seg + 32, typev);
+    cases[2].w[9]  = enc_add_imm(22, 22, (unsigned)(typev - seg));
+    cases[2].w[10] = enc_movz_w(3, 0x40eu);
+    cases[2].w[11] = enc_movk_w(3, 0x200u);
+    cases[2].w[12] = enc_mov_reg(0, 21);                  /* live move to x0 */
+    cases[2].w[13] = enc_mov_reg(2, 22);                  /* live move to x2 */
+    /* w[14] is the bl, written below */
+
     uint64_t tvas[1] = { typev };
 
-    for (int c = 0; c < 2; c++) {
-        uint32_t code[12];
-        memcpy(code, cases[c].w, sizeof(code));
+    for (int c = 0; c < 3; c++) {
+        uint32_t code[21];
+        /* sizeof of the SOURCE, not of the destination: code[] is wider than
+         * the case's window, and copying the destination's size would read past
+         * the array (into the struct's own `n`, so it would not crash — which is
+         * exactly the kind of thing that stays wrong). */
+        memcpy(code, cases[c].w, sizeof(cases[c].w));
         size_t npro = (size_t)cases[c].n;
         /* the `bl` sits one word past the prologue */
         code[npro] = enc_bl(seg + (uint64_t)npro * 4u, stub);

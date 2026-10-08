@@ -116,6 +116,14 @@ static const uint32_t PATCH_WORDS[2] = { PATCH_MOV0, PATCH_RET };
 #define EXIT_NO_RESOLVE 2
 #define EXIT_NO_WRITE   3
 
+/* A command-line option was not understood. NOT 2: 2 means "the resolution
+ * failed", and a mistyped option reported as a resolution failure sends the
+ * reader into the ELF parser when the fault is on the command line. 19 is the
+ * same code tools/vold-fusefs.c uses for this, so the shared word() table in
+ * tools/vold-targets.sh labels it correctly for both patchers — a private code
+ * here would have collided with a meaning already taken there (4 = no file). */
+#define EXIT_USAGE      19
+
 /* Already-patched stub, in either form this project writes into vold:
  *
  *   ours:      mov w0,#0 ; ret / add / br                — `ldr` is gone,
@@ -458,7 +466,7 @@ int main(int argc, char **argv) {
             self = true;
         } else {
             usage();
-            return EXIT_NO_RESOLVE;
+            return EXIT_USAGE;
         }
     }
 
