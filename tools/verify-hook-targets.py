@@ -76,9 +76,11 @@ BR_X17 = 0xD61F0220   # br  x17
 BTI_JC = 0xD50324DF   # bti jc (hint #38)
 PATCH_SIZE = 20
 
-# Must match kHooks[] in src/hook_libc.cpp.
+# Must match kHooks[] in src/hook_libc.cpp (корни) плюс покрытые переходники.
+# open/open64/openat/openat64 сняты с модуля: их работу берёт стаб сисколла
+# __openat, найденный по форме (см. ниже openat_stub_root). Они здесь не
+# перечислены — иначе скрипт счёл бы их корнями и требовал патчить по имени.
 HOOK_NAMES = [
-    "open", "open64", "openat", "openat64",
     "creat", "creat64", "__open_2", "__openat_2",
     "mkdir", "mkdirat",
     "chmod", "fchmod", "fchmodat",
@@ -393,12 +395,16 @@ def size_at(elf, addr):
     return (min(cands) - addr) if cands else None
 
 
-def body_calls_root(elf, addr, size, roots_by_addr):
+def body_calls_root(elf, addr, size, roots_by_addr, seen):
     """Ищет в теле функции вызов (bl) на уже пропатченный корень.
 
     Нужно для mkstemp и родни: они переходят на длинную mktemp_internal, а та
     внутри себя зовёт open@plt. Размотать это хвостовой цепочкой нельзя, поэтому
     тело просматривается целиком.
+
+    Поиск транзитивный: bl может вести на функцию, которая сама не корень, но
+    доходит до корня (open -> bl __openat, где __openat — форм-цель модуля, а
+    open из HOOK_NAMES выведен). Тогда цепочка всё равно покрыта.
     """
     if not size:
         return None
@@ -417,8 +423,16 @@ def body_calls_root(elf, addr, size, roots_by_addr):
             if name is None:
                 continue
             sym = next((s for s in elf.symbols if s.name == name and s.value), None)
-            if sym is not None and sym.value in roots_by_addr:
+            if sym is None:
+                continue
+            if sym.value in roots_by_addr:
                 return sym.value
+            # Транзитивно: open@plt -> open -> bl __openat (корень формы).
+            if sym.value not in seen:
+                res, root, _ = chase(elf, sym.value, roots_by_addr,
+                                     0, [], seen | {addr})
+                if res in ("root", "indirect"):
+                    return root
     return None
 
 
@@ -444,13 +458,19 @@ def chase(elf, addr, roots_by_addr, depth=0, trail=None, seen=None):
 
     if size > THUNK_MAX:
         # Real function reached: nothing to unwind, but check for a call to a root.
-        root = body_calls_root(elf, addr, size, roots_by_addr)
+        root = body_calls_root(elf, addr, size, roots_by_addr, seen)
         if root is not None:
             return "indirect", root, trail
         return "uncovered", None, trail
 
     kind, tgt = classify_tail(elf, addr, size)
     if kind != "thunk":
+        # Короткое тело, не переходник: всё равно покрыто, если зовёт пропатченный
+        # корень ближайшим bl. Так open/openat (снятые с модуля) покрываются через
+        # ближайший bl __openat — а __openat теперь форм-цель модуля.
+        root = body_calls_root(elf, addr, size, roots_by_addr, seen)
+        if root is not None:
+            return "indirect", root, trail
         return "uncovered", None, trail
 
     if elf.in_plt(tgt):
@@ -518,6 +538,49 @@ def analyse(elf, arch64=True):
     for name, e in entries.items():
         if e["role"] == "root" and e["sym"]:
             addr_name.setdefault(e["sym"].value, name)
+
+    # Форм-цель модуля: стаб сисколла __openat. Он ЛОКАЛЬНЫЙ (не в .dynsym, поэтому
+    # не в HOOK_NAMES), но модуль патчит именно его вместо снятых open/openat.
+    # Находим по имени в .symtab и трактуем как корень, если он патчпригоден.
+    stub = next((s for s in elf.symbols
+                 if s.name == "__openat" and s.value
+                 and s.type in (STT_FUNC, STT_GNU_IFUNC)), None)
+    stub_row = None
+    if stub is not None:
+        snxt = next_after(stub)
+        seff = stub.size or ((snxt.value - stub.value) if snxt else None)
+        saddr = stub.value
+        salign = saddr % 4
+        if not arch64:
+            stub_verdict = "skip"
+            stub_note = "не AArch64 — правка входа не реализована"
+        elif seff is None:
+            stub_verdict = "BAD"
+            stub_note = "размер неизвестен — патч недопустим"
+            bad = True
+        elif seff < PATCH_SIZE:
+            stub_verdict = "BAD"
+            stub_note = "короче %d байт — патч затрёт соседнюю" % PATCH_SIZE
+            bad = True
+        elif salign != 0:
+            stub_verdict = "BAD"
+            stub_note = "адрес не выровнен по 4 байта"
+            bad = True
+        elif is_thunk(elf, saddr, seff):
+            stub_verdict = "BAD"
+            stub_note = "переходник — патчить нельзя"
+            bad = True
+        else:
+            stub_verdict = "ok"
+            stub_note = ("патчится по форме (%s байт), заменяет open/openat" % seff)
+        roots_by_addr.add(saddr)
+        addr_name.setdefault(saddr, "__openat")
+        stub_row = {"name": "__openat", "value": saddr, "size": stub.size,
+                    "eff": seff, "gap": (snxt.value - saddr) if snxt else None,
+                    "next": snxt.name if snxt else None, "align": salign,
+                    "type": STT_NAMES.get(stub.type, str(stub.type)),
+                    "bind": STB_NAMES.get(stub.bind, str(stub.bind)),
+                    "role": "root", "verdict": stub_verdict, "note": stub_note}
 
     rows = []
     bad = False
@@ -597,6 +660,15 @@ def analyse(elf, arch64=True):
                         notes.append("цепочка: " + " ".join(trail))
 
         rows.append(_finish(row, notes))
+
+    if stub_row is not None:
+        rows.append(_finish(stub_row, [stub_row["note"]]))
+    elif arch64:
+        # __openat не найден в .symtab — модуль не сможет перехватить
+        # open-семейство (нет корня для снятых open/openat).
+        print("  ВНИМАНИЕ: __openat не найден — цель формы отсутствует",
+              file=sys.stderr)
+        bad = True
 
     collisions = []
     addrs = sorted(roots_by_addr)

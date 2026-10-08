@@ -35,13 +35,16 @@ typedef struct {
 
 /* Verified against a real image (device/ holds the reference binaries).
  *
- *   libc: `installed` = how many of the 12 listed targets come out PATCHED,
- *   counted as ROOTS, aliases included (hooks_install counts Ok + Alias): ten
- *   on 11/12/12L/13 -> 12, nine on 14-17 -> 11, since renameat from 14 on is
- *   a tail branch onto the patched renameat2 (8 bytes on 16, reads "коротка").
- *   It is in kHooks for the other four, whose SYSCALLS.TXT still lists it as a
- *   syscall of its own: a leaf patched as a root, rename a thunk onto it. 11
- *   was measured on-device (Android 16, hookselftest); the rest match that.
+ *   libc: `installed` = how many of the targets come out PATCHED, counted as
+ *   ROOTS, aliases included (hooks_install counts Ok + Alias). С 2026-10-09
+ *   open/open64/openat/openat64 сняты с модуля (их патчит порт GCam — любой
+ *   чужой переходник на входе он считает хуком и роняет процесс), и вместо
+ *   них патчится стаб сисколла __openat, найденный по форме (он локален, не
+ *   виден dlsym). Так что целей стало 8 (kHooks) + 1 (стаб) = 9 на 11/12/12L/13,
+ *   где renameat — корень, и 8 на 14-17, где renameat — переходник на renameat2
+ *   (8 байт, читается "коротка") и не патчится. __open_2/__openat_2 остаются
+ *   корнями: они подставляют 0666 вместо нуля (иначе ACL-маска обнулилась бы).
+ *   11 измерен на устройстве (Android 16, hookselftest); остальные совпадают.
  *   vold:  the column is a SITE, not a count — setxattr is called exactly once
  *   (11/12/12L/13: Utils.cpp:192, 14/15/16: :195, 17: :196), one
  *   R_AARCH64_JUMP_SLOT each. 11 writes that ACL from fewer places, which is
@@ -61,14 +64,14 @@ typedef struct {
  * linkat, renameat2, plus renameat on 11/12/12L/13) on 11-16 and exactly 20
  * on 17 — no margin. */
 static const UnfuseVer UNFUSE_VERSIONS[] = {
-    {30, 11, "R",               12, "vold-11/Utils.cpp:192"},
-    {31, 12, "S",               12, "vold-12/Utils.cpp:192"},
-    {32, 12, "Sv2",             12, "vold-12l/Utils.cpp:192"},
-    {33, 13, "Tiramisu",        12, "vold-13/Utils.cpp:192"},
-    {34, 14, "UpsideDownCake",  11, "vold-14/Utils.cpp:195"},
-    {35, 15, "VanillaIceCream", 11, "vold-15/Utils.cpp:195"},
-    {36, 16, "Baklava",         11, "vold-16/Utils.cpp:195"},
-    {37, 17, "CinnamonBun",     11, "vold-17/Utils.cpp:196"},
+    {30, 11, "R",               9,  "vold-11/Utils.cpp:192"},
+    {31, 12, "S",               9,  "vold-12/Utils.cpp:192"},
+    {32, 12, "Sv2",             9,  "vold-12l/Utils.cpp:192"},
+    {33, 13, "Tiramisu",        9,  "vold-13/Utils.cpp:192"},
+    {34, 14, "UpsideDownCake",  8,  "vold-14/Utils.cpp:195"},
+    {35, 15, "VanillaIceCream", 8,  "vold-15/Utils.cpp:195"},
+    {36, 16, "Baklava",         8,  "vold-16/Utils.cpp:195"},
+    {37, 17, "CinnamonBun",     8,  "vold-17/Utils.cpp:196"},
 };
 
 #define UNFUSE_VER_COUNT  ((int)(sizeof(UNFUSE_VERSIONS) / sizeof(UNFUSE_VERSIONS[0])))

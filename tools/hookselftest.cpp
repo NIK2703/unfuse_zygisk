@@ -41,9 +41,11 @@ namespace {
 
 constexpr const char *kRoot = "/data/media/0/.hooktest";
 
-// Names must match kHooks[] in src/hook_libc.cpp.
+// Names must match HOOK_NAMES in tools/verify-hook-targets.py (и быть
+// суперпоследовательностью kHooks[]). open/open64/openat/openat64 сняты с
+// модуля (их патчит порт GCam) — их работу берёт стаб __openat, найденный по
+// форме, поэтому здесь их нет.
 const char *const kNames[] = {
-    "open", "open64", "openat", "openat64",
     "creat", "creat64", "__open_2", "__openat_2",
     "mkdir", "mkdirat",
     "chmod", "fchmod", "fchmodat",
@@ -170,7 +172,7 @@ void test_sizes() {
 void test_patch_bytes() {
     printf("\n== 2. Байты входа до и после установки хуков ==\n");
     printf("  до:\n");
-    dump_entry("openat");
+    dump_entry("__openat_2");
     dump_entry("mkdirat");
 
     int total = 0;
@@ -180,6 +182,11 @@ void test_patch_bytes() {
     char report[1024];
     hooks_report(report, sizeof report);
     printf("  отчёт:\n    %s\n", report);
+
+    // Стаб __openat — отдельная цель, найденная по форме; он заменяет снятые с
+    // модуля open/openat и патчится сам (порт GCam его не трогает).
+    check(strstr(report, "__openat=ok") != nullptr,
+          "отчёт содержит __openat=ok (стаб пропатчен по форме)");
 
     // Which release the table matched, and whether the tally is what that
     // release is known to yield (android_ver.h). -1 means the release is not in
@@ -200,16 +207,16 @@ void test_patch_bytes() {
     }
 
     printf("  после:\n");
-    dump_entry("openat");
+    dump_entry("__openat_2");
     dump_entry("mkdirat");
 
-    void *fn = dlsym(RTLD_DEFAULT, "openat");
-    check(fn != nullptr, "openat разрешён через dlsym");
+    void *fn = dlsym(RTLD_DEFAULT, "__openat_2");
+    check(fn != nullptr, "__openat_2 разрешён через dlsym");
     if (fn != nullptr) {
         const uint32_t *w = static_cast<const uint32_t *>(fn);
         char what[200];
         snprintf(what, sizeof what,
-                 "вход openat = bti jc / ldr x17,#8 / br x17 "
+                 "вход __openat_2 = bti jc / ldr x17,#8 / br x17 "
                  "(получено 0x%08x 0x%08x 0x%08x)",
                  w[0], w[1], w[2]);
         check(w[0] == 0xd50324dfu && w[1] == 0x58000051u && w[2] == 0xd61f0220u, what);

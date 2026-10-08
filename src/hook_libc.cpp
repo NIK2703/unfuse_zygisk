@@ -15,7 +15,9 @@
  * hooks_bti_report when libc declares BTI but the module was built without it.
  *
  * A patched entry can be taken away by another in-process patcher (the GCam port
- * does exactly that) — see "сторож входа" below, which puts it back.
+ * does exactly that). Instead of fighting it with a guard thread (forbidden in
+ * this project), the open family is redirected through the bare __openat syscall
+ * stub, found by form below — the port patches only open/openat, never the stub.
  *
  * The root COUNT is measured, not assumed: hookselftest.cpp on the device and
  * tools/verify-hook-targets.py device/libc/libc-arm64.so statically;
@@ -29,6 +31,7 @@
 #include "gnu_props.h"
 
 #include "func_size.h"
+#include "openat_stub.h"
 
 #include <fcntl.h>
 #include <stdint.h>
@@ -42,7 +45,6 @@
 
 #include <dlfcn.h>
 #include <link.h>  // dl_iterate_phdr, ElfW: the branch-protection preflight
-#include <pthread.h>
 
 namespace {
 
@@ -542,11 +544,14 @@ struct HookDef {
 // (size gate, or tail_call_target) since its calls reach the root through .plt.
 // Measured instead by hookselftest.cpp and verify-hook-targets.py. renameat is
 // a root on 11/12/12L/13 and a tail branch onto renameat2 elsewhere.
+//
+// open/open64/openat/openat64 сняты с модуля: их патчит порт GCam, и любой
+// чужой переходник на входе он считает хуком и роняет процесс (SIGBUS, см.
+// «Стаб сисколла openat» ниже). Их работу берёт стаб сисколла __openat —
+// отдельная цель, найденная по форме, которую порт не трогает. __open_2 и
+// __openat_2 ОСТАЮТСЯ: они подставляют 0666 вместо нуля (снять их — обнулить
+// ACL-маску), поэтому патчатся напрямую.
 const HookDef kHooks[] = {
-    {"open", reinterpret_cast<void *>(h_open)},
-    {"open64", reinterpret_cast<void *>(h_open)},
-    {"openat", reinterpret_cast<void *>(h_openat)},
-    {"openat64", reinterpret_cast<void *>(h_openat)},
     {"__open_2", reinterpret_cast<void *>(h_open_2)},
     {"__openat_2", reinterpret_cast<void *>(h_openat_2)},
     {"mkdirat", reinterpret_cast<void *>(h_mkdirat)},
@@ -560,6 +565,10 @@ const HookDef kHooks[] = {
 constexpr int kHookCount = static_cast<int>(sizeof(kHooks) / sizeof(kHooks[0]));
 
 State g_state[kHookCount];
+
+// Отдельная цель — стаб сисколла __openat (найден по форме, не из kHooks).
+State g_stub_state = State::Missing;
+
 bool g_installed = false;
 
 // Last patch's release (android_ver.h): set by hooks_install, read by
@@ -567,89 +576,88 @@ bool g_installed = false;
 UnfusePick g_ver;
 bool g_ver_ready = false;
 
-// open64 is the same address as open on 64-bit: alias, not re-patch.
-void *g_patched[kHookCount];
+// +1: стаб __openat — тоже пропатченная цель, но не из kHooks.
+void *g_patched[kHookCount + 1];
 int g_patched_n = 0;
 
-// What the guard below re-checks: entry and the handler its literal must hold.
-struct Guarded {
-    void *entry;
-    void *handler;
-};
-Guarded g_guarded[kHookCount];
-int g_guarded_n = 0;
-
-// --- Сторож входа -----------------------------------------------------------
+// --- Стаб сисколла openat: входы open/openat сняты --------------------------
 //
-// Свой патч может снести чужой: порт GCam (com.android.MGC_9_7_047) достаёт из
-// ассетов codec_*.lck и dlopen-ит их; внутри лежит собственный патчер кода,
-// который тоже закрывает входы open/openat. Root ему не нужен — правится своё
-// адресное пространство, как и нам под uid приложения.
+// Почему сняты. Порт GCam (com.android.MGC_9_7_047) достаёт из ассетов
+// codec_*.lck и dlopen-ит их; внутри лежит собственный патчер кода, который тоже
+// закрывает входы open и openat. Root ему не нужен — правится своё адресное
+// пространство, как и нам под uid приложения.
 //
-// Он замечает чужой переходник на входе и строит свой трамплин, который ЧИТАЕТ
-// указатель по entry+12 и прыгает по нему. Но entry+12 — это середина его же
-// собственного 16-байтного переходника (литерал по entry+8), и он затирает наши
-// полслова своим старшим. Выходит 0x0000002d00000075: младшие 32 бита чужие
-// (0x00000075), выравнивания нет -> br x17 ловит BUS_ADRALN и приложение падает.
-// На устройстве: чужой патч на ~432 мс от запуска, падение ещё через ~35 мс; с
-// выключенными хуками (флаг no_hooks) порт патчит чистое место, трамплина не
-// строит, и ничего не падает.
+// Найдя на входе чужой переходник, он строит трамплин, который ЧИТАЕТ указатель
+// по entry+12, — а перед этим сам затирает первые 16 байт. По entry+12 остаётся
+// его слово плюс старшая половина нашего литерала (0x0000002d от базы
+// 0x2d82815000): выходит 0x2d00000075, выравнивания нет, br x17 ловит
+// BUS_ADRALN. На устройстве: его патч на ~432 мс от запуска, падение ещё через
+// ~35 мс.
 //
-// Проверено подстановкой форм прямо в живой процесс (форма порта, форма модуля,
-// bti jc заменён на nop, литерал сдвинут на +16) — падает ЛЮБАЯ: порт считает
-// чужим хуком любой переходник на входе, а не конкретно наш.
+// Формой это не лечится: подстановка в живой процесс любой формы (порта,
+// модуля, bti jc заменён на nop, литерал сдвинут на +16) роняет его одинаково —
+// порт считает чужим хуком ЛЮБОЙ переходник на входе. Сторожевой поток тоже не
+// ответ: сторожа в этом проекте запрещены (memory/MEMORY.md, «Запреты»).
 //
-// Значит, дело не в форме патча, а в том, кто первый: надо вернуть свой
-// переходник, пока чужой трамплин не пущен в ход. Вернув его, мы кладём по
-// entry+12 адрес обработчика — и чужой трамплин попадает в него, а не в мусор,
-// так что даже повторный патч порта процесс не роняет.
+// Остаётся убрать свой переходник с тех входов, которые порт патчит. open и
+// openat снимаются, а их работу берёт единственный стаб сисколла __openat: всё
+// open-семейство сходится в него — open/open64, openat/openat64, __open_2,
+// __openat_2, все четыре адреса делают bl __openat, — а порт его не трогает.
+// Разбор формы и доказательства: src/openat_stub.h.
 //
-// Опрос дешёвый (12 входов по три слова) и по времени ограничен: частый — первые
-// три секунды, дальше редкий, чтобы поймать и ленивый патчер, не жгя процессор.
+// __open_2 и __openat_2 при этом ОСТАЮТСЯ входовыми целями: они зовут __openat
+// с режимом 0, а модуль подставляет туда 0666 — нулевой режим обнулил бы
+// ACL-маску. Сняв их, мы потеряли бы это.
 #if defined(__aarch64__)
 
-constexpr unsigned kGuardFastSteps = 30000;  // 30000 * 100 мкс = 3 с
-constexpr unsigned kGuardFastUs = 100;
-constexpr unsigned kGuardSlowUs = 100000;
+struct StubQuery {
+    const char *name_part;  // "libc.so"
+    void *addr;             // найденный стаб
+    unsigned size;
+};
 
-bool stub_intact(const Guarded &g) {
-    const volatile uint32_t *w = static_cast<const volatile uint32_t *>(g.entry);
-    if (w[0] != kBitJc || w[1] != kLdrX17 || w[2] != kBrX17) return false;
+int stub_cb(dl_phdr_info *info, size_t, void *data) {
+    auto *q = static_cast<StubQuery *>(data);
+    if (q->name_part == nullptr || info->dlpi_name == nullptr) return 0;
+    if (strstr(info->dlpi_name, q->name_part) == nullptr) return 0;
 
-    // Литерал читаем как есть: он по entry+12, то есть выровнен по 4, а не по 8.
-    const volatile uint64_t *lit =
-        reinterpret_cast<const volatile uint64_t *>(static_cast<const char *>(g.entry) + 12);
-    return *lit == reinterpret_cast<uint64_t>(g.handler);
-}
+    // Секций в рантайме нет — есть только сегменты, поэтому сканируем
+    // исполняемый PT_LOAD целиком. Хостовый тест делает ровно то же самое
+    // (tools/test-openat-stub.sh), иначе он проверял бы не тот вход.
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD || (ph.p_flags & PF_X) == 0) continue;
 
-void *guard_main(void *) {
-    for (unsigned step = 0;; step++) {
-        for (int i = 0; i < g_guarded_n; i++) {
-            if (!stub_intact(g_guarded[i])) {
-                patch_entry(g_guarded[i].entry, g_guarded[i].handler);
-            }
-        }
-        usleep(step < kGuardFastSteps ? kGuardFastUs : kGuardSlowUs);
+        const uintptr_t base = info->dlpi_addr + ph.p_vaddr;
+        unsigned size = 0;
+        const long off =
+            openat_stub_find(reinterpret_cast<const void *>(base), ph.p_memsz, &size);
+        if (off < 0) continue;
+
+        q->addr = reinterpret_cast<void *>(base + static_cast<uintptr_t>(off));
+        q->size = size;
+        return 1;
     }
-    return nullptr;
+    return 0;
 }
 
-void guard_start() {
-    if (g_guarded_n == 0) return;
-
-    pthread_attr_t at;
-    if (pthread_attr_init(&at) != 0) return;
-    pthread_attr_setstacksize(&at, 64 * 1024);
-
-    pthread_t t;
-    if (pthread_create(&t, &at, guard_main, nullptr) == 0) pthread_detach(t);
-    pthread_attr_destroy(&at);
+// Адрес стаба и его длина. nullptr — не нашли или нашли не один раз; тогда
+// цель честно отчитается как отсутствующая, а не пропатчится наугад.
+void *openat_stub_addr(unsigned *out_size) {
+    StubQuery q{};
+    q.name_part = "libc.so";
+    dl_iterate_phdr(stub_cb, &q);
+    if (out_size != nullptr) *out_size = q.size;
+    return q.addr;
 }
 
 #else
 
-// На v7a переходников нет вовсе, сторожить нечего.
-void guard_start() {}
+// На v7a переходников нет вовсе: patch_entry под #else возвращает false.
+void *openat_stub_addr(unsigned *out_size) {
+    if (out_size != nullptr) *out_size = 0;
+    return nullptr;
+}
 
 #endif
 
@@ -663,7 +671,8 @@ bool already_patched(void *fn) {
 }  // namespace
 
 int hooks_install(int *total) {
-    if (total != nullptr) *total = kHookCount;
+    // kHooks + стаб __openat (отдельная цель по форме).
+    if (total != nullptr) *total = kHookCount + 1;
 
     // The release picks what the tally is compared against, not how entries
     // are patched (android_ver.h).
@@ -675,6 +684,7 @@ int hooks_install(int *total) {
         for (int i = 0; i < kHookCount; i++) {
             if (g_state[i] == State::Ok || g_state[i] == State::Alias) n++;
         }
+        if (g_stub_state == State::Ok || g_stub_state == State::Alias) n++;
         return n;
     }
     g_installed = true;
@@ -718,20 +728,36 @@ int hooks_install(int *total) {
         }
         if (patch_entry(fn, kHooks[i].handler)) {
             g_state[i] = State::Ok;
-            if (g_patched_n < kHookCount) g_patched[g_patched_n++] = fn;
-            if (g_guarded_n < kHookCount) {
-                g_guarded[g_guarded_n].entry = fn;
-                g_guarded[g_guarded_n].handler = kHooks[i].handler;
-                g_guarded_n++;
-            }
+            if (g_patched_n < kHookCount + 1) g_patched[g_patched_n++] = fn;
             ok++;
         } else {
             g_state[i] = State::Failed;
         }
     }
 
-    // Входы пропатчены — теперь их надо удержать за собой (см. сторож входа).
-    guard_start();
+    // Отдельная цель: стаб сисколла __openat, найденный по форме (он локален,
+    // dlsym его не видит). Он заменяет снятые входы open/open64/openat/openat64
+    // — порт GCam патчит только open/openat, а стаб не трогает, поэтому конфликта
+    // нет, и никакой сторож не нужен (memory/MEMORY.md, «Запреты»).
+    {
+        unsigned stub_size = 0;
+        void *stub = openat_stub_addr(&stub_size);
+        g_stub_state = State::Missing;
+        if (stub != nullptr && stub_size >= kPatchSize && !already_patched(stub) &&
+            patch_entry(stub, reinterpret_cast<void *>(h_openat))) {
+            g_stub_state = State::Ok;
+            if (g_patched_n < kHookCount + 1) g_patched[g_patched_n++] = stub;
+            ok++;
+        } else if (stub == nullptr) {
+            g_stub_state = State::Missing;
+        } else if (stub_size < kPatchSize) {
+            g_stub_state = State::Small;
+        } else if (already_patched(stub)) {
+            g_stub_state = State::Alias;
+        } else {
+            g_stub_state = State::Failed;
+        }
+    }
 
 // No log: the caller prints this tally once per boot, this runs per launch.
     return ok;
@@ -756,6 +782,22 @@ void hooks_report(char *buf, size_t len) {
         const int w = snprintf(buf + used, len - used, "%s%s=%s", used ? " " : "", kHooks[i].name, s);
         if (w < 0 || static_cast<size_t>(w) >= len - used) break;
         used += static_cast<size_t>(w);
+    }
+
+    // Степ сисколла openat — отдельная цель, не из kHooks (dlsym его не видит).
+    {
+        const char *s = "?";
+        switch (g_stub_state) {
+            case State::Ok: s = "ok"; break;
+            case State::Alias: s = "alias"; break;
+            case State::Missing: s = "нет"; break;
+            case State::Failed: s = "СБОЙ"; break;
+            case State::Thunk: s = "переходник"; break;
+            case State::Small: s = "коротка"; break;
+            case State::Unknown: s = "размер?"; break;
+        }
+        const int w = snprintf(buf + used, len - used, "%s%s=%s", used ? " " : "", "__openat", s);
+        if (!(w < 0 || static_cast<size_t>(w) >= len - used)) used += static_cast<size_t>(w);
     }
 }
 
