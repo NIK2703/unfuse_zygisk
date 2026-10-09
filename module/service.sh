@@ -1,16 +1,14 @@
 #!/system/bin/sh
-# service.sh — late boot, once vold has mounted the storages: repeat the
-# preparation (all passes idempotent).
+# service.sh — late boot, after vold mounted the storages: repeat the
+# preparation (idempotent).
 
 MODDIR=${MODDIR:-${0%/*}}
 
-# vold may restore the media_userdir_file label on /data/media while preparing
-# it, so the relabel runs again here.
+# vold may restore the media_userdir_file label while preparing /data/media.
 sh "$MODDIR/storage.sh"
 
-# Both vold patches live in vold's process memory and vold may not have existed
-# at post-fs-data, so repeat them. A FUSE failure is app-visible: vold mounts
-# FUSE over the raw tree again.
+# Both vold patches live in vold's memory and vold may not have existed at
+# post-fs-data, so repeat them.
 NOACL="$MODDIR/tools/vold-noacl"
 [ -x "$NOACL" ] && "$NOACL" >/dev/null 2>&1
 

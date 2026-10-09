@@ -1,5 +1,5 @@
 # shellcheck shell=sh
-# customize.sh — install stage: the installer runs it while unpacking.
+# customize.sh — install stage.
 
 SKIPUNZIP=0
 
@@ -13,8 +13,7 @@ if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
     abort "! zygisk/$ABI.so is missing - the build did not run (build.sh)"
 fi
 
-# The archive carries every ABI's tools: keep ours, under the names the stages
-# look for.
+# Every ABI's tools are in the archive; keep ours under the plain names.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
     abort "! tools/$FIX is missing - the build did not run (build.sh)"
 fi

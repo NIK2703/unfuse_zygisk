@@ -1,11 +1,10 @@
 #!/system/bin/sh
-# status.sh — puts one sign into module.prop's description: whether vold's FUSE
-# mount for emulated storage is cut off. vold-fusefs --check: 0 patched (the
-# only checkmark), 1 no vold / none patched, 2 anchor unresolved, 3 not
-# writable. One description= line; every reader takes the first.
-# By hand: su -c 'sh /data/adb/modules/unfuse_zygisk/status.sh'
+# status.sh — one sign in module.prop's description: is vold's FUSE mount for
+# emulated storage cut off. vold-fusefs --check: 0 patched (the only checkmark),
+# 1 no vold / none patched, 2 anchor unresolved, 3 not writable. One
+# description= line; every reader takes the first.
 
-# PATH is set explicitly: the PATH a module stage inherits is not to be trusted.
+# PATH is set explicitly: a stage's inherited PATH is not to be trusted.
 PATH=/system/bin:/system/xbin
 export PATH
 
@@ -40,8 +39,7 @@ if [ ! -f "$PROP" ] || [ ! -w "$PROP" ]; then
     exit $exit_status
 fi
 
-# Temp file in the same directory, then mv: no reader sees a half-written
-# module.prop. Extra description lines are dropped, not kept.
+# Temp file in the same directory, then mv: no reader sees a half-written prop.
 tmp="$PROP.status.$$"
 awk -v want="description=$want" '
     BEGIN { done = 0 }
