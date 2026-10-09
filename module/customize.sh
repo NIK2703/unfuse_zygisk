@@ -32,6 +32,9 @@ rm -f "$MODPATH/tools/storage-fix-arm64" "$MODPATH/tools/storage-fix-arm" \
 
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/zygisk/$ABI.so"     0 0 0644
+# .so вне /system: контекст от менеджера не гарантирован — у всех zygisk-модулей на
+# устройстве он system_lib_file. Фиксируем явно.
+chcon u:object_r:system_lib_file:s0 "$MODPATH/zygisk/$ABI.so" 2>/dev/null || true
 set_perm "$MODPATH/tools/storage-fix"  0 0 0755
 set_perm "$MODPATH/tools/vold-noacl"   0 0 0755
 set_perm "$MODPATH/tools/vold-fusefs"  0 0 0755
