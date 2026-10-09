@@ -537,12 +537,19 @@ static int stub_literal_off(const uint8_t *p) {
  *
  * ================ why the frame looks the way it does
  *
- * `stp x29, x30, [sp, #-16]!` is emitted once, before the comparisons. The
- * take-over path pops it before returning, because it returns through the
- * original `lr`. The pass-through path does NOT pop it — it never returns to
- * us; it tail-calls libc mount, which returns straight to the caller. libc
- * mount does not care what sits above sp, and the caller's `bl mount` pushed
- * only its own frame, so the extra 16 bytes are harmless there. */
+ * `stp x29, x30, [sp, #-32]!` is emitted once, before the comparisons, and it
+ * is 32 bytes rather than 16 because the mount target is parked at [sp, #16]
+ * across the first mount() call — a register cannot carry it (see the
+ * prologue). BOTH exits pop it: the take-over path before its `ret`, and the
+ * pass-through path before it tail-calls libc mount.
+ *
+ * The pass-through pop is not optional and it is not symmetry for its own
+ * sake. That path never returns to us — it hands control to libc mount, which
+ * returns straight to the original caller — so it looks as though leaving the
+ * frame would only leave 32 dead bytes above sp. It does not: the caller's sp
+ * must be exactly what it was at `bl mount`, and the caller's own epilogue
+ * reads its frame from there. A push without the matching pop shifts sp by 32
+ * bytes and the caller returns into words that are not its frame. */
 
 /* --- encoders, so the emission below reads as assembly --- */
 static uint32_t enc_ldr_lit(int rt, int64_t byte_delta) {
@@ -612,6 +619,13 @@ static uint32_t enc_add_imm(int rd, int rn, unsigned imm) {   /* add Xd, Xn, #im
 static uint32_t enc_sub_w_imm(int rd, int rn, unsigned imm) { /* sub Wd, Wn, #imm */
     return 0x51000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
+/* SUB (immediate, 64-bit) — ADD's encoding with op=1, 0xD1_ against 0x91_.
+ * The mount handler needs it to step back from the target path's NUL to where
+ * a trailing "/emulated" would have to begin; there is no length to hand it,
+ * so the start of the tail has to be computed from the end. */
+static uint32_t enc_sub_imm(int rd, int rn, unsigned imm) {   /* sub Xd, Xn, #imm */
+    return 0xd1000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
 static uint32_t enc_subs_w_imm(int rd, int rn, unsigned imm){ /* subs Wd, Wn, #imm */
     return 0x71000000u | (imm << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
 }
@@ -665,6 +679,7 @@ static int64_t dec_cbnz_w(uint32_t w, int *rt_out, int *is_nz) {
 #define COND_NE 0x1
 #define COND_EQ 0x0
 #define COND_HI 0x8
+#define COND_LO 0x3   /* unsigned lower — "x12 < x1", the short-path guard */
 
 /* Named pool slots; the enum and the `pool_val[]` assignment must stay in the
  * same order — that is the only invariant in this function. */
@@ -673,6 +688,7 @@ enum {
     P_SRC,          /* runtime VA of vold's "/dev/fuse" literal  */
     P_MOUNT,        /* runtime VA of libc mount                  */
     P_RAW,          /* runtime VA of the "/data/media\0" copy    */
+    P_TAIL,         /* runtime VA of the "/emulated\0" copy      */
     P_COUNT
 };
 
@@ -714,11 +730,23 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
         br_cond[nbr] = COND_NE; nbr++; E(0); } while (0)
 #define BEQ() do { if (nbr >= 8) return -1; br_at[nbr] = n; \
         br_cond[nbr] = COND_EQ; nbr++; E(0); } while (0)
+#define BLO() do { if (nbr >= 8) return -1; br_at[nbr] = n; \
+        br_cond[nbr] = COND_LO; nbr++; E(0); } while (0)
 
     /* bti jc — the stub reaches us with `br x17`, an indirect jump. This is the
      * landing pad; the stub itself cannot carry one (see build_stub_patch). */
     E(INSN_BTI_JC);
-    E(enc_stp_pre(29, 30, -2));         /* stp x29, x30, [sp, #-16]! */
+    /* Frame is 32 bytes: x29/x30 in the low 16, and a spared slot at [sp,#16]
+     * for the mount target. It has to be memory, not a register: x10 looks
+     * free because it is caller-saved, but that is exactly why the target
+     * cannot live there — the first mount() call below is free to trash it,
+     * and does. That was a shipped bug: the FUSE mount went to the right
+     * place, the bind of /data/media went to the empty string, and the
+     * aarch64 exec selftest caught it as "target mismatch" on the only cases
+     * that take over. The callee-saved registers are not an option either —
+     * this handler runs in place of a call, so the caller's x19..x28 must come
+     * back untouched and there is no room to stash them. */
+    E(enc_stp_pre(29, 30, -4));         /* stp x29, x30, [sp, #-32]! */
     E(0x910003fdu);                     /* mov x29, sp               */
 
     /* classify: x2 == "fuse" */
@@ -749,14 +777,89 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     E(0x6a09007fu);                     /* tst  w3, w9              */
     BEQ();                              /* b.eq pass — not our mount */
 
+    /* ---- is the target the emulated volume? ----
+     *
+     * The three tests above are not enough, and this is why: MountUserFuse()
+     * is ONE function serving TWO volumes. EmulatedVolume calls it with the
+     * label (EmulatedVolume.cpp:421, "emulated"), PublicVolume — the physical
+     * SD card — with the volume's UUID (PublicVolume.cpp:235, e.g. "0395-
+     * 1716"). Both arrive here with the identical source pointer, type
+     * pointer and flags, so the handler used to bind /data/media on top of
+     * the SD card's mount point as well: the card appeared as a node whose
+     * children were Android/data and obb — the internal tree — and none of
+     * its own files were reachable. A volume that is not the emulated one
+     * has to reach libc mount untouched, FUSE and all.
+     *
+     * The tail is what separates them, and it is the same shape the umount2
+     * handler matches, which is not a coincidence but the invariant the
+     * patch rests on: this handler may stack a second mount only on a path
+     * that handler unmounts repeatedly, or teardown leaves a daemon-less
+     * FUSE behind and the volume comes back unmountable.
+     *
+     * The tail also excludes a case the bug report did not mention:
+     * getLabel() returns "emulated" only for the primary volume
+     * (EmulatedVolume.cpp:70-77) — an adopted volume carries its fsUuid in
+     * the same slot, and binding /data/media there would be just as wrong.
+     *
+     * Bounded by construction, like the umount2 matcher: the walk stops at
+     * the path's own NUL, the length guard keeps the nine-byte compare
+     * inside the string, and the compare stops on the template's NUL — a
+     * NUL in the path never equals a non-NUL template byte, so it can never
+     * run off the end. Only x9..x13 are written; x0..x4 are the caller's
+     * arguments and the pass-through must hand them to libc mount intact. */
+    E(enc_mov_reg(9, 1));               /* mov x9, x1     (p = target)     */
+    {
+        E(enc_ldrb_post(10, 9));        /* ldrb w10, [x9], #1              */
+        int l1 = n - 1;                 /* index of that ldrb              */
+        /* A branch's delta is relative to the branch's own address and `n` is
+         * that address, so the distance back to the load is l1 - n. Looping to
+         * the ldrb rather than to the `mov` above it matters for clarity only
+         * — both are idempotent — but the selftest below decodes the emitted
+         * words and requires the loop to close on the ldrb, so this is
+         * checked rather than trusted. */
+        /* The delta is evaluated into a local: E(x) expands to w[n++] = (x),
+         * so reading n in the argument and bumping it in the macro is
+         * unsequenced (-Wunsequenced), and the value on some compilers is
+         * whatever falls out of the evaluation order. */
+        int64_t d1 = ((int64_t)l1 - (int64_t)n) * 4;
+        E(enc_cbnz_w(10, d1));          /* cbnz w10,l1 */
+    }
+    /* p is one past the NUL, so a trailing "/emulated" begins at p-10. */
+    E(enc_sub_imm(12, 9, 10));          /* sub x12, x9, #10                */
+    E(enc_cmp_reg(12, 1));              /* cmp x12, x1                     */
+    BLO();                              /* b.lo pass — shorter than the tail */
+    {
+        LDR(P_TAIL, 13);                /* ldr x13, <"/emulated">          */
+        int l2 = n;                     /* index of the *first* ldrb       */
+        E(enc_ldrb_post(10, 12));       /* ldrb w10, [x12], #1             */
+        E(enc_ldrb_post(11, 13));       /* ldrb w11, [x13], #1             */
+        E(enc_cmp_w_reg(10, 11));       /* cmp w10, w11                    */
+        BNE();                          /* b.ne pass                       */
+        /* Stops on the template's NUL. The path's NUL lands there too —
+         * they compare equal, which is the match — and any longer path
+         * mismatches on the byte before it.
+         *
+         * The loop closes on the FIRST ldrb, and both have to re-run: the
+         * first advances the path pointer (x12), the second the template
+         * pointer (x13). Closing on the second — the obvious-looking choice,
+         * since w11 is the value the test reads — silently drops the path
+         * advance: the compare then holds x12 still while the template walks
+         * on, mismatches on the second byte, and every path falls through to
+         * the pass branch. That was the shipped bug, and it is invisible in
+         * a sequential reading of the block: it only shows in the control
+         * flow. The selftest guards it by requiring each loop to close on a
+         * load of the same register the branch tests, and there are exactly
+         * two such loops. */
+        int64_t d2 = ((int64_t)l2 - (int64_t)n) * 4;
+        E(enc_cbnz_w(11, d2));          /* cbnz w11,l2 */
+    }
+
     /* ---------------- take over ---------------- */
 
-    /* The target is parked in x10, a caller-saved temporary, NOT in x19: the
-     * handler is entered from the PLT stub in place of a real `mount` call, so
-     * the caller's callee-saved registers must survive untouched. x19 is
-     * callee-saved and the handler has no frame slot for it — using it here
-     * would corrupt whatever the caller kept there across the call. */
-    E(enc_mov_reg(10, 1));              /* mov x10, x1  (target)           */
+    /* Park the target on our own frame, NOT in x10 or any other register:
+     * the first mount() call below is a real call out of this code and may
+     * clobber every caller-saved register, x10 included. See the prologue. */
+    E(enc_str_imm(1, 31, 16));          /* str x1, [sp, #16] (target)      */
 
     /* (a) the FUSE mount the caller asked for — x0..x4 are still exactly its
      * arguments, so there is nothing to set up. It has to happen: the fd it
@@ -767,17 +870,18 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
 
     /* (b) the raw tree on top of it. This is the mount anything actually sees:
      * it is the topmost mount at fuse_path, so the FUSE view below it is
-     * unreachable through the path. */
+     * unreachable through the path. The target comes back off the frame — the
+     * call above may have overwritten any register that held it. */
     LDR(P_MOUNT, 9);                    /* ldr x9, <mount>                 */
     LDR(P_RAW, 0);                      /* ldr x0, <raw>                   */
-    E(enc_mov_reg(1, 10));              /* mov x1, x10                     */
+    E(enc_ldr_imm(1, 31, 16));          /* ldr x1, [sp, #16] (target)      */
     E(0xd2800002u);                     /* mov x2, #0     (fstype = NULL)  */
     E(enc_movz_w(3, 4096u | 16384u));   /* mov w3,#0x5000 MS_BIND|MS_REC   */
     E(0xd2800004u);                     /* mov x4, #0     (data   = NULL)  */
     E(enc_blr(9));                      /* blr x9                          */
 
     E(enc_movz_w(0, 0));                /* mov w0, #0    -> "mount worked"  */
-    E(enc_ldp_post(29, 30, 2));         /* ldp x29, x30, [sp], #16          */
+    E(enc_ldp_post(29, 30, 4));         /* ldp x29, x30, [sp], #32          */
     E(0xd65f03c0u);                     /* ret                              */
 
     /* ---------------- pass ----------------
@@ -793,7 +897,7 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
      * The index of the restore is captured separately from the index of the
      * block: the two `b.ne` above must land on the restore, not after it. */
     idx_restore = n;
-    E(enc_ldp_post(29, 30, 2));         /* ldp x29, x30, [sp], #16        */
+    E(enc_ldp_post(29, 30, 4));         /* ldp x29, x30, [sp], #32        */
     idx_pass_tail = n;
     LDR(P_MOUNT, 9);                    /* ldr x9, <mount>                */
     E(enc_br(9));                       /* br x9 — x0..x4 exactly as given */
@@ -815,6 +919,16 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     n += str_words;
     if (n > 96) return -1;
     uint64_t str_va = code_va + (uint64_t)str_off_bytes;
+
+    /* The "/emulated" template the target-tail matcher compares against,
+     * shipped with the handler because the handler cannot write anywhere:
+     * it runs from a page vold has mapped r-x. Same reason P_RAW exists. */
+    static const char mount_tail[] = FUSE_PATH_TAIL_S;   /* NUL included */
+    int tail_off_bytes = n * 4;
+    int tail_words = (int)((sizeof(mount_tail) + 3) / 4);
+    n += tail_words;
+    if (n > 96) return -1;
+    uint64_t tail_va = code_va + (uint64_t)tail_off_bytes;
 
     /* ---- fix up the ldr literals ---- */
     for (int i = 0; i < nfld; i++) {
@@ -857,6 +971,7 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     pool_val[P_SRC]     = src_va;
     pool_val[P_MOUNT]   = real_mount;
     pool_val[P_RAW]     = str_va;
+    pool_val[P_TAIL]    = tail_va;
     for (int i = 0; i < P_COUNT; i++) {
         w[pool_idx + i * 2 + 0] = (uint32_t)(pool_val[i] & 0xffffffffu);
         w[pool_idx + i * 2 + 1] = (uint32_t)(pool_val[i] >> 32);
@@ -876,6 +991,7 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
     memset(out, 0, total);
     memcpy(out, w, total);
     memcpy(out + str_off_bytes, raw_string, raw_len);
+    memcpy(out + tail_off_bytes, mount_tail, sizeof(mount_tail));
 
     return (int)total;
 }
@@ -2145,6 +2261,145 @@ static int umount_handler_exec_selftest(void) {
 #endif
 }
 
+#if defined(__aarch64__)
+/* What the mount handler asked libc mount for, call by call. All five
+ * arguments are recorded, because the whole claim about a path that is not
+ * ours is that the call goes through *unchanged* — same source, same type,
+ * same flags — and a test that only counted the calls could not tell that
+ * from a handler that quietly rewrote them. */
+#define MT_MAX 8
+static int           g_mt_calls;
+static const char   *g_mt_src[MT_MAX];
+static char          g_mt_tgt[MT_MAX][256];
+static const char   *g_mt_type[MT_MAX];
+static unsigned long g_mt_flags[MT_MAX];
+
+static int fake_mount(const char *src, const char *tgt, const char *type,
+                      unsigned long flags, const void *data) {
+    (void)data;
+    int i = g_mt_calls < MT_MAX ? g_mt_calls : MT_MAX - 1;
+    g_mt_src[i]   = src;
+    g_mt_tgt[i][0] = '\0';
+    if (tgt) snprintf(g_mt_tgt[i], sizeof(g_mt_tgt[i]), "%s", tgt);
+    g_mt_type[i]  = type;
+    g_mt_flags[i] = flags;
+    g_mt_calls++;
+    return 0;
+}
+#endif
+
+/* Runs the emitted mount handler as machine code and checks, per target, both
+ * how many mounts it makes and what it asked for. The SD-card cases are the
+ * regression: before the target-tail test existed, every one of them came back
+ * with /data/media bound over it.
+ *
+ * Only *reachable* targets appear here. find_fuse_site() proves vold has
+ * exactly one mount("/dev/fuse", …, MS_LAZYTIME) call site, MountUserFuse(),
+ * and its target is always "/mnt/user/%d/%s" — so shapes like
+ * "/mnt/user//emulated" cannot arise, and the tail test agrees with the
+ * umount2 handler's shape test on everything that can. */
+static int mount_handler_exec_selftest(void) {
+#if !defined(__aarch64__)
+    return 0;   /* the handler is aarch64 machine code; nothing to run here */
+#else
+    static const char          k_src[]   = "/dev/fuse";
+    static const char          k_type[]  = "fuse";
+    static const unsigned long k_flags   = 0x0200040eu;   /* MS_…|MS_LAZYTIME */
+    static const unsigned long k_bind    = 4096u | 16384u; /* MS_BIND|MS_REC */
+
+    static const struct {
+        const char *tgt; int want_calls; bool want_bind;
+    } cases[] = {
+        /* the emulated volume: the FUSE mount, then the raw tree on top */
+        { "/mnt/user/0/emulated",                2, true  },
+        { "/mnt/user/10/emulated",               2, true  },
+        { "/mnt/user/999/emulated",              2, true  },
+        /* a physical SD card — the reported bug. One call, the caller's own,
+         * and nothing bound: the card keeps its FUSE view and its files. */
+        { "/mnt/user/0/0395-1716",               1, false },
+        { "/mnt/user/0/ABCD-EFGH",               1, false },
+        { "/mnt/user/10/1234-5678",              1, false },
+        /* adopted storage: getLabel() hands over the fsUuid, not "emulated" */
+        { "/mnt/user/0/1a2b3c4d-5e6f",           1, false },
+        /* tails that merely look like it */
+        { "/mnt/user/0/emulatedx",               1, false },
+        { "/mnt/user/0/emulate",                 1, false },
+        { "/mnt/user/0/Emulated",                1, false },
+        { "/mnt/user/0/emulated/0/Android/data", 1, false },
+        /* short paths: the length guard has to reject them without reading
+         * outside the string */
+        { "/data",                               1, false },
+        { "/",                                   1, false },
+        { "",                                    1, false },
+    };
+
+    long pg = sysconf(_SC_PAGESIZE);
+    size_t pgsz = pg > 0 ? (size_t)pg : 4096;
+    void *mem = mmap(NULL, pgsz, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        fprintf(stderr, "selftest: исполняемую память не дали (%s) — "
+                        "прогон машины пропущен\n", strerror(errno));
+        return 0;   /* not a failure: the structural checks still ran */
+    }
+
+    uint8_t blob[512];
+    int n = build_handler(blob, sizeof(blob), (uint64_t)(uintptr_t)mem,
+                          (uint64_t)(uintptr_t)&fake_mount,
+                          (uint64_t)(uintptr_t)k_src,
+                          (uint64_t)(uintptr_t)k_type, RAW_PATH);
+    if (n <= 0) {
+        munmap(mem, pgsz);
+        fprintf(stderr, "selftest FAIL: build_handler вернул %d\n", n);
+        return 1;
+    }
+    memcpy(mem, blob, (size_t)n);
+    __builtin___clear_cache((char *)mem, (char *)mem + n);
+
+    typedef int (*mt_fn)(const char *, const char *, const char *,
+                         unsigned long, const void *);
+    mt_fn fn = (mt_fn)(void *)mem;
+
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char pbuf[256];
+        snprintf(pbuf, sizeof(pbuf), "%s", cases[i].tgt);
+        g_mt_calls = 0;
+        errno = 0;
+
+        int rc = fn(k_src, pbuf, k_type, k_flags, NULL);
+
+        bool ok = (g_mt_calls == cases[i].want_calls) && rc == 0 &&
+                  g_mt_src[0] == k_src && g_mt_type[0] == k_type &&
+                  g_mt_flags[0] == k_flags &&
+                  strcmp(g_mt_tgt[0], cases[i].tgt) == 0;
+        if (ok && cases[i].want_bind) {
+            /* the second mount is the raw tree, over the same target */
+            ok = g_mt_src[1] != NULL &&
+                 strcmp(g_mt_src[1], RAW_PATH) == 0 &&
+                 g_mt_type[1] == NULL &&
+                 g_mt_flags[1] == k_bind &&
+                 strcmp(g_mt_tgt[1], cases[i].tgt) == 0;
+        }
+        if (!ok) {
+            fprintf(stderr, "selftest FAIL: \"%s\": вызовов %d (ждали %d),"
+                            " rc %d, второй вызов src=\"%s\" type=%s flags=%#lx\n",
+                    cases[i].tgt, g_mt_calls, cases[i].want_calls, rc,
+                    (cases[i].want_calls > 1 && g_mt_src[1]) ? g_mt_src[1]
+                                                             : "(нет)",
+                    (cases[i].want_calls > 1 && g_mt_type[1]) ? g_mt_type[1]
+                                                              : "(null)",
+                    (cases[i].want_calls > 1) ? g_mt_flags[1] : 0UL);
+            bad++;
+        }
+    }
+    munmap(mem, pgsz);
+
+    if (bad) return 1;
+    return 0;
+#endif
+}
+
 /* The two handlers have to fit in the one zero run find_handler_room() asks
  * for. That constant (512) and this check are two halves of the same claim, so
  * they are asserted together rather than left to drift apart. */
@@ -2360,7 +2615,6 @@ static int selftest(void) {
 
     struct { const char *what; uint32_t got, want; } checks[] = {
         { "word0 = bti jc", w[0], 0xd50324dfu },
-        { "word1 = stp x29,x30", w[1], 0xa9bf7bfdu },
         { "word2 = mov x29,sp", w[2], 0x910003fdu },
     };
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -2369,6 +2623,17 @@ static int selftest(void) {
                     checks[i].what, checks[i].got, checks[i].want);
             return 1;
         }
+    }
+    /* word1 = `stp x29, x30, [sp, #-N]!` with N read from the encoding, not
+     * pinned: the frame size follows from whether a slot had to be kept for
+     * the mount target, and the prologue/epilogue comparison below is what
+     * proves the size is consistent. Pinning N here as well would make this
+     * check fail for a correct handler the day the frame changes, which is
+     * how a test teaches you to weaken the real check. */
+    if ((w[1] & 0xffc07fffu) != 0xa9807bfdu) {
+        fprintf(stderr, "selftest FAIL: word1 = stp x29,x30: got %08x want"
+                        " 0xa9807bfd|imm7<<15\n", w[1]);
+        return 1;
     }
 
     /* Find the pass block. Two anchors are acceptable, and which one the
@@ -2402,25 +2667,63 @@ static int selftest(void) {
     }
     int branch_target = -1;
     for (int i = pass - 1; i >= 0; i--) {
-        if (w[i] == 0xa8c17bfdu) { branch_target = i; break; }
+        /* `ldp x29, x30, [sp], #N` — the post-index form with Rt=29, Rt2=30.
+         * The N is not pinned to 16: the handler's frame grew to 32 when the
+         * mount target had to be parked on the stack (a register cannot hold
+         * it across the first mount call), so this decodes the immediate and
+         * requires what actually matters — the restore pops the same frame the
+         * prologue pushed, i.e. the same N, or the caller's sp comes back
+         * shifted and its own epilogue reads the wrong words. */
+        if ((w[i] & 0xffc07fffu) == 0xa8c07bfdu) { branch_target = i; break; }
         /* Only the pool load may sit between the restore and the br. */
         if ((w[i] >> 24) != 0x58u && (w[i] >> 24) != 0x18u) break;
     }
     if (branch_target < 0) {
         fprintf(stderr, "selftest FAIL: перед 'br x9' (слово %d) нет "
-                        "'ldp x29,x30,[sp],#16'\n", pass);
+                        "'ldp x29,x30,[sp],#N'\n", pass);
         return 1;
     }
+    /* The prologue pushes the same amount the epilogue pops. Reading the two
+     * imm7 fields (bits 21:15) and requiring them equal is the check that
+     * makes "the caller's sp is restored exactly" a fact rather than a
+     * convention: a prologue that pushes 32 and an epilogue that pops 16
+     * leaves sp wrong by 16 on the pass path, and the caller then returns
+     * into a frame that is not there. */
+    {
+        /* The two imm7 fields are negatives of each other: the pre-index STP
+         * encodes the offset as signed (-N) and the post-index LDP as +N, both
+         * as a multiple of 8. So `push #-32` is imm7 = -4 & 0x7f = 0x7c and
+         * `pop #32` is imm7 = 4. Compare the magnitudes, then confirm the push
+         * really was a push (negative) and the pop a pop (positive). */
+        int pro_imm7  = (int)((w[1] >> 15) & 0x7f);
+        int epi_imm7  = (int)((w[branch_target] >> 15) & 0x7f);
+        int pro_signed = (pro_imm7 & 0x40) ? pro_imm7 - 0x80 : pro_imm7;
+        int epi_signed = (epi_imm7 & 0x40) ? epi_imm7 - 0x80 : epi_imm7;
+        if ((w[1] & 0xffc07fffu) != 0xa9807bfdu) {
+            fprintf(stderr, "selftest FAIL: пролог не 'stp x29,x30,[sp,#-N]!'"
+                            " (слово 1 = %08x)\n", w[1]);
+            return 1;
+        }
+        if (pro_signed >= 0 || epi_signed <= 0 || pro_signed != -epi_signed) {
+            fprintf(stderr, "selftest FAIL: пролог и эпилог кадра не сходятся:"
+                            " push #%d, pop #%d\n", pro_signed * 8, epi_signed * 8);
+            return 1;
+        }
+    }
 
-    /* Every classification branch — two b.ne on the argument pointers, one
-     * b.eq on MS_LAZYTIME — must target the pass block. This is checked by
-     * *decoding* the emitted imm19, so an encoder that silently lost the delta
-     * (the bug this test was written after) is caught even though the word
-     * count is right. The conditions are counted separately as well: a handler
-     * that lost the b.eq, or emitted it as another b.ne, would still show three
-     * branches but would take over AppFuseUtil::Mount() — the defect this
-     * branch exists to prevent. */
-    int ncond = 0, n_ne = 0, n_eq = 0;
+    /* Every classification branch must target the pass block. There are five:
+     * two b.ne on the argument pointers, one b.eq on MS_LAZYTIME, and two from
+     * the target-tail matcher — a b.lo that rejects any path shorter than
+     * "/emulated" and a b.ne on the first byte that differs from it. This is
+     * checked by *decoding* the emitted imm19, so an encoder that silently lost
+     * the delta (the bug this test was written after) is caught even though the
+     * word count is right. The conditions are counted separately as well: a
+     * handler that lost the b.eq, or emitted it as another b.ne, would still
+     * show the same number of branches but would take over
+     * AppFuseUtil::Mount() — the defect this branch exists to prevent. A
+     * handler that lost one of the tail branches would bind /data/media over a
+     * physical SD card again, which is the defect they exist to prevent. */
+    int ncond = 0, n_ne = 0, n_eq = 0, n_lo = 0;
     for (int i = 0; i < nw; i++) {
         /* b.cond is 0x5400_0000 | imm19<<5 | cond: the opcode lives in bits
          * 31..24 and the condition in bits 3..0, with imm19 in between. So the
@@ -2438,9 +2741,10 @@ static int selftest(void) {
         int cond = dec_b_cond(&d, w[i]);
         if (cond == COND_NE) n_ne++;
         else if (cond == COND_EQ) n_eq++;
+        else if (cond == COND_LO) n_lo++;
         else {
             fprintf(stderr, "selftest FAIL: b.cond со словом %d — cond %d,"
-                            " ждали b.ne или b.eq\n", i, cond);
+                            " ждали b.ne, b.eq или b.lo\n", i, cond);
             return 1;
         }
         int dst = i + (int)d;
@@ -2456,9 +2760,10 @@ static int selftest(void) {
             return 1;
         }
     }
-    if (ncond != 3 || n_ne != 2 || n_eq != 1) {
-        fprintf(stderr, "selftest FAIL: условных переходов %d (b.ne %d, b.eq %d),"
-                        " ждали 3 (2 b.ne + 1 b.eq)\n", ncond, n_ne, n_eq);
+    if (ncond != 5 || n_ne != 3 || n_eq != 1 || n_lo != 1) {
+        fprintf(stderr, "selftest FAIL: условных переходов %d (b.ne %d, b.eq %d,"
+                        " b.lo %d), ждали 5 (3 b.ne + 1 b.eq + 1 b.lo)\n",
+                        ncond, n_ne, n_eq, n_lo);
         return 1;
     }
 
@@ -2491,16 +2796,95 @@ static int selftest(void) {
         }
     }
 
-    /* The take-over path must end `ldp x29,x30,[sp],#16; ret`, and that is the
+    /* Both tail-matching loops must return to the right load.
+     *
+     * The property to check is NOT "the branch returns to a load of the same
+     * register it tests". The second loop is `ldrb w10,[x12],#1;
+     * ldrb w11,[x13],#1; cmp w10,w11; b.ne pass; cbnz w11, <back>`, and it
+     * tests w11 but MUST return to the FIRST ldrb: that is the one that
+     * advances the path pointer (x12). Returning to the second — which is what
+     * "same register as the branch" demands — drops the path advance, so the
+     * compare holds the path byte still while the template walks on, the very
+     * next byte mismatches, and every path falls through to pass-through.
+     *
+     * That check used to be written as `w[target] & 0x1f == rt`, and it is
+     * what caused the bug rather than catching it: it forced the emitter onto
+     * the second ldrb. The handler then never stacked the bind for ANY path,
+     * the module silently stopped doing its job, and the host selftest stayed
+     * green — because the check asserted exactly the wrong invariant. Only
+     * running it on a device CPU (`--selftest` there, aarch64-only) showed it.
+     *
+     * What actually has to hold: each byte loop re-runs BOTH loads, so the
+     * loop's target must be an `ldrb …, [Xn], #1` (any register) and the two
+     * loops must close on two DIFFERENT loads. A loop that closes on the
+     * second load while skipping the first fails the "different" test, and an
+     * off-by-one (target one word past a load) fails the `is_ldrb` test. */
+    {
+        int loops = 0;
+        int targets[4];
+        for (int i = 0; i < branch_target; i++) {
+            if ((w[i] >> 24) != 0x35u) continue;                 /* not cbnz */
+            int rt = 0, nz = 0;
+            int64_t d = dec_cbnz_w(w[i], &rt, &nz);
+            int64_t target = (int64_t)i + d;
+            if (target < 0 || target >= branch_target) {
+                fprintf(stderr, "selftest FAIL: cbnz на слове %d уходит за блок"
+                                " (%lld)\n", i, (long long)target);
+                return 1;
+            }
+            bool is_ldrb = (w[target] & 0xffe00c00u) == 0x38400400u;
+            if (!is_ldrb) {
+                fprintf(stderr, "selftest FAIL: cbnz на слове %d возвращается"
+                                " на %lld (%08x), а не на 'ldrb Wt, [Xn], #1'"
+                                " — сдвиг на слово?\n",
+                        i, (long long)target, w[target]);
+                return 1;
+            }
+            if (loops >= 4) {
+                fprintf(stderr, "selftest FAIL: байтовых циклов больше 4\n");
+                return 1;
+            }
+            targets[loops++] = (int)target;
+        }
+        if (loops != 2) {
+            fprintf(stderr, "selftest FAIL: байтовых циклов в сопоставителе"
+                            " хвоста %d, ждали 2\n", loops);
+            return 1;
+        }
+        /* The two loops must revisit two distinct loads. If both closed on the
+         * same word, one of the two loads is skipped on every iteration —
+         * exactly the shape of the shipped bug. */
+        if (targets[0] == targets[1]) {
+            fprintf(stderr, "selftest FAIL: оба байтовых цикла возвращаются"
+                            " на слово %d — один из двух ldrb пропускается\n",
+                    targets[0]);
+            return 1;
+        }
+        /* The second loop is the one that tests w11; its target must be the
+         * FIRST of the two adjacent post-index loads, i.e. the one that
+         * advances the path pointer. The two loads it spans are `targets[1]`
+         * and `targets[1]+1`; require the pair to be adjacent and the loop to
+         * close on the lower of them. */
+        if ((w[targets[1] + 1] & 0xffe00c00u) != 0x38400400u) {
+            fprintf(stderr, "selftest FAIL: цикл на слове %d не покрывает два"
+                            " подряд ldrb (следующее слово %08x)\n",
+                    targets[1], w[targets[1] + 1]);
+            return 1;
+        }
+    }
+
+    /* The take-over path must end `ldp x29,x30,[sp],#N; ret`, and that is the
      * end of the *code*. `nw` spans the whole block including the literal pool
      * and the "/data/media" text, so the last words overall are data, not
      * instructions — anchoring on nw-1 would be checking the string. The code
      * ends at the last `ret` reachable before the pass block; the take-over
-     * block's `ret` is the one immediately preceding branch_target's region. */
+     * block's `ret` is the one immediately preceding branch_target's region.
+     * N is not pinned: the frame size is the prologue's business, and the two
+     * are compared above. */
     int ret_at = -1;
     for (int i = 0; i < branch_target; i++)
         if (w[i] == 0xd65f03c0u) ret_at = i;
-    if (ret_at < 1 || w[ret_at - 1] != 0xa8c17bfdu) {
+    if (ret_at < 1 || (w[ret_at - 1] & 0xffc07fffu) != 0xa8c07bfdu) {
         fprintf(stderr, "selftest FAIL: блок не кончается 'ldp; ret'"
                         " (ret на %d, перед ним %08x)\n",
                 ret_at, ret_at >= 1 ? w[ret_at - 1] : 0);
@@ -2533,6 +2917,39 @@ static int selftest(void) {
     if (!have_txt) {
         fprintf(stderr, "selftest FAIL: текст \"%s\" не найден в блоке\n", raw);
         return 1;
+    }
+
+    /* The target-tail template must be shipped too, and P_TAIL must point at
+     * it. Without this the handler would compare the path against whatever
+     * bytes happen to sit past its literal pool — which is exactly the kind of
+     * silent mismatch that put /data/media on the SD card in the first place. */
+    {
+        const char *tail = "/emulated";
+        bool have_tail = false;
+        for (int off = 0; off + (int)sizeof("/emulated") <= n; off++) {
+            if (memcmp(buf + off, tail, sizeof("/emulated")) == 0) {
+                have_tail = true;
+                uint64_t tail_va = code_va + (uint64_t)off;
+                bool found = false;
+                for (int i = 0; i + 1 < nw; i++) {
+                    uint64_t v;
+                    memcpy(&v, &w[i], 8);
+                    if (v == tail_va) { found = true; break; }
+                }
+                if (!found) {
+                    fprintf(stderr, "selftest FAIL: нет пулового слова, "
+                                    "указывающего на \"%s\" (%#llx)\n",
+                            tail, (unsigned long long)tail_va);
+                    return 1;
+                }
+                break;
+            }
+        }
+        if (!have_tail) {
+            fprintf(stderr, "selftest FAIL: текст \"%s\" не найден в блоке\n",
+                    tail);
+            return 1;
+        }
     }
 
     /* the other four pool values must be present verbatim */
@@ -2616,6 +3033,7 @@ static int selftest(void) {
 
     if (anchor_selftest() != 0) return 1;
     if (handlers_fit_selftest() != 0) return 1;
+    if (mount_handler_exec_selftest() != 0) return 1;
     if (umount_handler_exec_selftest() != 0) return 1;
 
     return 0;
