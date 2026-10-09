@@ -25,7 +25,7 @@ set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/.." && pwd)"
 WORK="$ROOT/out/openat-stub"
-WANT_IMAGES=8
+WANT_IMAGES=16
 
 CC="${CC:-}"
 if [[ -z "$CC" ]]; then
@@ -35,8 +35,12 @@ if [[ -z "$CC" ]]; then
 fi
 [[ -n "$CC" ]] || { echo "нет C-компилятора на хосте; задайте CC=..." >&2; exit 2; }
 
+# Оба класса: 8 arm64 (ELF64/AArch64) + 8 arm32 (ELF32/ARM). Форма стаба у них
+# разная, и finder'ов тоже два — тест обязан пройти по обоим.
+# libc-arm.so назван без суффикса версии (это база, как libc-arm64.so), поэтому
+# его приходится перечислять отдельно: под libc-arm-a*.so он не подходит.
 # shellcheck disable=SC2207
-IMAGES=($(cd "$ROOT/device/libc" && ls libc-arm64*.so 2>/dev/null | sort))
+IMAGES=($(cd "$ROOT/device/libc" && ls libc-arm64*.so libc-arm-a*.so libc-arm.so 2>/dev/null | sort))
 if (( ${#IMAGES[@]} != WANT_IMAGES )); then
     echo "эталонных образов ${#IMAGES[@]}, ожидалось $WANT_IMAGES — тест был бы неполным" >&2
     exit 2
@@ -52,7 +56,8 @@ echo "=== хостовый тест поиска стаба openat ($CC) ==="
     cd "$WORK" || exit 2
     "$CC" -std=c11 -O1 -Wall -Wextra -Wno-unused-function \
           test-openat-stub.c -o probe 2>&1 || exit 2
-    ./probe ../../device/libc/libc-arm64*.so
+    ./probe ../../device/libc/libc-arm64*.so ../../device/libc/libc-arm-a*.so \
+            ../../device/libc/libc-arm.so
 ) 
 rc=$?
 echo

@@ -1,9 +1,12 @@
 /*
  * hookselftest.cpp — check the libc entry-patching on the device itself.
- * Built as a normal arm64 dynamic executable, run as root on the phone. Checks:
+ * Built as a normal dynamic executable (arm64-v8a or armeabi-v7a), run as root
+ * on the phone. Checks:
  *   1. target sizes from .dynsym ON DEVICE match the host preflight
  *      (tools/verify-hook-targets.py) — two independent ELF readers agree;
- *   2. entry bytes become bti jc / ldr x17,#8 / br x17 (20 байт);
+ *   2. entry bytes become the ABI's patch form: arm64 bti jc / ldr x17,#8 /
+ *      br x17 (20 байт), arm32 ldr.w pc,[pc,#0] + литерал (8) или movw/movt/bx
+ *      (10) или ldr pc,[pc,#-4] + литерал (8) — и литерал равен обработчику;
  *   3. modes are coerced to sdcardfs form (0600->0660, 0700->0770) plus a 9997
  *      ACL entry;
  *   4. .plt thunk coverage works: creat, mkstemp(s), mkdtemp are not patched
@@ -36,6 +39,15 @@
 
 #include "func_size.h"
 #include "hook_libc.h"
+
+// Формы патча входа ARM32 — та же чистая функция, что у модуля (src/arm32_patch.h).
+#include "arm32_patch.h"
+
+// Обработчики, которые модуль ставит на входы: по ним проверяем, что записанный
+// литерал указывает именно на нужный. __openat_2 — своя цель со своим
+// обработчиком (h_openat_2), а h_openat идёт на стаб сисколла __openat.
+extern "C" int h_openat(int dirfd, const char *path, int flags, mode_t mode);
+extern "C" int h_openat_2(int dirfd, const char *path, int flags);
 
 namespace {
 
@@ -213,13 +225,45 @@ void test_patch_bytes() {
     void *fn = dlsym(RTLD_DEFAULT, "__openat_2");
     check(fn != nullptr, "__openat_2 разрешён через dlsym");
     if (fn != nullptr) {
+        // Форма патча входа зависит от ABI (patch_entry в src/hook_libc.cpp).
+        // На arm32 она ещё и от выравнивания, поэтому сверяем весь блоб целиком
+        // той же чистой функцией, что и модуль, — а не набор констант.
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(fn);
+        // Обработчик этой цели — h_openat_2 (не h_openat: тот стоит на стабе
+        // сисколла __openat). На arm64 литерал сверяется с ним напрямую, на
+        // arm32 он же уходит в arm32_patch_bytes.
+        [[maybe_unused]] const uint32_t handler =
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&h_openat_2));
+        char what[240];
+#if defined(__aarch64__)
         const uint32_t *w = static_cast<const uint32_t *>(fn);
-        char what[200];
+        const uint64_t lit = *reinterpret_cast<const uint64_t *>(raw + 12);
         snprintf(what, sizeof what,
-                 "вход __openat_2 = bti jc / ldr x17,#8 / br x17 "
-                 "(получено 0x%08x 0x%08x 0x%08x)",
-                 w[0], w[1], w[2]);
-        check(w[0] == 0xd50324dfu && w[1] == 0x58000051u && w[2] == 0xd61f0220u, what);
+                 "вход __openat_2 = bti jc / ldr x17,#8 / br x17 + литерал "
+                 "(получено 0x%08x 0x%08x 0x%08x, литерал 0x%llx)",
+                 w[0], w[1], w[2], static_cast<unsigned long long>(lit));
+        check(w[0] == 0xd50324dfu && w[1] == 0x58000051u && w[2] == 0xd61f0220u &&
+                  lit == reinterpret_cast<uintptr_t>(&h_openat_2),
+              what);
+#elif defined(__arm__)
+        uint8_t expect[ARM32_PATCH_THUMB2];
+        const size_t n = arm32_patch_bytes(raw, handler, expect);
+        const uint8_t *got = reinterpret_cast<const uint8_t *>(raw & ~static_cast<uintptr_t>(1));
+        bool same = true;
+        for (size_t i = 0; i < n; i++) {
+            if (got[i] != expect[i]) { same = false; break; }
+        }
+        snprintf(what, sizeof what,
+                 "вход __openat_2 = форма патча ARM32 (%zu байт, %s), литерал = h_openat_2",
+                 n, arm32_is_thumb(raw) ? ((raw & ~static_cast<uintptr_t>(1)) % 4u
+                                               ? "Thumb-2 10" : "Thumb-2 8")
+                                        : "ARM 8");
+        check(same, what);
+#else
+        (void)raw;
+        (void)handler;
+        check(false, "неизвестная ABI — форма патча входа не проверена");
+#endif
     }
 }
 

@@ -43,8 +43,8 @@ bool read_at(int fd, void *buf, size_t count, off_t off) {
 }
 
 // Aliased symbols (same st_value) take the largest size.
-void scan_symtab(const uint8_t *tab, size_t count, size_t entsize,
-                 Target *targets, int n) {
+void scan_symtab64(const uint8_t *tab, size_t count, size_t entsize,
+                   Target *targets, int n) {
     for (size_t i = 0; i < count; i++) {
         const uint8_t *p = tab + i * entsize;
         const Elf64_Sym *s = reinterpret_cast<const Elf64_Sym *>(p);
@@ -61,27 +61,33 @@ void scan_symtab(const uint8_t *tab, size_t count, size_t entsize,
     }
 }
 
-void scan_object(const char *path, Target *targets, int n) {
-    const int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
+// ELF32: тот же разбор для armeabi-v7a. st_value у Thumb-функции несёт бит
+// режима (нечётен), и dlsym отдаёт адрес с тем же битом, поэтому сравнение
+// sym_value == st_value сходится и здесь — снимать бит не нужно.
+void scan_symtab32(const uint8_t *tab, size_t count, size_t entsize,
+                   Target *targets, int n) {
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t *p = tab + i * entsize;
+        const Elf32_Sym *s = reinterpret_cast<const Elf32_Sym *>(p);
+        const uint8_t type = ELF32_ST_TYPE(s->st_info);
+        if (type != STT_FUNC && type != STT_GNU_IFUNC) continue;
+        if (s->st_value == 0) continue;
 
-    Elf64_Ehdr eh;
-    if (!read_at(fd, &eh, sizeof eh, 0) ||
-        memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
-        eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_ident[EI_DATA] != ELFDATA2LSB ||
-        eh.e_machine != EM_AARCH64 ||
-        eh.e_shnum == 0 || eh.e_shentsize < sizeof(Elf64_Shdr)) {
-        close(fd);
-        return;
+        for (int k = 0; k < n; k++) {
+            if (s->st_value != targets[k].sym_value) continue;
+            const unsigned sz = static_cast<unsigned>(s->st_size);
+            if (!targets[k].found || sz > targets[k].size) targets[k].size = sz;
+            targets[k].found = true;
+        }
     }
+}
 
+void scan_object64(int fd, const Elf64_Ehdr &eh, Target *targets, int n) {
     const size_t shbytes = static_cast<size_t>(eh.e_shnum) * sizeof(Elf64_Shdr);
     Elf64_Shdr *shdrs = static_cast<Elf64_Shdr *>(malloc(shbytes));
     if (shdrs == nullptr ||
         !read_at(fd, shdrs, shbytes, static_cast<off_t>(eh.e_shoff))) {
         free(shdrs);
-        close(fd);
         return;
     }
 
@@ -93,12 +99,71 @@ void scan_object(const char *path, Target *targets, int n) {
         uint8_t *tab = static_cast<uint8_t *>(malloc(sh.sh_size));
         if (tab == nullptr) continue;
         if (read_at(fd, tab, sh.sh_size, static_cast<off_t>(sh.sh_offset))) {
-            scan_symtab(tab, sh.sh_size / sh.sh_entsize, sh.sh_entsize, targets, n);
+            scan_symtab64(tab, sh.sh_size / sh.sh_entsize, sh.sh_entsize, targets, n);
         }
         free(tab);
     }
 
     free(shdrs);
+}
+
+void scan_object32(int fd, const Elf32_Ehdr &eh, Target *targets, int n) {
+    const size_t shbytes = static_cast<size_t>(eh.e_shnum) * sizeof(Elf32_Shdr);
+    Elf32_Shdr *shdrs = static_cast<Elf32_Shdr *>(malloc(shbytes));
+    if (shdrs == nullptr ||
+        !read_at(fd, shdrs, shbytes, static_cast<off_t>(eh.e_shoff))) {
+        free(shdrs);
+        return;
+    }
+
+    for (int i = 0; i < eh.e_shnum; i++) {
+        const Elf32_Shdr &sh = shdrs[i];
+        if (sh.sh_type != SHT_DYNSYM || sh.sh_entsize < sizeof(Elf32_Sym)) continue;
+        if (sh.sh_size == 0) continue;
+
+        uint8_t *tab = static_cast<uint8_t *>(malloc(sh.sh_size));
+        if (tab == nullptr) continue;
+        if (read_at(fd, tab, sh.sh_size, static_cast<off_t>(sh.sh_offset))) {
+            scan_symtab32(tab, sh.sh_size / sh.sh_entsize, sh.sh_entsize, targets, n);
+        }
+        free(tab);
+    }
+
+    free(shdrs);
+}
+
+void scan_object(const char *path, Target *targets, int n) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+
+    // Класс и машина — по заголовку, а не по ABI сборки: на arm64-сборке
+    // аргументом может оказаться 32-битный объект (и наоборот), и молча
+    // вернуть нули из-за неверного класса — худший исход, чем разобрать его.
+    uint8_t ident[EI_NIDENT];
+    if (!read_at(fd, ident, sizeof ident, 0) || memcmp(ident, ELFMAG, SELFMAG) != 0 ||
+        ident[EI_DATA] != ELFDATA2LSB) {
+        close(fd);
+        return;
+    }
+
+    if (ident[EI_CLASS] == ELFCLASS64) {
+        Elf64_Ehdr eh;
+        if (!read_at(fd, &eh, sizeof eh, 0) || eh.e_machine != EM_AARCH64 ||
+            eh.e_shnum == 0 || eh.e_shentsize < sizeof(Elf64_Shdr)) {
+            close(fd);
+            return;
+        }
+        scan_object64(fd, eh, targets, n);
+    } else if (ident[EI_CLASS] == ELFCLASS32) {
+        Elf32_Ehdr eh;
+        if (!read_at(fd, &eh, sizeof eh, 0) || eh.e_machine != EM_ARM ||
+            eh.e_shnum == 0 || eh.e_shentsize < sizeof(Elf32_Shdr)) {
+            close(fd);
+            return;
+        }
+        scan_object32(fd, eh, targets, n);
+    }
+
     close(fd);
 }
 

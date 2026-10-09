@@ -29,7 +29,8 @@ typedef struct {
     int         sdk;        /* ro.build.version.sdk */
     int         release;    /* release number, for hooks_release()'s string */
     const char *codename;   /* AOSP codename, for hooks_release()'s string */
-    int         installed;  /* targets covered -> hooks_install()'s return here */
+    int         installed;  /* targets covered on arm64-v8a */
+    int         installed_arm; /* targets covered on armeabi-v7a */
     const char *vold_acl;   /* AOSP site that writes the ACL vold-noacl disarms */
 } UnfuseVer;
 
@@ -45,6 +46,15 @@ typedef struct {
  *   (8 байт, читается "коротка") и не патчится. __open_2/__openat_2 остаются
  *   корнями: они подставляют 0666 вместо нуля (иначе ACL-маска обнулилась бы).
  *   11 измерен на устройстве (Android 16, hookselftest); остальные совпадают.
+ *
+ *   Обе ABI измерены на эталонных образах (8 arm64 + 8 arm32, tools/check-release-table.py):
+ *   arm64 9 на 11–13 и 8 на 14–17 (там renameat — переходник на renameat2),
+ *   arm32 — 9 на ВСЕХ релизах: там renameat сам корень (20 байт, Thumb-тело,
+ *   зовёт renameat2@plt), а rename/link на arm32 хоть и тела, но не из kHooks и
+ *   покрыты косвенно через renameat2/linkat. Поэтому колонок две: `installed`
+ *   (arm64-v8a) и `installed_arm` (armeabi-v7a) — какую читать, решает ABI
+ *   сборки (unfuse_installed()).
+ *
  *   vold:  the column is a SITE, not a count — setxattr is called exactly once
  *   (11/12/12L/13: Utils.cpp:192, 14/15/16: :195, 17: :196), one
  *   R_AARCH64_JUMP_SLOT each. 11 writes that ACL from fewer places, which is
@@ -64,15 +74,26 @@ typedef struct {
  * linkat, renameat2, plus renameat on 11/12/12L/13) on 11-16 and exactly 20
  * on 17 — no margin. */
 static const UnfuseVer UNFUSE_VERSIONS[] = {
-    {30, 11, "R",               9,  "vold-11/Utils.cpp:192"},
-    {31, 12, "S",               9,  "vold-12/Utils.cpp:192"},
-    {32, 12, "Sv2",             9,  "vold-12l/Utils.cpp:192"},
-    {33, 13, "Tiramisu",        9,  "vold-13/Utils.cpp:192"},
-    {34, 14, "UpsideDownCake",  8,  "vold-14/Utils.cpp:195"},
-    {35, 15, "VanillaIceCream", 8,  "vold-15/Utils.cpp:195"},
-    {36, 16, "Baklava",         8,  "vold-16/Utils.cpp:195"},
-    {37, 17, "CinnamonBun",     8,  "vold-17/Utils.cpp:196"},
+    {30, 11, "R",               9, 9, "vold-11/Utils.cpp:192"},
+    {31, 12, "S",               9, 9, "vold-12/Utils.cpp:192"},
+    {32, 12, "Sv2",             9, 9, "vold-12l/Utils.cpp:192"},
+    {33, 13, "Tiramisu",        9, 9, "vold-13/Utils.cpp:192"},
+    {34, 14, "UpsideDownCake",  8, 9, "vold-14/Utils.cpp:195"},
+    {35, 15, "VanillaIceCream", 8, 9, "vold-15/Utils.cpp:195"},
+    {36, 16, "Baklava",         8, 9, "vold-16/Utils.cpp:195"},
+    {37, 17, "CinnamonBun",     8, 9, "vold-17/Utils.cpp:196"},
 };
+
+/* Сколько целей модуль обязан покрыть на этой сборке — по той ABI, под которую
+ * он собран. Разница только в renameat: на arm32 он корень на всех релизах, на
+ * arm64 с 14 — переходник на renameat2 и не патчится. */
+static inline int unfuse_installed(const UnfuseVer *v) {
+#if defined(__arm__)
+    return v->installed_arm;
+#else
+    return v->installed;
+#endif
+}
 
 #define UNFUSE_VER_COUNT  ((int)(sizeof(UNFUSE_VERSIONS) / sizeof(UNFUSE_VERSIONS[0])))
 

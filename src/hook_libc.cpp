@@ -9,7 +9,9 @@
  * after the chmod (rename applies no default ACL).
  *
  * Only roots are patched (kHooks), see below; no trampoline (handlers syscall
- * directly), handlers must be reentrant (syscalls only). arm64 only.
+ * directly), handlers must be reentrant (syscalls only). Both ABIs:
+ * arm64-v8a (20-byte entry patch, bti jc) and armeabi-v7a (8/10-byte entry
+ * patch, no pad — see patch_entry).
  *
  * The patch is 20 bytes with a leading bti jc — see patch_entry; -1 from
  * hooks_bti_report when libc declares BTI but the module was built without it.
@@ -33,6 +35,10 @@
 #include "func_size.h"
 #include "openat_stub.h"
 
+// Формы патча входа ARM32 — чистые функции, те же, что у verifier'а (см. там же
+// про две формы и выравнивание). Включается всегда: на AArch64 не используется.
+#include "arm32_patch.h"
+
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,7 +57,7 @@ namespace {
 // AID_EVERYBODY: shared group of all apps in a profile (sdcardfs mounts).
 constexpr uint32_t kAidEverybody = 9997;
 
-// A thunk is never longer. arm64 only (see tail_call_target).
+// A thunk is never longer. Один порог на оба ABI (см. tail_call_target).
 [[maybe_unused]] constexpr unsigned kThunkMax = 32;
 
 constexpr const char *kAclAccess = "system.posix_acl_access";
@@ -347,6 +353,11 @@ constexpr uint32_t kLdrX17 = 0x58000051u;  // ldr x17, #8
 constexpr uint32_t kBrX17 = 0xd61f0220u;   // br  x17
 constexpr size_t kPatchSize = 20;
 
+// Сколько байт нужно под патч по этому адресу. На AArch64 ширина одна — 20, и
+// от адреса не зависит; на arm32 — 8 или 10 (см. #elif ниже). Через неё движок
+// сравнивает размер цели, поэтому она и есть порог «короче патча».
+size_t patch_width(const void *) { return kPatchSize; }
+
 bool patch_entry(void *target, void *handler) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(target);
     if ((addr & 3u) != 0) {
@@ -428,10 +439,175 @@ void *tail_call_target(const void *fn, unsigned size) {
     return const_cast<uint32_t *>(static_cast<const uint32_t *>(fn)) + off;
 }
 
+#elif defined(__arm__)
+
+// ---- armeabi-v7a: патч входа 8 или 10 байт ----------------------------------
+//
+// Формы и правила — в src/arm32_patch.h (там же, почему их две и почему у
+// Thumb-2 при entry%4==2 патч шире). Здесь — только запись в чужую страницу;
+// байты берутся из arm32_patch_bytes, чтобы форма была ровно одна и та же в
+// модуле, в verifier'е и в хостовом тесте (tools/test-arm32-patch.sh).
+size_t patch_width(const void *target) {
+    return arm32_patch_width(reinterpret_cast<uintptr_t>(target));
+}
+
+bool patch_entry(void *target, void *handler) {
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(target);
+    const uintptr_t addr = raw & ~static_cast<uintptr_t>(1);
+
+    // ARM-инструкции 4-байтные; Thumb-2 допускает 2-выравнивание (форма 10 байт).
+    if (!arm32_is_thumb(raw) && (addr & 3u) != 0) return false;
+
+    const size_t width = arm32_patch_width(raw);
+    uint8_t blob[ARM32_PATCH_THUMB2];
+    arm32_patch_bytes(raw,
+                      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(handler)), blob);
+
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return false;
+    const uintptr_t page = addr & ~(static_cast<uintptr_t>(ps) - 1);
+
+    // Патч может лечь через границу страницы; отображаем обе.
+    const size_t span = static_cast<size_t>(addr - page) + width;
+    const size_t mlen = (span + static_cast<size_t>(ps) - 1) & ~(static_cast<size_t>(ps) - 1);
+
+    if (mprotect(reinterpret_cast<void *>(page), mlen,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return false;
+    }
+
+    // Порядок тот же по смыслу, что на AArch64: сначала всё, кроме замыкающей
+    // ветки, последней — сама ветка. До неё вход либо исполняет оригинал
+    // (литерал ничего не значит, пока нет ldr), либо (Thumb-2 2-выровненный)
+    // полусломается — но это окно в один стор, и этот код бежит из
+    // postAppSpecialize, когда вход никто не исполняет.
+    if (width == ARM32_PATCH_THUMB2) {
+        // movw/movt (blob[0..7]) — 2-байтными сторами: адрес 2-выровнен, а
+        // 4-байтный стор был бы невыровненным (на ARM это отказ выравнивания).
+        auto *hw = reinterpret_cast<volatile uint16_t *>(addr);
+        hw[0] = static_cast<uint16_t>(blob[0] | (blob[1] << 8));
+        hw[1] = static_cast<uint16_t>(blob[2] | (blob[3] << 8));
+        hw[2] = static_cast<uint16_t>(blob[4] | (blob[5] << 8));
+        hw[3] = static_cast<uint16_t>(blob[6] | (blob[7] << 8));
+        hw[4] = static_cast<uint16_t>(blob[8] | (blob[9] << 8));  // bx r12 — последним
+    } else {
+        // 4-выровненный вход: сначала литерал (blob[4..7]), затем инструкция.
+        auto *lit = reinterpret_cast<volatile uint32_t *>(addr + 4);
+        auto *insn = reinterpret_cast<volatile uint32_t *>(addr);
+        *lit = static_cast<uint32_t>(blob[4] | (blob[5] << 8) | (blob[6] << 16) |
+                                     (static_cast<uint32_t>(blob[7]) << 24));
+        *insn = static_cast<uint32_t>(blob[0] | (blob[1] << 8) | (blob[2] << 16) |
+                                      (static_cast<uint32_t>(blob[3]) << 24));
+    }
+
+    __builtin___clear_cache(reinterpret_cast<char *>(addr),
+                            reinterpret_cast<char *>(addr) + width);
+
+    // Обратное чтение побайтово: страница могла остаться read-only или запись не
+    // доехать — тогда патч молча не встал бы, а цель числилась бы ok.
+    bool wrote = true;
+    const auto *got = reinterpret_cast<const volatile uint8_t *>(addr);
+    for (size_t i = 0; i < width; i++) {
+        if (got[i] != blob[i]) {
+            wrote = false;
+            break;
+        }
+    }
+
+    if (!wrote) {
+        mprotect(reinterpret_cast<void *>(page), mlen, PROT_READ | PROT_EXEC);
+        return false;
+    }
+
+    mprotect(reinterpret_cast<void *>(page), mlen, PROT_READ | PROT_EXEC);
+    return true;
+}
+
+// Цель Thumb-2 B.W/BL/BLX (T4) по двум полусловам.
+int32_t thumb_branch_imm(uint16_t hw1, uint16_t hw2) {
+    const int32_t s = (hw1 >> 10) & 1;
+    const int32_t j1 = (hw2 >> 13) & 1;
+    const int32_t j2 = (hw2 >> 11) & 1;
+    const int32_t i1 = 1 - (j1 ^ s);
+    const int32_t i2 = 1 - (j2 ^ s);
+    int32_t imm = (s << 24) | (i1 << 23) | (i2 << 22) |
+                  (static_cast<int32_t>(hw1 & 0x3FFu) << 12) |
+                  (static_cast<int32_t>(hw2 & 0x7FFu) << 1);
+    if (s) imm -= (1 << 25);
+    return imm;
+}
+
+uint16_t half_at(uintptr_t a) { return *reinterpret_cast<const uint16_t *>(a); }
+uint32_t word_at(uintptr_t a) { return *reinterpret_cast<const uint32_t *>(a); }
+
+// Переходник ли функция ARM32: коротка (<= kThunkMax) И кончается переходом
+// bionic. Возвращает цель перехода или nullptr. Формы — ровно те, что у
+// arm_tail_target в tools/verify-hook-targets.py:
+//   * Thumb-обёртка, кончающаяся b.n (2 байта) или b.w (4 байта);
+//   * __ThumbV7PILongThunk_* (12 байт): movw/movt r12; add r12,pc; bx r12;
+//   * __ARMV7PILongThunk_*  (16 байт): movw/movt r12; add r12,r12,pc; bx r12.
+//
+// Хвостовой ARM-`b` переходником НЕ считается намеренно: им кончается каждый
+// сисколл-стаб bionic (`b __set_errno_internal`, 32 байта), а стаб — это корень,
+// который и надо патчить. Правило «коротка и кончается переходом» (как на
+// AArch64) приняло бы все четыре стаба за переходники и оставило образ без
+// корней. Движку результат нужен как булев — «это переходник»; цель отдаём для
+// полноты и проверяемости.
+void *tail_call_target(const void *fn, unsigned size) {
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(fn);
+    const bool thumb = (raw & 1u) != 0;
+    const uintptr_t addr = raw & ~static_cast<uintptr_t>(1);
+    if (size < 2 || size > kThunkMax) return nullptr;
+
+    if (thumb) {
+        const uint16_t last = half_at(addr + size - 2);
+        if ((last & 0xF800u) == 0xE000u) {              // b.n T2
+            int32_t imm = last & 0x7FFu;
+            if (imm & 0x400) imm -= 0x800;
+            return reinterpret_cast<void *>(addr + size + 2 + imm * 2);
+        }
+        if (size < 4) return nullptr;
+
+        const uint16_t hw1 = half_at(addr + size - 4);
+        if ((hw1 & 0xF800u) == 0xF000u && (last & 0xD000u) == 0x9000u) {  // b.w T4
+            return reinterpret_cast<void *>(addr + size + thumb_branch_imm(hw1, last));
+        }
+        if (size == 12) {                               // __ThumbV7PILongThunk_*
+            const uint16_t h0 = half_at(addr + 0), h1 = half_at(addr + 2);
+            const uint16_t h2 = half_at(addr + 4), h3 = half_at(addr + 6);
+            const uint16_t h4 = half_at(addr + 8), h5 = half_at(addr + 10);
+            if ((h0 & 0xFBF0u) == 0xF240u && (h2 & 0xFBF0u) == 0xF2C0u &&
+                h4 == 0x44FCu && h5 == 0x4760u) {
+                const uint32_t lo = ((h0 & 0xFu) << 12) | (((h0 >> 10) & 1u) << 11) |
+                                    (((h1 >> 12) & 7u) << 8) | (h1 & 0xFFu);
+                const uint32_t hi = ((h2 & 0xFu) << 12) | (((h2 >> 10) & 1u) << 11) |
+                                    (((h3 >> 12) & 7u) << 8) | (h3 & 0xFFu);
+                const uintptr_t pc = (addr + 12) & ~static_cast<uintptr_t>(3);
+                return reinterpret_cast<void *>(pc + ((hi << 16) | lo));
+            }
+        }
+        return nullptr;
+    }
+
+    if (size == 16) {                                   // __ARMV7PILongThunk_*
+        const uint32_t w0 = word_at(addr + 0), w1 = word_at(addr + 4);
+        const uint32_t w2 = word_at(addr + 8), w3 = word_at(addr + 12);
+        if ((w0 & 0xFFF0F000u) == 0xE300C000u && (w1 & 0xFFF0F000u) == 0xE340C000u &&
+            w2 == 0xE08CC00Fu && w3 == 0xE12FFF1Cu) {
+            const uint32_t lo = (((w0 >> 16) & 0xFu) << 12) | (w0 & 0xFFFu);
+            const uint32_t hi = (((w1 >> 16) & 0xFu) << 12) | (w1 & 0xFFFu);
+            return reinterpret_cast<void *>(addr + 16 + ((hi << 16) | lo));
+        }
+    }
+    return nullptr;
+}
+
 #else
 
 // Same width as the arm64 patch, so the size gate means the same on both ABIs.
 constexpr size_t kPatchSize = 20;
+
+size_t patch_width(const void *) { return kPatchSize; }
 
 bool patch_entry(void *, void *) {
     return false;
@@ -608,7 +784,12 @@ int g_patched_n = 0;
 // __open_2 и __openat_2 при этом ОСТАЮТСЯ входовыми целями: они зовут __openat
 // с режимом 0, а модуль подставляет туда 0666 — нулевой режим обнулил бы
 // ACL-маску. Сняв их, мы потеряли бы это.
-#if defined(__aarch64__)
+//
+// Стаб ищется по форме на обоих ABI: на arm64 это `mov x8,#0x38; svc #0; ret`,
+// на arm32 — `mov r12,r7; movw r7,#0x142; svc #0; …; b __set_errno_internal`
+// (см. src/openat_stub.h). Форма одна на все релизы, поэтому #if — по ABI, а не
+// по версии Android.
+#if defined(__aarch64__) || defined(__arm__)
 
 struct StubQuery {
     const char *name_part;  // "libc.so"
@@ -653,7 +834,8 @@ void *openat_stub_addr(unsigned *out_size) {
 
 #else
 
-// На v7a переходников нет вовсе: patch_entry под #else возвращает false.
+// Неподдерживаемая ABI (не arm64-v8a и не armeabi-v7a): patch_entry() тоже
+// возвращает false, так что цель честно отчитается как отсутствующая.
 void *openat_stub_addr(unsigned *out_size) {
     if (out_size != nullptr) *out_size = 0;
     return nullptr;
@@ -693,7 +875,9 @@ int hooks_install(int *total) {
     void *fns[kHookCount];
     for (int i = 0; i < kHookCount; i++) fns[i] = dlsym(RTLD_DEFAULT, kHooks[i].name);
 
-    // Sizes: 20 bytes into an 8/12-byte function clobbers the next.
+    // Sizes: a patch wider than the function clobbers the next one. Ширина у
+    // AArch64 одна (20), у arm32 зависит от выравнивания цели (8 или 10), —
+    // поэтому порог берётся из patch_width(fn), а не из константы.
     unsigned sizes[kHookCount];
     func_sizes(fns, kHookCount, sizes);
 
@@ -718,7 +902,7 @@ int hooks_install(int *total) {
             g_state[i] = State::Unknown;
             continue;
         }
-        if (sizes[i] < kPatchSize) {
+        if (sizes[i] < patch_width(fn)) {
             g_state[i] = State::Small;
             continue;
         }
@@ -743,14 +927,14 @@ int hooks_install(int *total) {
         unsigned stub_size = 0;
         void *stub = openat_stub_addr(&stub_size);
         g_stub_state = State::Missing;
-        if (stub != nullptr && stub_size >= kPatchSize && !already_patched(stub) &&
+        if (stub != nullptr && stub_size >= patch_width(stub) && !already_patched(stub) &&
             patch_entry(stub, reinterpret_cast<void *>(h_openat))) {
             g_stub_state = State::Ok;
             if (g_patched_n < kHookCount + 1) g_patched[g_patched_n++] = stub;
             ok++;
         } else if (stub == nullptr) {
             g_stub_state = State::Missing;
-        } else if (stub_size < kPatchSize) {
+        } else if (stub_size < patch_width(stub)) {
             g_stub_state = State::Small;
         } else if (already_patched(stub)) {
             g_stub_state = State::Alias;
@@ -809,7 +993,7 @@ int hooks_release(char *buf, size_t len) {
 
     // -1 for a borrowed profile: never measured, so unvalidated, not a
 // regression.
-    return g_ver.known ? g_ver.v->installed : -1;
+    return g_ver.known ? unfuse_installed(g_ver.v) : -1;
 }
 
 int hooks_bti_report(char *buf, size_t len) {

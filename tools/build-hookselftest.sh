@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
-# build-hookselftest.sh — build the arm64 libc-hook self-test. Developer tool, not
-# part of the module; built dynamic into out/. Usage: run it, or set API / NDK.
+# build-hookselftest.sh — build the libc-hook self-test. Developer tool, not part
+# of the module; built dynamic into out/. Usage: run it, or set ABI / API / NDK.
+#
+# ABI выбирает и цель сборки, и имя файла: тест гоняется в процессе той же ABI,
+# что и проверяемый патч, поэтому arm32-ветка (patch_entry под __arm__) требует
+# armeabi-v7a-бинарника. По умолчанию — arm64-v8a, как было.
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd -- "$HERE/.." && pwd)"
-OUT="${OUT:-$ROOT/out/hookselftest-arm64}"
+ABI="${ABI:-arm64-v8a}"
 API="${API:-26}"
+
+case "$ABI" in
+    arm64-v8a)   TRIPLE=aarch64-linux-android;   SUFFIX=arm64 ;;
+    armeabi-v7a) TRIPLE=armv7a-linux-androideabi; SUFFIX=arm ;;
+    *) echo "неизвестный ABI: $ABI (arm64-v8a | armeabi-v7a)" >&2; exit 1 ;;
+esac
+OUT="${OUT:-$ROOT/out/hookselftest-$SUFFIX}"
 
 # The prebuilt directory is named after the *host*: linux-x86_64, darwin-x86_64
 # or windows-x86_64. Hardcoding linux-x86_64 makes the script refuse to see a
@@ -66,7 +77,7 @@ find_ndk() {
 
 NDK_DIR="$(find_ndk)" || { echo "NDK не найден. Укажите: NDK=/path/to/ndk $0" >&2; exit 1; }
 TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/$(find_host_tag)"
-CXX="$TOOLCHAIN/bin/aarch64-linux-android${API}-clang++"
+CXX="$TOOLCHAIN/bin/${TRIPLE}${API}-clang++"
 [[ -x "$CXX" ]] || { echo "нет компилятора $CXX (проверьте API=$API)" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
@@ -81,7 +92,7 @@ hostpath() {
     esac
 }
 
-echo "==> сборка $OUT"
+echo "==> сборка $OUT ($ABI)"
 "$CXX" \
     -std=c++20 \
     -O1 \
@@ -94,6 +105,7 @@ echo "==> сборка $OUT"
     "$(hostpath "$ROOT/src/func_size.cpp")" \
     -o "$(hostpath "$OUT")" \
     -Wl,--build-id=none \
+    -static-libstdc++ \
     -ldl
 
 "$TOOLCHAIN/bin/llvm-strip" --strip-unneeded "$OUT" 2>/dev/null || true
