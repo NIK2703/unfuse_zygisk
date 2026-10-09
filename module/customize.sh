@@ -39,7 +39,6 @@ set_perm "$MODPATH/customize.sh"       0 0 0755 2>/dev/null
 set_perm "$MODPATH/post-fs-data.sh"    0 0 0755 2>/dev/null
 set_perm "$MODPATH/service.sh"         0 0 0755 2>/dev/null
 set_perm "$MODPATH/storage.sh"         0 0 0755 2>/dev/null
-set_perm "$MODPATH/status.sh"          0 0 0755 2>/dev/null
 set_perm "$MODPATH/description.txt" 0 0 0644 2>/dev/null
 
 # Leftovers of the old config; nothing reads them.

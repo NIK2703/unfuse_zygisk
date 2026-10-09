@@ -14,5 +14,3 @@ NOACL="$MODDIR/tools/vold-noacl"
 
 FUSEFS="$MODDIR/tools/vold-fusefs"
 [ -x "$FUSEFS" ] && "$FUSEFS" >/dev/null 2>&1
-
-sh "$MODDIR/status.sh"
