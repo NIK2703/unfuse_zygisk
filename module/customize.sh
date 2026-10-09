@@ -45,4 +45,18 @@ set_perm "$MODPATH/description.txt" 0 0 0644 2>/dev/null
 rm -f /data/adb/unfuse_zygisk.conf 2>/dev/null
 rm -f "$MODPATH/unfuse_zygisk.conf" 2>/dev/null
 
+# Форму хранилища на 11 модуль выставляет сам (post-fs-data.sh), но смена
+# бэкенда не должна быть неожиданной. FUSE — значение AOSP по умолчанию
+# (init.rc:792), вендор мог его переопределить. external_storage.sdcardfs.enabled
+# приводится к 0 независимо от него: иначе живые чтения vold идут по sdcardfs.
+if [ "$(getprop ro.build.version.sdk)" = "30" ]; then
+    if [ "$(getprop persist.sys.fuse)" = "true" ]; then
+        ui_print "- Android 11: FUSE-форма уже активна"
+    else
+        ui_print "- Android 11: FUSE выключен; модуль включит его при загрузке"
+        ui_print "  persist.sys.fuse=true — значение AOSP по умолчанию (init.rc:792)."
+    fi
+    ui_print "  external_storage.sdcardfs.enabled -> 0"
+fi
+
 ui_print "- Storage path: raw /data/media, FUSE off in vold"
