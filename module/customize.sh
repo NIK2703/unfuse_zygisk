@@ -1,6 +1,5 @@
 # shellcheck shell=sh
-# customize.sh — install-time stage: the Magisk/KernelSU installer runs it while
-# unpacking the module.
+# customize.sh — install stage: the installer runs it while unpacking.
 
 SKIPUNZIP=0
 
@@ -14,8 +13,8 @@ if [ ! -f "$MODPATH/zygisk/$ABI.so" ]; then
     abort "! zygisk/$ABI.so is missing - the build did not run (build.sh)"
 fi
 
-# The archive carries all three tools for every ABI: keep only ours, renamed to
-# the names storage.sh, post-fs-data.sh and service.sh look for.
+# The archive carries every ABI's tools: keep ours, under the names the stages
+# look for.
 if [ ! -f "$MODPATH/tools/$FIX" ]; then
     abort "! tools/$FIX is missing - the build did not run (build.sh)"
 fi
@@ -42,14 +41,10 @@ set_perm "$MODPATH/post-fs-data.sh"    0 0 0755 2>/dev/null
 set_perm "$MODPATH/service.sh"         0 0 0755 2>/dev/null
 set_perm "$MODPATH/storage.sh"         0 0 0755 2>/dev/null
 set_perm "$MODPATH/status.sh"          0 0 0755 2>/dev/null
-
-# status.sh rewrites module.prop's description at every boot; the shipped one
-# carries plain text, so a fresh install shows no status left from the build.
 set_perm "$MODPATH/description.txt" 0 0 0644 2>/dev/null
 
-# Legacy config files: nothing reads them; old leftovers cannot interfere.
+# Leftovers of the old config; nothing reads them.
 rm -f /data/adb/unfuse_zygisk.conf 2>/dev/null
 rm -f "$MODPATH/unfuse_zygisk.conf" 2>/dev/null
 
-# One line, not the description: module.prop already says what the module does.
 ui_print "- Storage path: raw /data/media, FUSE off in vold"
