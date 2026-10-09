@@ -19,10 +19,10 @@ BASE="$MODDIR/description.txt"
 # The mark carries no brackets; they go on around the whole prefix below.
 FUSEFS="$MODDIR/tools/vold-fusefs"
 if [ -x "$FUSEFS" ] && "$FUSEFS" --check >/dev/null 2>&1; then
-    MARK="✅ fuse-off"
+    MARK="✅"
     exit_status=0
 else
-    MARK="❌ fuse-off"
+    MARK="❌"
     exit_status=1
 fi
 
