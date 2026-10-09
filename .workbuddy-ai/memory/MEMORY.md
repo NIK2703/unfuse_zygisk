@@ -63,8 +63,18 @@ SDK 30..37 (A11..A17). Целей (arm64): 9 на 11–13 (`renameat` — кор
   заголовка файла, а не из ABI сборки.
 - Хостовые тесты формы: `tools/test-arm32-patch.sh` (48 случаев, сверка с verifier'ом, 0 расхождений);
   `tools/test-openat-stub.sh` (110 проверок, 0 провалов, оба класса ELF).
-- Устройство (Android 16, zygote64_32): `hookselftest-arm` — 46/0, «установлено 9 из 9», `__openat=ok`;
-  arm64 `hookselftest` — 46/0, 8/9.
+- Устройство (Android 16, zygote64_32), **проверено живьём 2026-10-09**:
+  `hookselftest-arm` — 46/0, «установлено 9 из 9», `renameat=ok`, `__openat=ok`;
+  arm64 `hookselftest` — 46/0, 8/9 (`renameat=коротка`).
+- `tools/check-live-patch.sh {32|64}` — патч в ЖИВОМ процессе приложения: r-xp-сегмент libc
+  читается сквозь `/proc/<pid>/mem` и сравнивается с файлом libc; смещения сопоставляются с
+  целями через `verify-hook-targets.py --json`. **Zygote не патчится** (патч в `postAppSpecialize`),
+  свидетель — только процесс приложения. Замер: 32-бит 9/9 (участки по 8 байт), 64-бит 8/8 (по 20).
+  Вспомогательные: `tools/live-patch-pick.sh`, `tools/live-patch-diff.sh` (на устройстве).
+- **vold-патчеры — только ELF64/EM_AARCH64** (`tools/vold-common.h`), на 32-битном vold честно
+  отказывают. В `E:\projects\12` 32-битного vold нет → форму проверить нечем. На zygote64_32
+  vold 64-битный, ущерба нет; для 32-бит-онли устройства нужен эталонный 32-битный vold.
+  (Решение Nikita 2026-10-09: оставить как есть.)
 
 ## Имя vold
 - Запускается не голым (`--blkid_context=…`); по comm не опознать (`binder:<pid>_<n>`). Опознание:
