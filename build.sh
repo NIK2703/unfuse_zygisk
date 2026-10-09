@@ -385,11 +385,16 @@ with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
                 skipped.append(rel)
                 continue
             zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-            # Permissions come from the filesystem, but .sh files and the tools
-            # are always executable: otherwise the module may fail to run its
-            # scripts or to find the storage-fix binary on install.
+            # Permissions come from the filesystem, but .sh files, the tools and
+            # the installer stub are always executable: otherwise the module may
+            # fail to run its scripts, to find the storage-fix binary on install,
+            # or Magisk may refuse the archive (update-binary is not a .sh file).
             mode = os.stat(full).st_mode & 0o7777
-            if rel.endswith('.sh') or rel.startswith('tools/'):
+            # os.path.relpath uses "\" on Windows while zip entries always use
+            # "/", so the directory test has to run on the normalized form:
+            # otherwise the tools silently lose their executable bit here.
+            relposix = rel.replace(os.sep, '/')
+            if rel.endswith('.sh') or relposix.startswith('tools/') or f == 'update-binary':
                 mode |= 0o111
             zi.external_attr = mode << 16
             zi.compress_type = zipfile.ZIP_DEFLATED
