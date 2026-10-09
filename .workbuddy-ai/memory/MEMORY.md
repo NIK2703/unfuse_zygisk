@@ -1,107 +1,109 @@
 # unfuse_zygisk
 
-Zygisk-модуль: доступ приложений к `/data/media` без FUSE и scoped storage.
-`github.com/NIK2703/unfuse_zygisk`, только `E:\projects\unfuse_zygisk` (ветка `no-sdcardfs`,
-до 2026-10-09 звалась `fuse-only` — имя вводило в заблуждение: обе ветки, `sdcardfs-only` и эта,
-дают «FUSE в пути приложения нет»; отличает их отсутствие sdcardfs).
-Разбор — `docs/fuse-root-patch-design.md`; устройство — скилл `zygisk-module-device-regression-sweep`;
-детали заходов — `memory/2026-10-*.md`.
+Zygisk-модуль: доступ приложений к `/data/media` без FUSE/scoped storage.
+Репозиторий `github.com/NIK2703/unfuse_zygisk`; рабочая копия `E:\projects\unfuse_zygisk`,
+ветка `no-sdcardfs` (до 2026-10-09 звалась `fuse-only`). `main` на origin = `no-sdcardfs`
+(fast-forward 2026-10-09, `87df5de`). Считается **не по счётчику коммитов**:
+`origin/no-sdcardfs` — соседняя ветка от `bc95307` (README добавлен через веб-интерфейс),
+она не предок и не потомок локальной.
+**Вторая ветка — «sdcardfs» — живёт НЕ в git:** её рабочая копия
+`C:\Users\Nikita\unfuse-build\sdcardfs-only` не является чекаутом (`git rev-parse` →
+«not a git repository»), и все её правки делаются в копии. В репозитории она есть только
+как устаревшая `origin/sdcardfs-only` (`2a1f43f`, 50 коммитов позади). Когда Nikita
+говорит «ветка sdcardfs», он имеет в виду эту копию — смотреть надо туда.
+Разбор дизайна — `docs/fuse-root-patch-design.md`; A11 — `docs/android-11-design.md`;
+разбор лога с живого A11 crDroid — `docs/android-11-crdroid-log.md`;
+варианты ПК-стенда A11 arm64 — `docs/android-11-arm64-stand.md`.
 
-## Запреты (Nikita)
-- **Никаких сторожей** (2026-10-09: «навсегда»). Прецедент: `--guard` у `storage-fix` убирали (v3.1.0).
-  Цена доводом не считается. Конфликт с патчером GCam лечится **без сторожа**.
-- **Не коммитить и не пушить без прямой просьбы** (2026-10-09: «я не просил тебя что-либо коммитить
-  и пушить»). Просьба «правь файлы» ≠ просьба «оформляй в git». Коммит/пуш — только по явной команде
-  (`закоммить`, `запушь`, «переименовать и на origin» и т.п.). Правило общее, не только для этого проекта.
+## Жёсткие запреты (Nikita)
+- **Никаких сторожей** — ни при каких обстоятельствах («навсегда», 2026-10-09). Прецедент:
+  `--guard` у `storage-fix` убирали (v3.1.0). Конфликт (напр. GCam-патчер) лечится без сторожа.
+- **Не коммитить и не пушить без прямой просьбы.** «правь файлы» ≠ «оформляй в git».
+  Коммит/пуш только по явной команде (`закоммить`, `запушь`, «на origin»). Правило общее.
 
-## Конвенции
-- Комментарии/коммиты по-русски, «почему» со ссылками на AOSP.
+## Конвенции сборки/установки
+- Комментарии/коммиты по-русски, «почему» со ссылкой на AOSP.
 - `./build.sh`, NDK `29.0.14206865`, сборка детерминированная (неизменный md5 = правка не доехала).
-  ABI: `arm64-v8a`, `armeabi-v7a`. Бинарники с устройства → `device/` (gitignore); файлы не удалять.
-- На устройство — только атомарно (`mv -f`; `cp -f` поверх `zygisk/*.so` усекает inode → SIGBUS в zygote).
-  Новая сборка не активна до перезагрузки (zn-daemon держит fd).
-- **Модуль ничего не пишет** — отчёт только кодом возврата; логгирование удалять целиком.
+  ABI: `arm64-v8a`, `armeabi-v7a`.
+- На устройство — **только атомарно** (`mv -f`); `cp -f` поверх `zygisk/*.so` усекает inode → SIGBUS zygote.
+- **Модуль ничего не пишет**: отчёт только кодом возврата; логгирование удалять целиком.
+- Ставить `install.sh` из `C:\Users\Nikita\unfuse-build\` (НЕ `ksud module install` — тот трогает
+  отображённый в zygote `*.so`). `zygisk/*.so` обязан быть `u:object_r:system_lib_file:s0`
+  (chcon в `install.sh`/4-м аргументе `atomic_put`).
 
 ## Ядро дизайна
-- FUSE-маунт обязан жить: fd — контракт с MediaProvider, `active` ставит только `pf_init` (иначе том `unmountable`).
-- Маунт `/mnt/user/<u>/emulated` приходит в namespace сам (слейв init); `MS_REC|MS_PRIVATE` рвёт связь.
-  Путь — **по форме** (конец `/emulated` + `MS_LAZYTIME`), не по значению.
-- `find_fuse_site()` — **не по смежности** (adrp+add то подряд, то вразбивку); одна функция на все версии.
-  LAZYTIME-площадка ровно одна во всех 8 образах. Регрессия — `anchor_selftest()`, коммит `3a83678`.
-- `scan_back()`: связывание «ближайшее к вызову» → **первое найденное**; иначе `x0_from == src_reg`
-  не сходится → rc 8. `w3` обязан накапливать половины. Окно 32 слова, `bl` окно не рвёт.
-- Переполнение списка площадок → отказ `18` **до** фильтра LAZYTIME (иначе чтение за массивом).
-- Отказ называет причину: `5..10` якорь, `11..17` нет дома (`vold_exec_page`), `18` площадок>списка,
-  `19` аргументы; печатает `word()`. `ep_exit_code()` **без `default:`**; `EP_OK` там = `17` (баг).
-- Места в образе нет ни на одном релизе → `vold_exec_page()` (ptrace) — единственный путь.
-- `vold.rc` → `reboot_on_failure`: SIGSEGV в vold = bootloop. `libfuse` в vold нет (сырой
-  `mount("/dev/fuse",…)`, `Utils.cpp:1676`), входит через `libfuse_jni`.
+- FUSE-маунт обязан жить: fd — контракт с MediaProvider, `active` ставит только `pf_init`.
+- `mount("/dev/fuse",…,MS_LAZYTIME)` — единственный дискриминатор FUSE-сайта (у AppFuseUtil LAZYTIME нет).
+  Решение по **форме**: хвост `fuse_path` == `/emulated` → бинд `/data/media`; иначе том
+  (SD-карта/принятый) проходит насквозь. Альтернатива «биндить `/mnt/media_rw/<uuid>`» отвергнута:
+  в state-free handler доступен только x1 = `fuse_path`.
+- **SD-карта идёт через ту же `MountUserFuse()`** (PublicVolume делит с EmulatedVolume; отличие —
+  `relative_upper_path` = UUID, `fuse_path=/mnt/user/<u>/<UUID>`). Без хвост-матчера модуль клал
+  `/data/media` поверх карты → файлы карты скрыты (отзыв 2026-10-09).
+- **Урок emitted-кода:** ошибки управления потоком ловит ТОЛЬКО исполнение на aarch64.
+  Хостовый `--selftest` лишь собирает/дизасм; device `--selftest` реально исполняет handler
+  (`mmap` EXEC + `fake_mount` recorder) — авторитетная проверка.
+- **caller-saved не переживает вызов**: значение, нужное после `blr`, класть на стек, не в x10.
+  (Регрессия 2026-10-09: цель маунта в x10 топтал реальный `mount()` → bind на `""`.)
+- Байтовый цикл хвост-матчера закрывается на **первом** `ldrb` (тот двигает путь x12); второй `ldrb`
+  двигает только шаблон x13. Структурный selftest проверяет **свойство** (цель — любой ldrb
+  post-index; два цикла на разных загрузках), а не «cbnz→ldrb с тем же регистром» (навязывал баг).
+- **Ветка `sdcardfs` — другой механизм, а не тот же фикс иначе.** Она не патчит vold и не биндит
+  `/data/media` на `/mnt/user/<u>/<UUID>`: `module/storage.sh` поднимает sdcardfs из `/data/media`
+  на `/mnt/runtime/{default,read,write,full}/emulated`, а Zygisk-плечо (`src/unfuse_zygisk.cpp`)
+  подменяет **только** `.../emulated` в `/mnt/user/<u>`, `/mnt/androidwritable/<u>`,
+  `/mnt/runtime/<view>`. Внешних томов не касается вообще → дефект «пропадает карта памяти» там
+  невозможен, хвост-матчеру не к чему прицепиться. Обратное тоже верно: правки основной ветки
+  (vold-патчеры, `storage-fix`, хуки libc) в копии `sdcardfs-only` неприменимы.
 
-## Версии (`src/android_ver.h`)
-SDK 30..37 (A11..A17). Целей (arm64): 9 на 11–13 (`renameat` — корень), 8 на 14–17 (`renameat` —
-переходник на `renameat2`); на arm32 — 9 на всех (колонка `installed_arm`, читает `unfuse_installed()`).
-Незнакомый SDK → профиль 17 («не проверялся»). Патч shape-based, ветвлений по
-релизмам нет. 17 с `-mbranch-protection=standard` (bti c, +4); 11 без bti/paciasp.
+## Версии / ABI (кратко)
+SDK 30..37 (A11..A17), shape-based, без ветвлений по релизам. arm64: 9 целей на 11–13, 8 на 14–17;
+arm32 — 9 везде. 17 с `-mbranch-protection=standard`; 11 без bti/paciasp. vold-патчеры — только
+EM_AARCH64 (32-битный vold не проверен, оставлено как есть). Таблицы — `tools/check-release-table.py`,
+`tools/verify-hook-targets.py`, `tools/vold-targets.sh`.
 
-## Применимость (источник истины)
-- libc — `tools/verify-hook-targets.py`: 8 arm64-образов ok=19 rc=0; **8 arm32 ok=19 rc=0**
-  (`device/libc/libc-arm-a{11..17}.so`, зеркало `E:\projects\12\libc`).
-  Корни (kHooks + стаб `__openat`, считаются только реальные `MODULE_HOOKS`):
-  **arm64 9 на 11–13, 8 на 14–17** (`renameat` — переходник); **arm32 9 на ВСЕХ** (`renameat` там корень).
-  arm32 `rename`/`link` — тела (28 байт), не из kHooks, покрыты косвенно через `renameat2`/`linkat`.
-- vold — `tools/vold-targets.sh --dry-run --file` (образы `/e/projects/12/bin/vold-a{11..17}`).
-- Таблица релизов — `tools/check-release-table.py` (8/8 сходится, обе колонки: `installed`/`installed_arm`).
+## Сторонние патчеры (GCam, 2026-10-08/09)
+Порт MGC dlopen-ит `*.lck`-патчер, читающий указатель по `entry+12` → мусор → SIGBUS. Решение без
+сторожа: сняли `open/open64/openat/openat64` из `kHooks[]`, ловим open-семью на голом стабе
+`__openat` (`mov x8,#0x38; svc #0; ret`). md5 `7975875a…`, коммит `fb2f2ab`.
 
-## ABI
-- **Обе ABI готовы и измерены.** arm64-v8a и armeabi-v7a реализованы; выбор — препроцессором
-  (`#if defined(__aarch64__)/__arm__`), одна форма на все релизы, ветвлений по версии Android нет.
-- ARM32-патч входа (`src/arm32_patch.h`, чистые функции, те же байты у verifier'а):
-  Thumb-2 4-aligned `ldr.w pc,[pc,#0]`(0xF000F8DF)+литерал = 8 байт; Thumb-2 2-aligned
-  `movw/movt r12; bx r12`(0x4760) = 10; ARM `ldr pc,[pc,#-4]`(0xE51FF004)+литерал = 8. Ни BTI, ни PAC
-  на AArch32 нет → паддинга нет. Thumb-бит (бит 0 `st_value`/dlsym) теряется у цели ветки → режим
-  брать из `st_value`. Запись 10-байтной формы — 2-байтными сторами (адрес 2-выровнен).
-- ARM32 `__openat` (`src/openat_stub.h:openat_stub_find_arm`): ARM-режим, 32 байта (17 — 28),
-  пролог-признак `mov r12,r7`(0xe1a0c007)+`movw r7,#0x142`(0xe3007142)+`svc #0`(0xef000000) —
-  уникален во всех 8 образах; конец = первый безусловный `b` (хвост `b __set_errno_internal`).
-  Хвостовой ARM-`b` переходником НЕ считается (иначе 4 сисколл-стаба съели бы все корни).
-- `src/func_size.cpp` разбирает и ELF32/EM_ARM (`scan_symtab32`/`scan_object32`), класс берёт из
-  заголовка файла, а не из ABI сборки.
-- Хостовые тесты формы: `tools/test-arm32-patch.sh` (48 случаев, сверка с verifier'ом, 0 расхождений);
-  `tools/test-openat-stub.sh` (110 проверок, 0 провалов, оба класса ELF).
-- Устройство (Android 16, zygote64_32), **проверено живьём 2026-10-09**:
-  `hookselftest-arm` — 46/0, «установлено 9 из 9», `renameat=ok`, `__openat=ok`;
-  arm64 `hookselftest` — 46/0, 8/9 (`renameat=коротка`).
-- `tools/check-live-patch.sh {32|64}` — патч в ЖИВОМ процессе приложения: r-xp-сегмент libc
-  читается сквозь `/proc/<pid>/mem` и сравнивается с файлом libc; смещения сопоставляются с
-  целями через `verify-hook-targets.py --json`. **Zygote не патчится** (патч в `postAppSpecialize`),
-  свидетель — только процесс приложения. Замер: 32-бит 9/9 (участки по 8 байт), 64-бит 8/8 (по 20).
-  Вспомогательные: `tools/live-patch-pick.sh`, `tools/live-patch-diff.sh` (на устройстве).
-- **vold-патчеры — только ELF64/EM_AARCH64** (`tools/vold-common.h`), на 32-битном vold честно
-  отказывают. В `E:\projects\12` 32-битного vold нет → форму проверить нечем. На zygote64_32
-  vold 64-битный, ущерба нет; для 32-бит-онли устройства нужен эталонный 32-битный vold.
-  (Решение Nikita 2026-10-09: оставить как есть.)
+## Устройство
+- `marble` POCO F5, SDK 36 (`fuse=true`, `external_storage.sdcardfs.enabled` пуст). A11-блок тут
+  не проявляется (условие `sdk=30` ложно). Живого стенда SDK 30 нет.
+- **A11-отзыв (2026-10-09) — mido**: Redmi Note 4, crDroid 7.22 (`ro.crdroid.build.version`),
+  SDK 30, ядро `4.9.295~zLOS`, ARM64-userspace, **Magisk Kitsune 27001** (форк 27.0; Zygisk
+  встроенный, API v5 поддержан), рядом `zygisk_lsposed`, SELinux permissive. Форма хранилища у
+  него **целевая** (`persist.sys.fuse=true`, sdcardfs `0`), но целевого состояния нет: FUSE на
+  `/mnt/user/0/emulated` без bind'а `/data/media` → патч vold не встал либо не сработал.
+  Разбор и что запрошено — `docs/android-11-crdroid-log.md`.
+- **vold перезапускается незаметно.** `init.svc_debug_pid.<svc>` — текущий pid: у mido
+  `vold = 1599` при `ro.boottime.vold = 9.93 с` (в это время pid'ы ~430), у остальных 7 сервисов
+  pid согласуется с boottime. Перезапуск vold снимает ОБА хука (они в его памяти), накат — только
+  дважды за загрузку, сторожа нет по правилу. Проверка: `stat -c %Y /proc/$(pidof vold)` против
+  `/proc/uptime`, `logcat`/`dmesg` на смерть vold.
+- **Zygisk-среда двух стендов разная.** Стенд `marble` — KernelSU 3.3.0 + **Zygisk Next**
+  (`zn-daemon`, `/data/adb/zygisksu/`), и только там Zygisk-плечо когда-либо проверялось
+  (`mount_storage_dirs`, замер 2026-10-07). У mido — **встроенный Zygisk Kitsune**: по changelog
+  27001 загрузчик заменён на ptrace-инъектор **от Zygisk Next**, а API остался магазовский
+  (`v27.0`: `ZYGISK_API_VERSION 5` + `mount_storage_dirs`; отказ лишь при `api_version > 5`).
+  Поэтому «виноват Zygisk Kitsune» объясняет только Zygisk-плечо, не патч vold; главная грабля —
+  **SuList** (модули грузятся лишь в приложения-списке). Тест — маркер
+  `/data/adb/unfuse_zygisk.state/once`.
+- **ПК-стенд A11 arm64** (разбор — `docs/android-11-arm64-stand.md`). Хост Никиты —
+  `AMD64`, emulator `36.5.10` (есть `qemu-system-aarch64.exe`), образов/AVD нет.
+  Стенд обязан быть настоящим aarch64 (патчер — только `EM_AARCH64`); на x86 arm64-гость
+  идёт лишь TCG, ARM-трансляция (Houdini/libndk) не годится — `vold` остаётся x86_64.
+  Путь: AVD `arm64-v8a` API 30 (`-accel off -gpu swiftshader_indirect -qemu -machine virt`),
+  откат на emulator `34.2.16` (build 12038310), root — rootAVD, но **Magisk ≥ 27.0**
+  (наш модуль = API v5; на 26.x отвергается). Альтернатива — redroid `11.0.0` (multi-arch)
+  + `catlair/redroid-magisk` на ARM-хосте (Oracle Ampere A1 free).
+- **IP меняется после reboot** (наблюдались 10.43.67.59, 10.43.59.38, 10.170.241.19). `adb` не в PATH:
+  `C:\Users\Nikita\AppData\Local\Android\Sdk\platform-tools\adb.exe`. Перед заменой — бэкап
+  `rollback-device/mod-backup-<дата>.tgz`. `adb push` из Git Bash — `MSYS_NO_PATHCONV=1`.
+- `adb shell "su 0 sh …"` рвёт по `;`; демон adb умирает между вызовами. `nsenter` под `su -c` — `--`.
+  f2fs `stat -f -c %t` → `0xf2f52010`, fuse → `0x65735546`.
 
-## Имя vold
-- Запускается не голым (`--blkid_context=…`); по comm не опознать (`binder:<pid>_<n>`). Опознание:
-  `/proc/<pid>/exe`; резерв `/proc/<pid>/cmdline` → NUL→пробел, обрезать по 1-му пробелу. Префикс
-  4 байта принимает `vold_prepare_subdirs`. Вынесено в `tools/proc-name.h`, `tools/stubs.h` (тождественно).
-  `count_call_sites()`: отказ = `-1`, не частичный счёт.
-
-## Сторонние патчеры (порт GCam, 2026-10-08/09)
-- Порт `com.android.MGC_9_7_047` dlopen-ит `*.lck` со своим патчером: закрывает вход 16-байтным
-  переходником, любой чужой переходник на входе считает хуком и строит трамплин, читающий указатель
-  по `entry+12` (середина своего) → мусор → `br x17` → SIGBUS. Формой не лечится, сторожем запрещено.
-- **Решение без сторожа:** модуль снял `open/open64/openat/openat64` из `kHooks[]` и ловит open-семью на
-  голом стабе сисколла `__openat` (по форме `mov x8,#0x38; svc #0; ret`; локален, вне `.dynsym`).
-  `__open_2/__openat_2` остаются целями. Устройство: `hookselftest` 8/9, `__openat=ok`, 46/0; MGC жив.
-  md5 `7975875a409272b0d000d187e3b51a3d`, коммит `fb2f2ab`. Откат: `device/rollback/arm64-v8a.so.before-20261009`.
-
-## vold-fusefs — два варианта
-- **STACK** (`no-sdcardfs` @ `5c743f3`, в дневниках ещё как `fuse-only`): FUSE + bind `/data/media` сверху на одном `fuse_path`, `umount2` до 4 слоёв.
-- **RELOCATE** (`relocate` @ `ecb48eb`): FUSE → `SCRATCH = fuse_path + ".fuse"`, `fuse_path` — один слой bind;
-  путь читать **побайтово** (8-байтовое чтение чужого `std::string` → SIGSEGV → bootloop).
-
-## Грабли устройства
-- `adb shell "su 0 sh …"` (adb рвёт по `;`); демон adb умирает между вызовами; `adb pull/push` ждёт
-  Windows-путь. `nsenter` под `su -c` — обязателен `--`. f2fs `stat -f -c %t` → `0xf2f52010`, fuse → `0x65735546`.
-  `head` в пайпе молча обрезает — считать `grep -c`. IP меняется после reboot; подтверждать у пользователя.
+## Бенчмарк (2000×4КиБ, root в ns приложения, 2026-10-09)
+FUSE без модуля медленнее сырого дерева в 52–780×; `sdcardfs-only` — 1.0–6.6×. Модуль (сырой f2fs)
+быстрее sdcardfs везде, где есть create/rename (rename 5.3×, mkdir 6.6×, create 2.5×). Замер от root —
+нижняя оценка; от uid 2000 create/rename/unlink в 6–8× медленнее.
