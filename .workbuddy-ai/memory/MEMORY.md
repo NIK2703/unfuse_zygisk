@@ -1,7 +1,9 @@
 # unfuse_zygisk
 
 Zygisk-модуль: доступ приложений к `/data/media` без FUSE и scoped storage.
-`github.com/NIK2703/unfuse_zygisk`, только `E:\projects\unfuse_zygisk` (ветка `fuse-only`).
+`github.com/NIK2703/unfuse_zygisk`, только `E:\projects\unfuse_zygisk` (ветка `no-sdcardfs`,
+до 2026-10-09 звалась `fuse-only` — имя вводило в заблуждение: обе ветки, `sdcardfs-only` и эта,
+дают «FUSE в пути приложения нет»; отличает их отсутствие sdcardfs).
 Разбор — `docs/fuse-root-patch-design.md`; устройство — скилл `zygisk-module-device-regression-sweep`;
 детали заходов — `memory/2026-10-*.md`.
 
@@ -92,7 +94,7 @@ SDK 30..37 (A11..A17). Целей (arm64): 9 на 11–13 (`renameat` — кор
   md5 `7975875a409272b0d000d187e3b51a3d`, коммит `fb2f2ab`. Откат: `device/rollback/arm64-v8a.so.before-20261009`.
 
 ## vold-fusefs — два варианта
-- **STACK** (`fuse-only` @ `5c743f3`): FUSE + bind `/data/media` сверху на одном `fuse_path`, `umount2` до 4 слоёв.
+- **STACK** (`no-sdcardfs` @ `5c743f3`, в дневниках ещё как `fuse-only`): FUSE + bind `/data/media` сверху на одном `fuse_path`, `umount2` до 4 слоёв.
 - **RELOCATE** (`relocate` @ `ecb48eb`): FUSE → `SCRATCH = fuse_path + ".fuse"`, `fuse_path` — один слой bind;
   путь читать **побайтово** (8-байтовое чтение чужого `std::string` → SIGSEGV → bootloop).
 
