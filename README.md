@@ -28,4 +28,5 @@ replaces the other. `unfuse-sdcardfs` needs a kernel with the `sdcardfs` driver;
 ./build.sh unfuse-sdcardfs
 ```
 
-Layout, shared code and build details: [docs/repo-layout.md](docs/repo-layout.md).
+Both are built from one tree by `./build.sh`; what they share (the installer stub and
+the shell primitives both modules source) lives in `module/common/`.
