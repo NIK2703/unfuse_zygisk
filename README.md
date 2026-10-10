@@ -28,5 +28,6 @@ replaces the other. `unfuse-sdcardfs` needs a kernel with the `sdcardfs` driver;
 ./build.sh unfuse-sdcardfs
 ```
 
-Both are built from one tree by `./build.sh`; what they share (the installer stub and
-the shell primitives both modules source) lives in `module/common/`.
+Both are produced by one `./build.sh`; what they share (the installer stub and the
+shell primitives both modules source) lives in `module/common/`, each module's own
+scripts and hook binaries in `module/<variant>/`.
