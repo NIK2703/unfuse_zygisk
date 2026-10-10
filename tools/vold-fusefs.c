@@ -985,11 +985,24 @@ static int build_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
      * satisfied it could still have had 384 bytes written into its buffer. Two
      * numbers describing the same thing, kept in step by hand in two places, is
      * how that happens; the produced size is the one that decides, so it is
-     * checked here. */
+     * checked here.
+     *
+     * Only the words the builder actually wrote are copied out — that is
+     * everything up to the first string. The two string areas are laid out in
+     * `n` but never written into `w`: they are placed by the byte-level memcpy
+     * below, so the tail of each one (the padding after the NUL, up to a whole
+     * word) has no value in `w` to copy. Copying `total` words took whatever the
+     * stack held there and left it in the blob, and since that residue carries
+     * bytes of an address it changed from run to run: the same binary emitted
+     * 0x81, 0x89 and 0xEE in one byte across three runs. Nothing executes it —
+     * it sits after the NUL of the string, and no ldr reaches it — but it made
+     * the blob's md5 useless as a check that a rebuild landed, which is what
+     * this project uses it for. memset + copying only the written prefix leaves
+     * that padding zero and the blob reproducible. */
     size_t total = (size_t)n * 4u;
     if (total > out_cap) return -1;
     memset(out, 0, total);
-    memcpy(out, w, total);
+    memcpy(out, w, (size_t)str_off_bytes);   /* code + pool; strings follow */
     memcpy(out + str_off_bytes, raw_string, raw_len);
     memcpy(out + tail_off_bytes, mount_tail, sizeof(mount_tail));
 
@@ -1293,11 +1306,17 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
 
     /* The capacity check is the WRITE, not a constant up front — same reason as
      * build_handler: the layout above may reach 96 words (384 bytes) while the
-     * precondition used to promise only 256. */
+     * precondition used to promise only 256.
+     *
+     * And as in build_handler, only the written prefix of `w` is copied: the
+     * "/emulated" area is placed by the memcpy below and its padding word was
+     * never given a value, so copying it whole dragged a byte of stack residue
+     * into the blob and made the same binary emit different bytes on different
+     * runs. See the note at the write in build_handler. */
     size_t total = (size_t)n * 4u;
     if (total > out_cap) return -1;
     memset(out, 0, total);
-    memcpy(out, w, total);
+    memcpy(out, w, (size_t)str_off_bytes);   /* code + pool; the tail follows */
     memcpy(out + str_off_bytes, tail, sizeof(tail));
     return (int)total;
 }
@@ -1336,8 +1355,9 @@ static int build_umount_handler(uint8_t *out, size_t out_cap, uint64_t code_va,
  * file, overwrite the two instructions at the stopped pc with `svc #0` then
  * `brk #0` (PTRACE_POKEDATA bypasses page permissions, so an r-x page works),
  * set x8 and x0..x5, resume, and read x0 back at the brk. The thread is
- * stopped for the whole thing, and its pc and the two clobbered words are
- * restored before it resumes.
+ * stopped for the whole thing, and its WHOLE register file — x0 included — and
+ * the two clobbered words are put back before it resumes. Why x0 matters is at
+ * the restore in inj_syscall(); leaving the injected result there killed vold.
  * ------------------------------------------------------------------ */
 
 #if defined(__aarch64__)
@@ -1391,12 +1411,32 @@ static int inj_syscall(pid_t pid, uint64_t nr, uint64_t a0, uint64_t a1,
             struct iovec giov = { .iov_base = &got, .iov_len = sizeof(got) };
             if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &giov) == 0) {
                 *ret = (int64_t)got.regs[0];
-                saved.regs[0] = got.regs[0];
             }
         }
     }
 
 restore:
+    /* `saved` is the thread's register file as it was; x0 goes back to ITS value,
+     * not to the value our syscall returned. This is not bookkeeping.
+     *
+     * The pc we stop at is the thread's own, and if that thread is vold's main
+     * one, its pc sits inside libc's ioctl wrapper — that is what the main thread
+     * does all its life (IPCThreadState::joinThreadPool -> talkWithDriver ->
+     * ioctl). Stop it on the instruction that loads x0 or on the `svc` itself and
+     * the thread resumes by executing that syscall with whatever x0 holds. With
+     * the injected result there, vold's `ioctl(mDriverFD, BINDER_WRITE_READ)`
+     * goes out as `ioctl(<result>, BINDER_WRITE_READ)` — an fd that is not
+     * binder. The kernel answers ENOTTY (25) and IPCThreadState::joinThreadPool
+     * aborts on the first unexpected error, because 25 is not one of the codes it
+     * tolerates. vold dies, init restarts it, and both hooks die with it: the
+     * module then does nothing for the rest of the boot.
+     *
+     * Measured on a crDroid 11 mido: docs/mido-vold-abort-2026-10-09.md
+     * ('getAndExecuteCommand(fd=6) returned unexpected error -25, aborting').
+     * The fd in that message is mProcess->mDriverFD (6, still open); the fd the
+     * failed ioctl actually carried was ours. On an image with PLT padding the
+     * handler needs no injection at all and this cannot happen — which is why the
+     * defect only showed on a build where --room = 1 (mido's vold). */
     ptrace(PTRACE_POKEDATA, pid, (void *)pc0, (void *)(uintptr_t)w0);
     ptrace(PTRACE_POKEDATA, pid, (void *)(pc0 + 4), (void *)(uintptr_t)w1);
     iov.iov_base = &saved;
