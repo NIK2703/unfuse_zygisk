@@ -8,14 +8,11 @@
 # label of the /data/media root (step 1). There is no alternative and no
 # fallback — the installer refuses the module on a kernel without sdcardfs, so
 # anything less than a working sdcardfs mount here means the module has nothing
-# to offer and says so in the log.
+# to offer, and the exit code is the only thing that says so.
 #
+# Модуль ничего не пишет: ни журнала, ни logcat — отчёт только кодом возврата.
 
-STAGE="${1:-storage}"
 MODDIR="${MODDIR:-${0%/*}}"
-LOG=/data/adb/unfuse_zygisk.log
-
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $STAGE: $*" >> "$LOG"; }
 
 # Общие примитивы обеих сборок: перемаркировка корня /data/media.
 . "$MODDIR/lib.sh"
@@ -31,15 +28,8 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $STAGE: $*" >> "$LOG"; }
 # No sepolicy patch is needed: the permission already exists, and relabelto is
 # neverallow for the zygote domain (domain.te:791), so the relabel happens here.
 #
-# Сама работа — в lib.sh (unfuse_relabel_media_root); здесь остаётся только то,
-# чего у unfuse нет: запись в лог. Коды возврата: 0 — метка уже была нужной,
-# 1 — перемаркировали, 2 — chcon не прошёл. stderr самого chcon идёт в тот же лог.
-prev=$(unfuse_relabel_media_root "$LOG")
-case $? in
-    0) ;;
-    1) log "/data/media: $prev -> media_rw_data_file" ;;
-    2) log "/data/media: НЕ УДАЛОСЬ перемаркировать (осталось $prev)" ;;
-esac
+# Сама работа — в lib.sh (unfuse_relabel_media_root).
+unfuse_relabel_media_root
 
 # --- 2. sdcardfs on /mnt/runtime/*/emulated ------------------------------------
 #
@@ -107,11 +97,9 @@ mount_one() {
     fi
 
     mkdir -p "$p" 2>/dev/null
-    if mount -t sdcardfs -o "$COMMON,mask=$2,gid=$3" /data/media "$p"; then
-        log "OK   $p (mask=$2 gid=$3)"
-    else
-        log "FAIL $p (mask=$2 gid=$3)"
-    fi
+    # Ошибку mount(2) здесь не разбираем: приёмка — по факту, в sdcardfs_verify()
+    # (см. 2a). Код возврата mount сам по себе ничего не значит.
+    mount -t sdcardfs -o "$COMMON,mask=$2,gid=$3" /data/media "$p"
 }
 
 mount_all() {
@@ -144,35 +132,17 @@ sdcardfs_verify() {
         p="/mnt/runtime/$name/emulated"
 
         line=$(mount_line "$p")
-        if [ -z "$line" ]; then
-            log "проверка: $p не смонтирована"
-            return 1
-        fi
+        [ -n "$line" ] || return 1
         ty="${line%% *}"; opts="${line#* }"
 
-        if [ "$ty" != "$SDCARDFS_FS" ]; then
-            log "проверка: $p под $ty, а не $SDCARDFS_FS"
-            return 1
-        fi
+        [ "$ty" = "$SDCARDFS_FS" ] || return 1
 
         case ",$opts," in
-            *,mask=*)
-                if ! has_opt "$opts" "mask=$want_mask"; then
-                    log "проверка: $p с чужой маской — ждали mask=$want_mask," \
-                        "ядро отдало: $opts"
-                    return 1
-                fi
-                ;;
+            *,mask=*) has_opt "$opts" "mask=$want_mask" || return 1 ;;
         esac
 
         case ",$opts," in
-            *,gid=*)
-                if ! has_opt "$opts" "gid=$want_gid"; then
-                    log "проверка: $p с чужим gid — ждали gid=$want_gid," \
-                        "ядро отдало: $opts"
-                    return 1
-                fi
-                ;;
+            *,gid=*) has_opt "$opts" "gid=$want_gid" || return 1 ;;
         esac
     done
     return 0
@@ -183,19 +153,14 @@ sdcardfs_verify() {
 # Without a kernel sdcardfs there is nothing to mount: the installer already
 # refuses the module, so a kernel that lost it mid-session is the only way here.
 # A failed verification is not something to work around either — the mounts are
-# left as they are and the failure is recorded.
+# left as they are.
 #
 if ! grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
-    log "в ядре нет sdcardfs (/proc/filesystems) — основной путь недоступен"
     exit 1
 fi
 
 mount_all
 
-if sdcardfs_verify; then
-    log "основной путь готов и проверен: sdcardfs на /mnt/runtime/*/emulated"
-    exit 0
-fi
-
-log "основной путь не прошёл проверку — оставляю как есть, альтернативы нет"
-exit 1
+# Единственный критерий приёмки — проверка по факту (2a). Её код возврата и есть
+# отчёт storage.sh.
+sdcardfs_verify

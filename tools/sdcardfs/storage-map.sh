@@ -30,13 +30,3 @@ echo
 echo "--- что лежит под /mnt/runtime/full/emulated (первые записи) ---"
 ls -ld /mnt/runtime/full/emulated 2>&1
 ls /mnt/runtime/full/emulated 2>&1 | head -8
-
-echo
-echo "--- что говорит журнал модуля ---"
-if [ -r /data/adb/unfuse_zygisk.log ]; then
-    grep -a 'основной путь' /data/adb/unfuse_zygisk.log | tail -n 4 | sed 's/^/  /'
-    [ -n "$(grep -a 'основной путь' /data/adb/unfuse_zygisk.log)" ] || \
-        echo "  (строк «основной путь» нет — журнал от старой сборки)"
-else
-    echo "  журнала нет"
-fi

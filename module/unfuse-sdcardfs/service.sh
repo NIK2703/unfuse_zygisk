@@ -9,7 +9,7 @@
 
 MODDIR=${MODDIR:-${0%/*}}
 
-sh "$MODDIR/storage.sh" service
+sh "$MODDIR/storage.sh"
 
 # The sign in the description. It reads only /proc/filesystems, so it does not
 # care that the storage pass above ran first.

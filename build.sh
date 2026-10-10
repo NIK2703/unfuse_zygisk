@@ -327,9 +327,8 @@ for variant in "${VARIANTS[@]}"; do
     vdir="$MODULE_DIR/$variant"
     [[ -d "$vdir" ]] || die "нет каталога варианта: $vdir"
 
-    # Что у варианта своё: исходники плеча, его линковка и набор утилит.
+    # Что у варианта своё: исходники плеча и набор утилит. Линковка у обоих общая.
     cxx_srcs=()
-    ld_extra=()
     ctools=()
     case "$variant" in
         unfuse)
@@ -338,7 +337,6 @@ for variant in "${VARIANTS[@]}"; do
             ;;
         unfuse-sdcardfs)
             cxx_srcs=("$HERE/src/unfuse_sdcardfs.cpp")
-            ld_extra=(-llog)
             ;;
     esac
 
@@ -362,7 +360,7 @@ for variant in "${VARIANTS[@]}"; do
         for s in "${cxx_srcs[@]}"; do src_args+=("$(hostpath "$s")"); done
 
         "$cxx" "${COMMON[@]}" "${src_args[@]}" -o "$(hostpath "$out")" \
-            "${LDFLAGS[@]}" "${ld_extra[@]}"
+            "${LDFLAGS[@]}"
         strip_unneeded "$out"
 
         ok "$abi: $(wc -c < "$out") байт"

@@ -63,10 +63,4 @@ if unfuse_is_android_11 &&
     unfuse_setprop persist.sys.fuse false
 fi
 
-# The native module logs one sample per boot and guards it with this marker, so
-# it has to be gone before Zygote starts — otherwise the tag stays silent for
-# the whole boot after the first one. Here, not in service.sh: that runs after
-# apps are already launching.
-rm -f /data/adb/unfuse_zygisk.once
-
-sh "$MODDIR/storage.sh" post-fs-data
+sh "$MODDIR/storage.sh"

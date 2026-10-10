@@ -7,13 +7,11 @@
 # только примитивы, у которых не бывает варианта: смена системного свойства,
 # проверка релиза, перемаркировка корня /data/media и общий шаг установщика.
 #
-# Политики здесь нет намеренно. Какое значение свойства нужно, что и в каком
-# порядке монтировать, что писать в лог — это у сборок разное (unfuse выключает
-# FUSE в vold и правит ACL, unfuse-sdcardfs поднимает sdcardfs на
-# /mnt/runtime/*/emulated) и общей быть не может. Логирования в lib.sh тоже нет:
-# у unfuse лог свой (log.sh, /data/adb/unfuse_zygisk.debug.log), у
-# unfuse-sdcardfs — свой (/data/adb/unfuse_zygisk.log), и общая функция не должна
-# выбирать за них.
+# Политики здесь нет намеренно. Какое значение свойства нужно и что в каком
+# порядке монтировать — это у сборок разное (unfuse выключает FUSE в vold и
+# правит ACL, unfuse-sdcardfs поднимает sdcardfs на /mnt/runtime/*/emulated) и
+# общей быть не может. Логирования нет ни здесь, ни в сборках: модуль ничего не
+# пишет — ни журнала, ни logcat, — и отчитывается только кодом возврата.
 
 # unfuse_is_android_11 — Android 11 (SDK 30) единственный релиз, где форму
 # хранилища FUSE/sdcardfs переключает булево свойство persist.sys.fuse
@@ -38,29 +36,23 @@ unfuse_setprop() {
     fi
 }
 
-# unfuse_relabel_media_root [<куда stderr chcon>]
+# unfuse_relabel_media_root
 #
 # Без этого getattr() на /storage/emulated отдаёт EACCES у appdomain и coredomain
 # (domain.te:252: один search и ни одного getattr), причём без AVC — отказ помечен
 # dontaudit. Содержимое уже несёт media_rw_data_file, где у appdomain полные права
 # (app.te:149), так что перемаркировать надо ровно корень.
 #
-# Возврат: 0 — метка уже была нужной; 1 — перемаркировали; 2 — chcon не прошёл.
-# В случаях 1 и 2 в stdout печатается ПРЕЖНЯЯ метка: вызывающему она нужна для
-# своего лога, а читать состояние второй раз — значит показать его дважды.
-#
-# Необязательный аргумент — файл, куда уйдёт stderr самого chcon (по умолчанию
-# /dev/null). unfuse-sdcardfs передаёт свой лог: снимка состояния у него нет, и
-# сообщение ядра — единственное, что объяснит, почему chcon не прошёл.
+# Молчит: раньше функция печатала ПРЕЖНЮЮ метку и различала три кода возврата
+# (метка уже нужная / перемаркировали / chcon не прошёл) — это уходило в лог
+# сборок, а лога больше нет и читать это некому. Остался обычный признак успеха:
+# 0 — метка на месте, не 0 — chcon не прошёл.
 unfuse_relabel_media_root() {
-    _sink=${1:-/dev/null}
     _cur=$(ls -Zd /data/media 2>/dev/null | awk '{print $1}')
     case "$_cur" in
         *:media_rw_data_file:*) return 0 ;;
     esac
-    printf '%s\n' "$_cur"
-    chcon u:object_r:media_rw_data_file:s0 /data/media 2>>"$_sink" || return 2
-    return 1
+    chcon u:object_r:media_rw_data_file:s0 /data/media 2>/dev/null
 }
 
 # unfuse_require_zygisk_so <ABI> — сборка не доехала. Только для customize.sh:

@@ -16,13 +16,23 @@ echo "--- осталось ли в modules_update ---"
 ls -la /data/adb/modules_update/unfuse_zygisk/ 2>&1 | head -3
 
 echo
-echo "########## 2. лог модуля ##########"
-if [ -f /data/adb/unfuse_zygisk.log ]; then
-    echo "размер: $(wc -c < /data/adb/unfuse_zygisk.log) байт"
-    cat /data/adb/unfuse_zygisk.log
-else
-    echo "ЛОГА НЕТ — post-fs-data.sh/service.sh не отработали!"
-fi
+echo "########## 2. sdcardfs на всех четырёх точках ##########"
+# Журнала у модуля больше нет — он отчитывается только кодом возврата. Поэтому
+# вердикт здесь ставится по факту, как и в самом storage.sh (sdcardfs_verify):
+# точка действительно sdcardfs и несёт запрошенные mask/gid.
+rc=0
+for d in default read write full; do
+    p="/mnt/runtime/$d/emulated"
+    line=$(grep -m1 " $p " /proc/mounts)
+    ty=$(echo "$line" | awk '{print $3}')
+    if [ "$ty" = sdcardfs ]; then
+        echo "  ОК   $p  $(echo "$line" | awk '{print $4}')"
+    else
+        echo "  НЕТ  $p (${ty:-нет в mounts})"
+        rc=1
+    fi
+done
+if [ "$rc" = 0 ]; then echo "  итог: ОК"; else echo "  итог: НЕТ"; fi
 
 echo
 echo "########## 3. sdcardfs на /mnt/runtime/*/emulated ##########"
@@ -43,10 +53,6 @@ echo "########## 5. наш .so в zygote? ##########"
 ZY=$(pidof zygote64 2>/dev/null)
 echo "zygote64 pid: ${ZY:-нет}"
 [ -n "$ZY" ] && grep -i "unfuse_zygisk" /proc/$ZY/maps 2>/dev/null || echo "(в картах zygote64 нашего .so нет)"
-
-echo
-echo "########## 6. logcat про наш модуль ##########"
-logcat -d -s UnfuseZygisk 2>/dev/null | tail -40
 
 echo
 echo "########## конец ##########"

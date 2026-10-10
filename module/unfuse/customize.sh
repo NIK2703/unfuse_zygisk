@@ -40,18 +40,13 @@ unfuse_install_common "$ABI"
 # устройстве он system_lib_file. Фиксируем явно.
 chcon u:object_r:system_lib_file:s0 "$MODPATH/zygisk/$ABI.so" 2>/dev/null || true
 
-# Права только у этой сборки: утилиты vold-плеча и диагностика.
+# Права только у этой сборки: утилиты vold-плеча.
 set_perm "$MODPATH/tools/storage-fix"  0 0 0755
 set_perm "$MODPATH/tools/vold-noacl"   0 0 0755
 set_perm "$MODPATH/tools/vold-fusefs"  0 0 0755
-set_perm "$MODPATH/log.sh"             0 0 0755 2>/dev/null
-set_perm "$MODPATH/diag.sh"            0 0 0755 2>/dev/null
 
 # Второй конфиг — тот же мёртвый, но лежал внутри модуля.
 rm -f "$MODPATH/unfuse_zygisk.conf" 2>/dev/null
-# Метка загрузки снятого механизма обрезки лога (unfuse_log_begin до правки:
-# boot_id + $MODDIR/.log_boot). Файл больше никем не читается — убираем.
-rm -f "$MODPATH/.log_boot" 2>/dev/null
 
 # Форму хранилища на 11 модуль выставляет сам (post-fs-data.sh), но смена
 # бэкенда не должна быть неожиданной. FUSE — значение AOSP по умолчанию

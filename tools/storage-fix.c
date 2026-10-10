@@ -685,7 +685,8 @@ int main(int argc, char **argv) {
         return stat_errors == 0 ? 0 : 1;
     }
 
-    /* Diagnostics only; they change nothing. Driven by module/diag.sh. */
+    /* Diagnostics only; they change nothing. Run by hand — the module keeps no
+     * journal, so nothing feeds this mode and nothing parses its output. */
     if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
         if (argc <= 2) return usage(argv[0]);
         for (int i = 2; i < argc; i++) dump_path(argv[i]);

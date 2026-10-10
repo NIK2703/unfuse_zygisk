@@ -25,48 +25,26 @@
  * is the one mode number that is not the same on every release — 8 on 11, 4 from
  * 12 on — so both are accepted; see is_android_writable().
  *
- * The tag gets one sample per boot, not one per app launch: the first app that
- * receives storage claims /data/adb/unfuse_zygisk.once and logs, the rest stay
- * quiet. post-fs-data.sh removes the marker at boot. Everything else on the tag
- * is an error.
+ * The module reports nothing and writes nothing to disk: a bind that does not
+ * take is silent, and Zygote is simply left to do what it would have done
+ * without the module.
  */
 
-#include <errno.h>
-#include <fcntl.h>
 #include <jni.h>
 #include <sched.h>
-#include <string.h>
 #include <strings.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
 #include <sys/system_properties.h>
-#include <unistd.h>
 
 #include <string>
 
-#include <android/log.h>
-
 #include "zygisk.hpp"
-
-#define LOG_TAG "UnfuseZygisk"
 
 namespace {
 
 // The source: sdcardfs with full access (mask=0007, gid=9997).
 constexpr const char *kSourceSdcardfs = "/mnt/runtime/full/emulated";
-
-// Claimed by the first app that gets storage, so the tag carries one sample per
-// boot instead of one per launch. post-fs-data.sh removes it.
-constexpr const char *kOnceFlag = "/data/adb/unfuse_zygisk.once";
-
-// Creates path if absent; true only for the caller that created it. Several
-// apps specialise at once, so this must be atomic — O_EXCL is.
-bool claim_once(const char *path) {
-    int fd = open(path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd < 0) return false;
-    close(fd);
-    return true;
-}
 
 // android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is
 // IVold.REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it.
@@ -80,7 +58,7 @@ bool claim_once(const char *path) {
 // ExternalStorageMountPolicy implementations return nothing outside NONE,
 // DEFAULT, READ and WRITE. 8 is past the end of the 12+ enum, so it cannot
 // occur there. A release that renumbers again shows up as an android_writable
-// process the module declines, which the log names rather than hides.
+// process the module declines.
 constexpr int kMountModeExternalDefault = 1;
 constexpr int kMountModeExternalAndroidWritable = 4;      // 12 and up
 constexpr int kMountModeExternalAndroidWritableR = 8;     // 11 only
@@ -137,9 +115,6 @@ const char *runtime_view_for_mode(int mode) {
     return nullptr;
 }
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-
 void rollback(const std::string &dst) { umount2(dst.c_str(), MNT_DETACH); }
 
 // Binds the sdcardfs source onto dst; true only if it is really sdcardfs under
@@ -149,20 +124,16 @@ void rollback(const std::string &dst) { umount2(dst.c_str(), MNT_DETACH); }
 // the inode, so unlike stat() it cannot be denied by directory permissions.
 bool attach_sdcardfs(const std::string &dst) {
     if (mount(kSourceSdcardfs, dst.c_str(), nullptr, MS_BIND | MS_REC, nullptr) != 0) {
-        LOGE("bind %s -> %s: %s", kSourceSdcardfs, dst.c_str(), strerror(errno));
         return false;
     }
 
     struct statfs st {};
     if (statfs(dst.c_str(), &st) != 0) {
-        LOGE("statfs %s: %s", dst.c_str(), strerror(errno));
         rollback(dst);
         return false;
     }
 
-    const auto type = static_cast<unsigned long>(st.f_type);
-    if (type != kSdcardFsMagic) {
-        LOGE("%s: под точкой не sdcardfs (0x%lx) — откат", dst.c_str(), type);
+    if (static_cast<unsigned long>(st.f_type) != kSdcardFsMagic) {
         rollback(dst);
         return false;
     }
@@ -179,14 +150,8 @@ public:
         // Private namespace copy: otherwise the mount leaks into zygote and all
         // its children. unshare() also copies propagation settings, so make the
         // whole tree private right away.
-        if (unshare(CLONE_NEWNS) != 0) {
-            LOGE("unshare(CLONE_NEWNS): %s", strerror(errno));
-            return;
-        }
-        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
-            LOGE("MS_REC|MS_PRIVATE на /: %s", strerror(errno));
-            return;
-        }
+        if (unshare(CLONE_NEWNS) != 0) return;
+        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return;
 
         const std::string user =
             std::to_string(static_cast<unsigned>(args->uid) / kAidUserOffset);
@@ -205,7 +170,6 @@ public:
         // the substitution above is off the path. Put the source there as well.
         // Both binds are kept: /storage/self comes from /mnt/user/<user> even on
         // that arm, so dropping the first would lose it.
-        std::string runtime_dst;
         if (zygote_uses_runtime_view()) {
             const char *view = runtime_view_for_mode(mode);
             if (view != nullptr) {
@@ -213,11 +177,8 @@ public:
                     std::string("/mnt/runtime/") + view + "/emulated";
                 // ANDROID_WRITABLE's view is /mnt/runtime/full, which IS the
                 // sdcardfs source: binding it onto itself adds nothing.
-                if (dst != kSourceSdcardfs) {
-                    if (attach_sdcardfs(dst)) {
-                        ok = true;
-                        runtime_dst = dst;
-                    }
+                if (dst != kSourceSdcardfs && attach_sdcardfs(dst)) {
+                    ok = true;
                 }
             }
         }
@@ -226,20 +187,6 @@ public:
         if (args->mount_storage_dirs != nullptr) {
             *args->mount_storage_dirs = JNI_FALSE;
         }
-
-        // The line below is per-launch by nature, and a launch happens every
-        // few seconds, so the tag is written only by the app that wins the
-        // marker. status.sh reads that sample; when it is gone (logcat rolled
-        // over) it has nothing to fall back on.
-        if (!claim_once(kOnceFlag)) return;
-
-        // The arm is named only when the runtime view is the one in play, so
-        // the sample says which half of MountEmulatedStorage() this release
-        // actually ran — the one thing about the mount that is not the same
-        // on every release.
-        const std::string arm =
-            runtime_dst.empty() ? std::string() : (", вид " + runtime_dst);
-        LOGI("sdcardfs подключён: uid=%d%s", static_cast<int>(args->uid), arm.c_str());
     }
 };
 

@@ -9,11 +9,11 @@
 #
 #   [✅ sdcardfs] Direct internal storage for all apps — no FUSE, no scoped...
 #
-# Only the driver, nothing else. Whether the mounts are actually up is a
-# question for storage.sh's own log: those four checks change from boot to boot
-# while apps restart, and a sign that flickers in the module list says less than
-# one that means exactly what it says. The install already refuses a kernel
-# without the driver, so ✅ is the normal case and ❌ means the kernel lost it.
+# Only the driver, nothing else. Whether the mounts are actually up is
+# storage.sh's business and changes from boot to boot while apps restart; a sign
+# that flickers in the module list says less than one that means exactly what it
+# says. The install already refuses a kernel without the driver, so ✅ is the
+# normal case and ❌ means the kernel lost it.
 #
 # Runs from service.sh, and can be run by hand:
 #   su -c 'sh /data/adb/modules/unfuse_zygisk/status.sh'
