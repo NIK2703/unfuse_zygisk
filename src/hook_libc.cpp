@@ -160,7 +160,17 @@ mode_t widen_existing(int dirfd, const char *path, mode_t mode, int at_flags) {
 
 // Five entries as vold::SetDefaultAcl (vold-16/Utils.cpp:142) /
 // tools/storage-fix.c. The named 9997 entry and the mask both take the group
-// perms (else the mask revokes access); OTHER cleared, as sdcardfs mask 0007.
+// perms (else the mask revokes access).
+//
+// OTHER is taken from the mode rather than written as 0, to read the same way as
+// the three mode helpers in tools/storage-fix.c — but the value is still 0 here,
+// and deliberately so. `mode` is always the already-shaped mode from
+// as_sdcardfs_file/dir, which keeps only owner+group bits, so `mode & S_IRWXO` is
+// 0 by construction. That is the correct answer for what this arm writes: objects
+// an app creates under /data/media are 0770/0660 in Android 10 too, and it is
+// only the four Android* levels — prepared by vold as 02771, and therefore fixed
+// by storage-fix from the on-disk mode — that carry `other = --x`. The two writers
+// agree on every object either of them touches.
 void acl_build(uint8_t *buf, size_t *len, mode_t mode) {
     const uint16_t g = static_cast<uint16_t>((mode & S_IRWXG) >> 3);
 
@@ -169,7 +179,7 @@ void acl_build(uint8_t *buf, size_t *len, mode_t mode) {
     e[1] = {kAclGroupObj, g, static_cast<uint32_t>(-1)};
     e[2] = {kAclGroup, g, kAidEverybody};
     e[3] = {kAclMask, g, 0};
-    e[4] = {kAclOther, 0, 0};
+    e[4] = {kAclOther, static_cast<uint16_t>(mode & S_IRWXO), 0};
 
     memcpy(buf, &kAclVersion, sizeof(uint32_t));
     memcpy(buf + sizeof(uint32_t), e, sizeof(e));

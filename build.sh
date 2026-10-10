@@ -1,45 +1,44 @@
 #!/usr/bin/env bash
 #
-# build.sh — build the Unfuse Zygisk module.
+# build.sh — сборка обоих модулей проекта из одного дерева.
 #
-# Builds four things:
-#   module/zygisk/<abi>.so          — the module itself (C++, NDK, clang++);
-#   module/tools/storage-fix-<abi>  — the tool that places the group-9997 ACL on
-#                                     the raw tree (C): /data/media is
-#                                     1023:1023 with 0550/2770/0670, and apps
-#                                     are not in group 1023, so without this
-#                                     they cannot even enter the root;
-#   module/tools/vold-noacl-<abi>   — the vold patcher: turns
-#                                     vold::SetDefaultAcl() into a no-op so vold
-#                                     stops overwriting those ACLs with its own
-#                                     group 1023 entry (C).
-#   module/tools/vold-fusefs-<abi>  — the FUSE-off patcher: redirects vold's
-#                                     mount() stub so MountUserFuse() puts a
-#                                     bind of /data/media on top of the FUSE
-#                                     mount it asked for, and redirects the
-#                                     umount2() stub as well so the teardown
-#                                     clears both layers instead of one (C).
-# Then packs module/ into out/unfuse_zygisk-<version>.zip.
+#   module/common/ + module/unfuse/           -> out/unfuse-<version>.zip
+#   module/common/ + module/unfuse-sdcardfs/  -> out/unfuse-sdcardfs-<version>.zip
+#
+# Что собирается у каждого варианта:
+#
+#   unfuse (Zygisk, C++, NDK clang++):
+#     module/unfuse/zygisk/<abi>.so   — сам модуль: vold-fusefs заменяет FUSE-маунт
+#                                       vold на бинд сырого /data/media, а libc-хуки
+#                                       формулируют режимы под это дерево;
+#     module/unfuse/tools/storage-fix-<abi>  — ACL группы 9997 на сыром дереве;
+#     module/unfuse/tools/vold-noacl-<abi>   — vold::SetDefaultAcl() -> no-op;
+#     module/unfuse/tools/vold-fusefs-<abi>  — перехват mount()/umount2() в vold.
+#
+#   unfuse-sdcardfs (Zygisk, C++, NDK clang++):
+#     module/unfuse-sdcardfs/zygisk/<abi>.so — сам модуль: биндит sdcardfs
+#                                       /mnt/runtime/*/emulated в namespace приложения.
+#     Утилит нет: всё, что нужно, делает storage.sh.
+#
+# module/common/ — то, что в обоих архивах совпадает: META-INF установщика и lib.sh
+# с общими примитивами (смена свойства, перемаркировка /data/media, шаг установщика).
+# Перед упаковкой common и каталог варианта складываются в один staging; в архив
+# идут ровно они, а не дерево репозитория.
 #
 # Usage:
-#   ./build.sh                  # arm64-v8a + armeabi-v7a, then a zip in out/
-#   ./build.sh arm64-v8a        # a single ABI
-#   API=30 ./build.sh           # another android API level (default 26)
-#   ZIP=0 ./build.sh            # do not pack a zip
-#   NDK=/path/to/ndk ./build.sh # explicit NDK path
-#   STRIP=0 ./build.sh          # no stripping (debugging)
+#   ./build.sh                      # оба модуля, arm64-v8a + armeabi-v7a
+#   ./build.sh unfuse               # только unfuse
+#   ./build.sh unfuse-sdcardfs      # только unfuse-sdcardfs
+#   ./build.sh unfuse arm64-v8a     # вариант и ABI — в любом порядке
+#   API=30 ./build.sh               # другой android API level (default 26)
+#   ZIP=0 ./build.sh                # без упаковки
+#   NDK=/path/to/ndk ./build.sh     # явный путь к NDK
+#   STRIP=0 ./build.sh              # без strip (отладка)
 #
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$HERE/src/unfuse_zygisk.cpp"
-HOOK_SRC="$HERE/src/hook_libc.cpp"
-SIZE_SRC="$HERE/src/func_size.cpp"
-TOOLS_SRC="$HERE/tools/storage-fix.c"
-NOACL_SRC="$HERE/tools/vold-noacl.c"
-FUSEFS_SRC="$HERE/tools/vold-fusefs.c"
-ZYG_DIR="$HERE/module/zygisk"
-TOOLS_DIR="$HERE/module/tools"
+MODULE_DIR="$HERE/module"
 OUT_DIR="$HERE/out"
 
 API="${API:-26}"
@@ -48,6 +47,7 @@ STRIP="${STRIP:-1}"
 DEBUG="${DEBUG:-0}"
 
 DEFAULT_ABIS=(arm64-v8a armeabi-v7a)
+ALL_VARIANTS=(unfuse unfuse-sdcardfs)
 
 # --------------------------------------------------------------- NDK lookup
 #
@@ -139,40 +139,34 @@ triple_for() {
     esac
 }
 
-# abi -> utility binary name in module/tools/.
+# abi -> суффикс имени утилиты в module/<variant>/tools/.
 #
-# The utility is a native executable, one per architecture (unlike the
-# zygisk/*.so, which Zygisk picks by ABI). So the archive carries every variant
-# and customize.sh keeps the right one, renaming it to tools/storage-fix.
-tool_name_for() {
+# Утилита — нативный исполняемый файл, по одному на архитектуру (в отличие от
+# zygisk/*.so, который Zygisk выбирает по ABI). Поэтому в архив кладутся оба
+# варианта, а customize.sh оставляет нужный и переименовывает в tools/<имя>.
+abi_suffix_for() {
     case "$1" in
-        arm64-v8a)   echo "storage-fix-arm64" ;;
-        armeabi-v7a) echo "storage-fix-arm" ;;
+        arm64-v8a)   echo "arm64" ;;
+        armeabi-v7a) echo "arm" ;;
         *)           return 1 ;;
     esac
 }
 
-# abi -> vold patcher binary name in module/tools/. Same reason as storage-fix:
-# the archive carries every variant and customize.sh keeps the right one,
-# renaming it to tools/vold-noacl.
-noacl_name_for() {
-    case "$1" in
-        arm64-v8a)   echo "vold-noacl-arm64" ;;
-        armeabi-v7a) echo "vold-noacl-arm" ;;
-        *)           return 1 ;;
+# --------------------------------------------------------------- аргументы
+#
+# Аргументы — имена вариантов и/или ABI в любом порядке. Не названо ни одного
+# варианта — собираются оба; ни одного ABI — оба ABI.
+VARIANTS=()
+ABIS=()
+for arg in "$@"; do
+    case "$arg" in
+        unfuse|unfuse-sdcardfs) VARIANTS+=("$arg") ;;
+        arm64-v8a|armeabi-v7a)  ABIS+=("$arg") ;;
+        *) die "неизвестный аргумент: $arg (варианты: ${ALL_VARIANTS[*]}; ABI: ${DEFAULT_ABIS[*]})" ;;
     esac
-}
-
-# abi -> FUSE-off patcher binary name in module/tools/. Same reason as the other
-# two: the archive carries every variant and customize.sh keeps the right one,
-# renaming it to tools/vold-fusefs.
-fusefs_name_for() {
-    case "$1" in
-        arm64-v8a)   echo "vold-fusefs-arm64" ;;
-        armeabi-v7a) echo "vold-fusefs-arm" ;;
-        *)           return 1 ;;
-    esac
-}
+done
+[[ ${#VARIANTS[@]} -eq 0 ]] && VARIANTS=("${ALL_VARIANTS[@]}")
+[[ ${#ABIS[@]} -eq 0 ]] && ABIS=("${DEFAULT_ABIS[@]}")
 
 # --------------------------------------------------------------- main
 NDK_DIR="$(find_ndk)" || die "NDK не найден. Укажите путь: NDK=/path/to/ndk $0"
@@ -181,20 +175,10 @@ TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/$(find_host_tag)"
 
 info "NDK:      $NDK_DIR"
 info "API:      $API"
-info "исходник: $SRC"
-info "          $HOOK_SRC"
-info "          $SIZE_SRC"
+info "варианты: ${VARIANTS[*]}"
+info "ABI:      ${ABIS[*]}"
 
-[[ -f "$SRC" ]] || die "нет исходника $SRC"
-[[ -f "$HOOK_SRC" ]] || die "нет исходника $HOOK_SRC"
-[[ -f "$SIZE_SRC" ]] || die "нет исходника $SIZE_SRC"
-[[ -f "$TOOLS_SRC" ]] || die "нет исходника $TOOLS_SRC"
-[[ -f "$NOACL_SRC" ]] || die "нет исходника $NOACL_SRC"
-[[ -f "$FUSEFS_SRC" ]] || die "нет исходника $FUSEFS_SRC"
-mkdir -p "$ZYG_DIR" "$TOOLS_DIR" "$OUT_DIR"
-
-ABIS=("$@")
-[[ ${#ABIS[@]} -eq 0 ]] && ABIS=("${DEFAULT_ABIS[@]}")
+mkdir -p "$OUT_DIR"
 
 # --------------------------------------------------------------- flags
 COMMON=(
@@ -235,8 +219,8 @@ LDFLAGS=(
     -ldl
 )
 
-# The utility links as a normal Android binary (dynamically, via bionic): it runs
-# from post-fs-data.sh/service.sh when /system is already mounted, just like
+# The utilities link as normal Android binaries (dynamically, via bionic): they
+# run from post-fs-data.sh/service.sh when /system is already mounted, just like
 # mount(1) and chcon(1) in those scripts. A static build would give 420 KB
 # instead of 10 KB and triple the archive size for nothing.
 CFLAGS=(
@@ -253,122 +237,52 @@ CFLAGS=(
     # the -I for it.
 )
 
-# --------------------------------------------------------------- build
-built=()
-for abi in "${ABIS[@]}"; do
-    prefix="$(triple_for "$abi")" || die "неизвестный ABI: $abi"
-    cxx="$TOOLCHAIN/bin/${prefix}${API}-clang++"
-    [[ -x "$cxx" ]] || die "нет компилятора $cxx (проверьте API=$API)"
+strip_unneeded() {
+    [[ "$STRIP" == "1" ]] || return 0
+    local strip_bin="$TOOLCHAIN/bin/llvm-strip"
+    [[ -x "$strip_bin" ]] && "$strip_bin" --strip-unneeded "$(hostpath "$1")"
+    return 0
+}
 
-    out="$ZYG_DIR/$abi.so"
-    info "сборка $abi -> $(basename "$out")"
+strip_all() {
+    [[ "$STRIP" == "1" ]] || return 0
+    local strip_bin="$TOOLCHAIN/bin/llvm-strip"
+    [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$1")"
+    return 0
+}
 
-    "$cxx" "${COMMON[@]}" "$(hostpath "$SRC")" "$(hostpath "$HOOK_SRC")" \
-        "$(hostpath "$SIZE_SRC")" -o "$(hostpath "$out")" "${LDFLAGS[@]}"
+# --------------------------------------------------------------- упаковка
+#
+# staging = module/common/ поверх module/<variant>/. Права нормализованы, а не
+# взяты с файловой системы: иначе архив зависел бы от umask сборочной машины.
+# Скрипты, утилиты и заглушка установщика исполняемые (их читает либо установщик,
+# либо загрузчик модуля), остальное 0644. customize.sh выставляет те же права ещё
+# раз при установке — здесь важно только то, что сам zip корректен.
+pack() {
+    local variant="$1"
+    local vdir="$MODULE_DIR/$variant"
+    local version zipname zippath staging
 
-    if [[ "$STRIP" == "1" ]]; then
-        strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-unneeded "$(hostpath "$out")"
-    fi
-
-    size="$(wc -c < "$out")"
-    ok "$abi: $size байт"
-
-    # The entry point must be exported and unmangled. zygisk_companion_entry is
-    # optional: the module does not need it (a companion exists only for reading
-    # config from places zygote cannot reach).
-    if ! "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_module_entry; then
-        die "в $out отсутствует экспортируемая точка входа zygisk_module_entry"
-    fi
-    if "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_companion_entry; then
-        ok "$abi: точки входа на месте (module + companion)"
-    else
-        ok "$abi: точка входа на месте (module)"
-    fi
-
-    built+=("$out")
-
-    # ------------------------------------------------- storage-fix utility
-    cc="$TOOLCHAIN/bin/${prefix}${API}-clang"
-    [[ -x "$cc" ]] || die "нет компилятора $cc (проверьте API=$API)"
-
-    tool="$(tool_name_for "$abi")" || die "нет имени утилиты для $abi"
-    tout="$TOOLS_DIR/$tool"
-    info "сборка $abi -> $(basename "$tout")"
-
-    "$cc" "${CFLAGS[@]}" "$(hostpath "$TOOLS_SRC")" -o "$(hostpath "$tout")" \
-        -Wl,--gc-sections -Wl,--build-id=none
-
-    if [[ "$STRIP" == "1" ]]; then
-        strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$tout")"
-    fi
-
-    ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
-    built+=("$tout")
-
-    # ------------------------------------------------ vold patcher
-    #
-    # The patcher touches only vold's process memory, so its ABI need not match
-    # vold's: it reads and writes /proc/<pid>/mem and parses ELF itself. Built
-    # for the same architecture as storage-fix, simply so the archive holds
-    # nothing extra.
-    ntool="$(noacl_name_for "$abi")" || die "нет имени патчера для $abi"
-    nout="$TOOLS_DIR/$ntool"
-    info "сборка $abi -> $(basename "$nout")"
-
-    "$cc" "${CFLAGS[@]}" "$(hostpath "$NOACL_SRC")" -o "$(hostpath "$nout")" \
-        -Wl,--gc-sections -Wl,--build-id=none
-
-    if [[ "$STRIP" == "1" ]]; then
-        strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$nout")"
-    fi
-
-    ok "$abi: $(basename "$nout") — $(wc -c < "$nout") байт"
-    built+=("$nout")
-
-    # ------------------------------------------------ FUSE-off patcher
-    #
-    # Same shape as vold-noacl: it works on vold's process memory and parses
-    # ELF itself, so its ABI need not match vold's. The arm64 handler it emits
-    # is generated at run time for the target it finds, not compiled in, so
-    # nothing here is architecture-specific except the outer executable.
-    ftool="$(fusefs_name_for "$abi")" || die "нет имени патчера для $abi"
-    fout="$TOOLS_DIR/$ftool"
-    info "сборка $abi -> $(basename "$fout")"
-
-    "$cc" "${CFLAGS[@]}" "$(hostpath "$FUSEFS_SRC")" -o "$(hostpath "$fout")" \
-        -Wl,--gc-sections -Wl,--build-id=none
-
-    if [[ "$STRIP" == "1" ]]; then
-        strip_bin="$TOOLCHAIN/bin/llvm-strip"
-        [[ -x "$strip_bin" ]] && "$strip_bin" --strip-all "$(hostpath "$fout")"
-    fi
-
-    ok "$abi: $(basename "$fout") — $(wc -c < "$fout") байт"
-    built+=("$fout")
-done
-
-# --------------------------------------------------------------- zip
-if [[ "$ZIP" == "1" ]]; then
-    version="$(sed -n 's/^version=//p' "$HERE/module/module.prop" 2>/dev/null | head -1)"
+    version="$(sed -n 's/^version=//p' "$vdir/module.prop" 2>/dev/null | head -1)"
     [[ -z "$version" ]] && version="dev"
-    zipname="unfuse_zygisk-${version}.zip"
+    zipname="$variant-${version}.zip"
     zippath="$OUT_DIR/$zipname"
+    staging="$OUT_DIR/.staging-$variant"
 
-    # Every module shell script must already be executable in the archive:
-    # customize.sh is invoked by the installer, the rest by the module loader.
-    # Same for the utility binaries.
-    chmod 0755 "$HERE/module"/*.sh 2>/dev/null || true
-    chmod 0755 "$HERE/module"/tools/* 2>/dev/null || true
+    chmod 0755 "$vdir"/*.sh 2>/dev/null || true
+    chmod 0755 "$vdir"/tools/* 2>/dev/null || true
+
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    cp -a "$MODULE_DIR/common/." "$staging/"
+    cp -a "$vdir/." "$staging/"
 
     info "упаковка $zipname"
 
-    # Packed through python: deterministic, permissions preserved, no external
+    # Packed through python: deterministic, permissions normalised, no external
     # zip and no need to delete an old archive first. Paths are translated
     # because python here is a native Windows build, not an MSYS one.
-    python3 - "$(hostpath "$HERE/module")" "$(hostpath "$zippath")" <<'PYEOF'
+    python3 - "$(hostpath "$staging")" "$(hostpath "$zippath")" <<'PYEOF'
 import os, sys, zipfile
 
 root, out = sys.argv[1], sys.argv[2]
@@ -381,21 +295,17 @@ with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for f in sorted(files):
             full = os.path.join(base, f)
             rel = os.path.relpath(full, root)
-            if f.startswith('.') or rel.endswith('.zip') or rel.endswith('.tmp'):
-                skipped.append(rel)
-                continue
-            zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
-            # Permissions come from the filesystem, but .sh files, the tools and
-            # the installer stub are always executable: otherwise the module may
-            # fail to run its scripts, to find the storage-fix binary on install,
-            # or Magisk may refuse the archive (update-binary is not a .sh file).
-            mode = os.stat(full).st_mode & 0o7777
             # os.path.relpath uses "\" on Windows while zip entries always use
             # "/", so the directory test has to run on the normalized form:
             # otherwise the tools silently lose their executable bit here.
             relposix = rel.replace(os.sep, '/')
-            if rel.endswith('.sh') or relposix.startswith('tools/') or f == 'update-binary':
-                mode |= 0o111
+            if f.startswith('.') or rel.endswith('.zip') or rel.endswith('.tmp'):
+                skipped.append(rel)
+                continue
+            executable = (rel.endswith('.sh') or f == 'update-binary'
+                          or relposix.startswith('tools/'))
+            mode = 0o755 if executable else 0o644
+            zi = zipfile.ZipInfo(rel, date_time=(2026, 1, 1, 0, 0, 0))
             zi.external_attr = mode << 16
             zi.compress_type = zipfile.ZIP_DEFLATED
             with open(full, 'rb') as fh:
@@ -406,9 +316,102 @@ if skipped:
     print("  пропущено:", ", ".join(skipped))
 PYEOF
 
+    rm -rf "$staging"
     [[ -f "$zippath" ]] || die "не удалось создать $zippath"
-    zsize="$(wc -c < "$zippath")"
-    ok "готово: $zippath ($zsize байт)"
+    ok "готово: $zippath ($(wc -c < "$zippath") байт)"
+}
+
+# --------------------------------------------------------------- build
+built=()
+for variant in "${VARIANTS[@]}"; do
+    vdir="$MODULE_DIR/$variant"
+    [[ -d "$vdir" ]] || die "нет каталога варианта: $vdir"
+
+    # Что у варианта своё: исходники плеча, его линковка и набор утилит.
+    cxx_srcs=()
+    ld_extra=()
+    ctools=()
+    case "$variant" in
+        unfuse)
+            cxx_srcs=("$HERE/src/unfuse_zygisk.cpp" "$HERE/src/hook_libc.cpp" "$HERE/src/func_size.cpp")
+            ctools=(storage-fix vold-noacl vold-fusefs)
+            ;;
+        unfuse-sdcardfs)
+            cxx_srcs=("$HERE/src/unfuse_sdcardfs.cpp")
+            ld_extra=(-llog)
+            ;;
+    esac
+
+    for s in "${cxx_srcs[@]}"; do [[ -f "$s" ]] || die "нет исходника $s"; done
+    for t in "${ctools[@]}"; do [[ -f "$HERE/tools/$t.c" ]] || die "нет исходника $HERE/tools/$t.c"; done
+
+    info "=== вариант $variant ==="
+
+    for abi in "${ABIS[@]}"; do
+        prefix="$(triple_for "$abi")" || die "неизвестный ABI: $abi"
+        cxx="$TOOLCHAIN/bin/${prefix}${API}-clang++"
+        [[ -x "$cxx" ]] || die "нет компилятора $cxx (проверьте API=$API)"
+
+        mkdir -p "$vdir/zygisk"
+
+        # ---------------------------------------------------- Zygisk-плечо
+        out="$vdir/zygisk/$abi.so"
+        info "сборка $abi -> $(basename "$out")"
+
+        src_args=()
+        for s in "${cxx_srcs[@]}"; do src_args+=("$(hostpath "$s")"); done
+
+        "$cxx" "${COMMON[@]}" "${src_args[@]}" -o "$(hostpath "$out")" \
+            "${LDFLAGS[@]}" "${ld_extra[@]}"
+        strip_unneeded "$out"
+
+        ok "$abi: $(wc -c < "$out") байт"
+
+        # The entry point must be exported and unmangled. zygisk_companion_entry
+        # is optional: the module does not need it (a companion exists only for
+        # reading config from places zygote cannot reach).
+        if ! "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_module_entry; then
+            die "в $out отсутствует экспортируемая точка входа zygisk_module_entry"
+        fi
+        if "$TOOLCHAIN/bin/llvm-nm" -D --defined-only "$(hostpath "$out")" 2>/dev/null | grep -qw zygisk_companion_entry; then
+            ok "$abi: точки входа на месте (module + companion)"
+        else
+            ok "$abi: точка входа на месте (module)"
+        fi
+
+        built+=("$out")
+
+        # ---------------------------------------------------- утилиты варианта
+        #
+        # Патчеры vold работают с памятью процесса и разбирают ELF сами, так что
+        # их ABI не обязан совпадать с ABI vold. Собираются под ту же
+        # архитектуру, что storage-fix, просто чтобы в архиве не было лишнего.
+        [[ ${#ctools[@]} -eq 0 ]] && continue
+
+        cc="$TOOLCHAIN/bin/${prefix}${API}-clang"
+        [[ -x "$cc" ]] || die "нет компилятора $cc (проверьте API=$API)"
+        suffix="$(abi_suffix_for "$abi")" || die "нет суффикса для $abi"
+        mkdir -p "$vdir/tools"
+
+        for t in "${ctools[@]}"; do
+            tout="$vdir/tools/$t-$suffix"
+            info "сборка $abi -> $(basename "$tout")"
+
+            "$cc" "${CFLAGS[@]}" "$(hostpath "$HERE/tools/$t.c")" \
+                -o "$(hostpath "$tout")" -Wl,--gc-sections -Wl,--build-id=none
+            strip_all "$tout"
+
+            ok "$abi: $(basename "$tout") — $(wc -c < "$tout") байт"
+            built+=("$tout")
+        done
+    done
+done
+
+# --------------------------------------------------------------- zip
+if [[ "$ZIP" == "1" ]]; then
+    for variant in "${VARIANTS[@]}"; do
+        pack "$variant"
+    done
 fi
 
 printf '\n'

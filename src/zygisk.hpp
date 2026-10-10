@@ -22,7 +22,26 @@
 
 #include <jni.h>
 
-#define ZYGISK_API_VERSION 5
+// Объявляем 4, а не 5, — сознательно.
+//
+// Из «свежего» нам нужно ровно одно: поле AppSpecializeArgs::mount_storage_dirs
+// (в preAppSpecialize гасим им примонтированные storage-каталоги). Оно есть уже
+// с API 3 — Magisk 25.2, native/jni/zygisk/api.hpp:115. Методов Api мы не зовём
+// вообще (ни pltHookRegister, ни exemptFd, ни hookJniNativeMethods), так что
+// v5-специфичное поле mount_sysprop_overrides нам не нужно.
+//
+// Зато за объявление 5 приходится платить: Magisk 27.0 вышел со сломанной
+// ZygiskModule::valid() — switch по *api_version знает только 1..4, а на 5
+// срабатывает default -> false. Модуль молча выкидывается из списка, и magiskd
+// ставит ему маркер zygisk/unloaded (get_process_info, entry.cpp:173). Починили
+// это лишь коммитом 49318259 «Fix zygisk v5» (2024-07-13, добавил case 5:),
+// то есть в 27.0 баг есть, а в 27.1/28+ — нет. Ровно на этом баге спотыкалась
+// redroid-ВМ (Delta 25206 = Zygisk от 27.0).
+//
+// Поведение при 4 идентично 5: call_app в module.cpp для case 4 и case 5 делает
+// одно и то же — mod.v1->method(mod.v1->impl, args). Итог: работаем и на 26.0+,
+// и на багованном 27.0, и на 27.1+/28+.
+#define ZYGISK_API_VERSION 4
 
 /*
 

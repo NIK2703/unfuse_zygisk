@@ -1,109 +1,138 @@
-# unfuse_zygisk
+# unfuse_zygisk — память проекта
 
 Zygisk-модуль: доступ приложений к `/data/media` без FUSE/scoped storage.
-Репозиторий `github.com/NIK2703/unfuse_zygisk`; рабочая копия `E:\projects\unfuse_zygisk`,
-ветка `no-sdcardfs` (до 2026-10-09 звалась `fuse-only`). `main` на origin = `no-sdcardfs`
-(fast-forward 2026-10-09, `87df5de`). Считается **не по счётчику коммитов**:
-`origin/no-sdcardfs` — соседняя ветка от `bc95307` (README добавлен через веб-интерфейс),
-она не предок и не потомок локальной.
-**Вторая ветка — «sdcardfs» — живёт НЕ в git:** её рабочая копия
-`C:\Users\Nikita\unfuse-build\sdcardfs-only` не является чекаутом (`git rev-parse` →
-«not a git repository»), и все её правки делаются в копии. В репозитории она есть только
-как устаревшая `origin/sdcardfs-only` (`2a1f43f`, 50 коммитов позади). Когда Nikita
-говорит «ветка sdcardfs», он имеет в виду эту копию — смотреть надо туда.
-Разбор дизайна — `docs/fuse-root-patch-design.md`; A11 — `docs/android-11-design.md`;
-разбор лога с живого A11 crDroid — `docs/android-11-crdroid-log.md`;
-варианты ПК-стенда A11 arm64 — `docs/android-11-arm64-stand.md`.
+`github.com/NIK2703/unfuse_zygisk`; копия `E:\projects\unfuse_zygisk`.
+**Одна ветка `master`, два модуля из одного дерева** (сведено 2026-10-10): `unfuse`
+(патч vold + libc-хуки) и `unfuse-sdcardfs` (sdcardfs на `/mnt/runtime/*/emulated`).
+Ветки `no-sdcardfs` и `sdcardfs-only` слиты в неё и удалены локально (остались в reflog
+и на origin). id у обоих — `unfuse_zygisk`: модули альтернативные (на A11 ставят
+`persist.sys.fuse` в противоположные значения), вместе не живут, второй заменяет первый.
+Собираются одним `./build.sh` (`out/unfuse-<ver>.zip`, `out/unfuse-sdcardfs-<ver>.zip`);
+общее — `module/common/` (META-INF + `lib.sh`). Структура — `docs/repo-layout.md`.
+
+Детали — в `docs/` (здесь только индекс и грабли): `repo-layout.md`,
+`fuse-root-patch-design.md`, `android-11-design.md`, `android-11-crdroid-log.md`,
+`android-11-arm64-stand.md`, `android-11-app-access-fix.md`, `marble-reboot-vold-failed.md`,
+`diagnostics.md`, `redroid-vm-module-diagnosis.md`, `redroid-vm-reliability-test.md`,
+`sdcardfs-vm-verification.md`, `redroid-vm/README-redroid-VM.md` + скилл **`redroid-vm-magisk`**.
 
 ## Жёсткие запреты (Nikita)
-- **Никаких сторожей** — ни при каких обстоятельствах («навсегда», 2026-10-09). Прецедент:
-  `--guard` у `storage-fix` убирали (v3.1.0). Конфликт (напр. GCam-патчер) лечится без сторожа.
-- **Не коммитить и не пушить без прямой просьбы.** «правь файлы» ≠ «оформляй в git».
-  Коммит/пуш только по явной команде (`закоммить`, `запушь`, «на origin»). Правило общее.
+- **Никаких сторожей, никогда.** Прецедент: `--guard` у `storage-fix` убран (v3.1.0).
+  Одноразовое решение в известной точке — можно; наблюдение за системой — нет.
+- **Не коммитить/пушить без прямой просьбы.** «правь файлы» ≠ «оформляй в git».
 
-## Конвенции сборки/установки
-- Комментарии/коммиты по-русски, «почему» со ссылкой на AOSP.
-- `./build.sh`, NDK `29.0.14206865`, сборка детерминированная (неизменный md5 = правка не доехала).
-  ABI: `arm64-v8a`, `armeabi-v7a`.
-- На устройство — **только атомарно** (`mv -f`); `cp -f` поверх `zygisk/*.so` усекает inode → SIGBUS zygote.
-- **Модуль ничего не пишет**: отчёт только кодом возврата; логгирование удалять целиком.
-- Ставить `install.sh` из `C:\Users\Nikita\unfuse-build\` (НЕ `ksud module install` — тот трогает
-  отображённый в zygote `*.so`). `zygisk/*.so` обязан быть `u:object_r:system_lib_file:s0`
-  (chcon в `install.sh`/4-м аргументе `atomic_put`).
+## Конвенции
+- Комментарии/коммиты/доки по-русски, «почему» со ссылкой на AOSP.
+- `./build.sh`, NDK `29.0.14206865`; сборка детерминированная (тот же md5 = правка не доехала).
+- На устройство — **только атомарно** (`mv -f`); `cp -f` поверх `zygisk/*.so` усекает inode
+  под живым mmap → SIGBUS zygote. Ставить `install.sh` из `C:\Users\Nikita\unfuse-build\`
+  (НЕ `ksud module install`). `zygisk/*.so` = `u:object_r:system_lib_file:s0`.
+- Zygisk Next держит module.so по **fd**, а не по пути: после `mv` новая сборка активна
+  только после перезагрузки. Проверять — только после reboot.
+- **Модуль ничего не пишет**: отчёт только кодом возврата. Исключение — диагностический лог
+  `/data/adb/unfuse_zygisk.debug.log` (`module/log.sh` + `module/diag.sh`, ручной снимок и
+  `--probe <пакет>`). Диагностическая сборка пишет его **по умолчанию**, глушится файлом-«стоп»
+  `/data/adb/unfuse_zygisk.nolog` (маркер-включатель `.debug` **отменён** — на живом пользователе
+  шаг неочевиден, лог не появлялся). **Файл перезаписывается ЦЕЛИКОМ в начале каждой загрузки**
+  (`unfuse_log_begin` в `post-fs-data.sh`, безусловно), накопления прошлых загрузок нет;
+  прежний механизм `boot_id` + `$MODDIR/.log_boot` убран, `service.sh` файл не обрезает —
+  дописывает свою стадию в ту же загрузку. Имя с `.debug.` — потому что `unfuse_zygisk.log` занят
+  мёртвым логом снятого `marble_unfuse_auto` (121 КБ на `marble`). Всё — `docs/diagnostics.md`.
 
 ## Ядро дизайна
 - FUSE-маунт обязан жить: fd — контракт с MediaProvider, `active` ставит только `pf_init`.
-- `mount("/dev/fuse",…,MS_LAZYTIME)` — единственный дискриминатор FUSE-сайта (у AppFuseUtil LAZYTIME нет).
-  Решение по **форме**: хвост `fuse_path` == `/emulated` → бинд `/data/media`; иначе том
-  (SD-карта/принятый) проходит насквозь. Альтернатива «биндить `/mnt/media_rw/<uuid>`» отвергнута:
-  в state-free handler доступен только x1 = `fuse_path`.
-- **SD-карта идёт через ту же `MountUserFuse()`** (PublicVolume делит с EmulatedVolume; отличие —
-  `relative_upper_path` = UUID, `fuse_path=/mnt/user/<u>/<UUID>`). Без хвост-матчера модуль клал
-  `/data/media` поверх карты → файлы карты скрыты (отзыв 2026-10-09).
-- **Урок emitted-кода:** ошибки управления потоком ловит ТОЛЬКО исполнение на aarch64.
-  Хостовый `--selftest` лишь собирает/дизасм; device `--selftest` реально исполняет handler
-  (`mmap` EXEC + `fake_mount` recorder) — авторитетная проверка.
-- **caller-saved не переживает вызов**: значение, нужное после `blr`, класть на стек, не в x10.
-  (Регрессия 2026-10-09: цель маунта в x10 топтал реальный `mount()` → bind на `""`.)
-- Байтовый цикл хвост-матчера закрывается на **первом** `ldrb` (тот двигает путь x12); второй `ldrb`
-  двигает только шаблон x13. Структурный selftest проверяет **свойство** (цель — любой ldrb
-  post-index; два цикла на разных загрузках), а не «cbnz→ldrb с тем же регистром» (навязывал баг).
-- **Ветка `sdcardfs` — другой механизм, а не тот же фикс иначе.** Она не патчит vold и не биндит
-  `/data/media` на `/mnt/user/<u>/<UUID>`: `module/storage.sh` поднимает sdcardfs из `/data/media`
-  на `/mnt/runtime/{default,read,write,full}/emulated`, а Zygisk-плечо (`src/unfuse_zygisk.cpp`)
-  подменяет **только** `.../emulated` в `/mnt/user/<u>`, `/mnt/androidwritable/<u>`,
-  `/mnt/runtime/<view>`. Внешних томов не касается вообще → дефект «пропадает карта памяти» там
-  невозможен, хвост-матчеру не к чему прицепиться. Обратное тоже верно: правки основной ветки
-  (vold-патчеры, `storage-fix`, хуки libc) в копии `sdcardfs-only` неприменимы.
+- `mount("/dev/fuse",…,MS_LAZYTIME)` — единственный дискриминатор FUSE-сайта. Форма: хвост
+  `fuse_path` == `/emulated` → бинд `/data/media`; иначе том насквозь. «Биндить
+  `/mnt/media_rw/<uuid>`» отвергнуто: в state-free handler доступен только x1.
+- **SD-карта идёт через ту же `MountUserFuse()`**; без хвост-матчера `/data/media` клался
+  поверх карты → её файлы скрыты.
+- **emitted-код:** ошибки потока выполнения ловит только запуск на aarch64 (device
+  `--selftest` реально исполняет handler; хостовый — лишь собирает/дизасм).
+- **caller-saved не переживает `blr`**: нужное после вызова — на стек, не в x10.
+- Хвост-матчер закрывается на **первом** `ldrb`; selftest проверяет **свойство**, не форму.
+- `ZYGISK_API_VERSION` = **4**: в v27.0 `ZygiskModule::valid()` знает 1..4, «5» → `unloaded`.
 
-## Версии / ABI (кратко)
-SDK 30..37 (A11..A17), shape-based, без ветвлений по релизам. arm64: 9 целей на 11–13, 8 на 14–17;
-arm32 — 9 везде. 17 с `-mbranch-protection=standard`; 11 без bti/paciasp. vold-патчеры — только
-EM_AARCH64 (32-битный vold не проверен, оставлено как есть). Таблицы — `tools/check-release-table.py`,
-`tools/verify-hook-targets.py`, `tools/vold-targets.sh`.
+## Доступ приложений (свежее, правки B–D внесены 2026-10-09)
+- Держится на ACL: именованная запись **`gid 9997`** + libc-хуки, shaping режима до сисколла.
+- На A11 AOSP даёт доступ **тремя** механизмами: (1) владелец = uid приложения; (2) per-package
+  default ACL (`SetDefaultAcl`, `Utils.cpp:192`; вызовы `:398` `Android/data/<pkg>` с
+  `additionalGids.push_back(uid)` и `:1615` OBB); (3) `other = --x` (`02771`), `Utils.cpp:1588`.
+- Модуль снимал (2) `vold-noacl` и (3) нулём `ACL_OTHER` — отсюда EACCES у приложений.
+- Классы отказа: **F1** нет записи для приложения, **F2** маска обнулена на `0600`,
+  **F3** снят `other` при живом FUSE, **F4** патч vold не встал, а остальное встало (mido),
+  **F5** нет починки после позднего писателя. Разбор — `docs/android-11-app-access-fix.md`.
+- **Правки:** B — `storage-fix` сохраняет `S_IRWXO` (только там, где он есть: четыре уровня
+  `Android*`, как в Android 10), `hook_libc.cpp` синхронно; C — глагол `--app-dirs`
+  (per-package запись из `st_uid`), вызывается из `storage.sh`; D — `storage.sh` идёт **после**
+  патчей vold, `service.sh` не ставит `vold-noacl`, если модель модуля не состоялась. **Fix A
+  (merge-handler в vold) снят:** `vold-noacl` уже глушит запись vold, поэтому `storage-fix` пишет
+  надмножество (9997 + uid) — третий arm64-handler не нужен.
+- **Посылка D уточнена 2026-10-09.** Форма хранилища отвечает не всегда: в момент `service.sh`
+  `/storage/emulated/0` ещё **tmpfs** (`1021994` = `0x01021994`) — бинды `/storage` делает триггер
+  `init.rc` на `zygote-start`, позже `service`. Поэтому теперь требуется ещё и
+  `vold-fusefs --check` = 0 (патч в памяти vold). Форма осталась вторым входом: fuse = не ставим.
+- **Проверка доступа приложения — только по его mount-namespace и живым группам.** У здорового
+  приложения в `/proc/<pid>/mounts` для `/storage/emulated` **две** строки: `fuse` (маунт vold,
+  его fd — контракт с MediaProvider, обязан жить) и `f2fs` (наш бинд поверх). Решает последняя.
+  «В списке есть fuse» — не признак отказа.
+- Приложения реально в группе 9997; `1078/1079` у них **нет** (только shell/root).
+- **Грабли:** `su <uid>` у Magisk сбрасывает доп. группы — ACL проверять только `su 9997`;
+  `--probe` берёт группы из живого процесса и говорит, если процесса нет.
 
-## Сторонние патчеры (GCam, 2026-10-08/09)
-Порт MGC dlopen-ит `*.lck`-патчер, читающий указатель по `entry+12` → мусор → SIGBUS. Решение без
-сторожа: сняли `open/open64/openat/openat64` из `kHooks[]`, ловим open-семью на голом стабе
-`__openat` (`mov x8,#0x38; svc #0; ret`). md5 `7975875a…`, коммит `fb2f2ab`.
+## Модуль unfuse-sdcardfs (`module/unfuse-sdcardfs/`) — другой механизм
+Не патчит vold и не биндит `/data/media`: `storage.sh` поднимает sdcardfs на
+`/mnt/runtime/{default,read,write,full}/emulated`, Zygisk-плечо (`src/unfuse_sdcardfs.cpp`)
+подменяет только `.../emulated` в `/mnt/user/<u>`, `/mnt/androidwritable/<u>`,
+`/mnt/runtime/<view>`. Внешних томов не касается → «пропадает карта» невозможен. Обратно:
+правки модуля `unfuse` (vold-fusefs, storage-fix, hook_libc) там неприменимы. Лог свой —
+`/data/adb/unfuse_zygisk.log` (простой `log()`, НЕ `log.sh`); статус — `status.sh`
+пишет знак в описание `module.prop`. **Дефект:** маркер в `/data/adb/unfuse_zygisk.once`
+(`drwx------ root`) → EACCES в `claim_once()`. Лечится переносом в
+`/data/adb/unfuse_zygisk.state/` (как у `unfuse`).
 
-## Устройство
-- `marble` POCO F5, SDK 36 (`fuse=true`, `external_storage.sdcardfs.enabled` пуст). A11-блок тут
-  не проявляется (условие `sdk=30` ложно). Живого стенда SDK 30 нет.
-- **A11-отзыв (2026-10-09) — mido**: Redmi Note 4, crDroid 7.22 (`ro.crdroid.build.version`),
-  SDK 30, ядро `4.9.295~zLOS`, ARM64-userspace, **Magisk Kitsune 27001** (форк 27.0; Zygisk
-  встроенный, API v5 поддержан), рядом `zygisk_lsposed`, SELinux permissive. Форма хранилища у
-  него **целевая** (`persist.sys.fuse=true`, sdcardfs `0`), но целевого состояния нет: FUSE на
-  `/mnt/user/0/emulated` без bind'а `/data/media` → патч vold не встал либо не сработал.
-  Разбор и что запрошено — `docs/android-11-crdroid-log.md`.
-- **vold перезапускается незаметно.** `init.svc_debug_pid.<svc>` — текущий pid: у mido
-  `vold = 1599` при `ro.boottime.vold = 9.93 с` (в это время pid'ы ~430), у остальных 7 сервисов
-  pid согласуется с boottime. Перезапуск vold снимает ОБА хука (они в его памяти), накат — только
-  дважды за загрузку, сторожа нет по правилу. Проверка: `stat -c %Y /proc/$(pidof vold)` против
-  `/proc/uptime`, `logcat`/`dmesg` на смерть vold.
-- **Zygisk-среда двух стендов разная.** Стенд `marble` — KernelSU 3.3.0 + **Zygisk Next**
-  (`zn-daemon`, `/data/adb/zygisksu/`), и только там Zygisk-плечо когда-либо проверялось
-  (`mount_storage_dirs`, замер 2026-10-07). У mido — **встроенный Zygisk Kitsune**: по changelog
-  27001 загрузчик заменён на ptrace-инъектор **от Zygisk Next**, а API остался магазовский
-  (`v27.0`: `ZYGISK_API_VERSION 5` + `mount_storage_dirs`; отказ лишь при `api_version > 5`).
-  Поэтому «виноват Zygisk Kitsune» объясняет только Zygisk-плечо, не патч vold; главная грабля —
-  **SuList** (модули грузятся лишь в приложения-списке). Тест — маркер
-  `/data/adb/unfuse_zygisk.state/once`.
-- **ПК-стенд A11 arm64** (разбор — `docs/android-11-arm64-stand.md`). Хост Никиты —
-  `AMD64`, emulator `36.5.10` (есть `qemu-system-aarch64.exe`), образов/AVD нет.
-  Стенд обязан быть настоящим aarch64 (патчер — только `EM_AARCH64`); на x86 arm64-гость
-  идёт лишь TCG, ARM-трансляция (Houdini/libndk) не годится — `vold` остаётся x86_64.
-  Путь: AVD `arm64-v8a` API 30 (`-accel off -gpu swiftshader_indirect -qemu -machine virt`),
-  откат на emulator `34.2.16` (build 12038310), root — rootAVD, но **Magisk ≥ 27.0**
-  (наш модуль = API v5; на 26.x отвергается). Альтернатива — redroid `11.0.0` (multi-arch)
-  + `catlair/redroid-magisk` на ARM-хосте (Oracle Ampere A1 free).
-- **IP меняется после reboot** (наблюдались 10.43.67.59, 10.43.59.38, 10.170.241.19). `adb` не в PATH:
-  `C:\Users\Nikita\AppData\Local\Android\Sdk\platform-tools\adb.exe`. Перед заменой — бэкап
-  `rollback-device/mod-backup-<дата>.tgz`. `adb push` из Git Bash — `MSYS_NO_PATHCONV=1`.
-- `adb shell "su 0 sh …"` рвёт по `;`; демон adb умирает между вызовами. `nsenter` под `su -c` — `--`.
-  f2fs `stat -f -c %t` → `0xf2f52010`, fuse → `0x65735546`.
+## Стенды
+- **`marble`** POCO F5, SDK 36, `persist.sys.fuse=true`, ядро `5.10.269-Bouquet-v5.1`
+  **умеет sdcardfs**. KernelSU 3.3.0 + **Zygisk Next** (`/data/adb/zygisksu/`) — единственное
+  место, где Zygisk-плечо проверялось. На нём стоял модуль `unfuse` (бывш. no-sdcardfs).
+- **redroid-ВМ A11** — контейнер `11.0.0` **на телефоне**, порт **5556** (5555 = телефон).
+  aarch64, SDK 30, `/mnt/runtime` нет — целевая FUSE-форма. SELinux **Disabled** (на метках
+  ничего не строить). Magisk **Delta 25206**; корень через `adb root` (SuList).
+  **НИКОГДА `adb reboot`** — `--privileged` делит ядро с телефоном; только
+  `su 0 sh /data/local/tmp/redroid/host.sh restart`. Модули не грузились из-за пустого
+  `/data/adb/magisk` → лечится `cp -a /system/etc/init/magisk/* /data/adb/magisk/`.
+  32-битный Zygisk в ВМ сломан.
+- **`mido`** Redmi Note 4, crDroid 7.22, SDK 30, Kitsune 27001, permissive — состояние **F4**.
+- **ПК-стенд A11 arm64** — только настоящий aarch64 (AVD API 30 `-accel off`, Magisk ≥ 27.0).
 
-## Бенчмарк (2000×4КиБ, root в ns приложения, 2026-10-09)
-FUSE без модуля медленнее сырого дерева в 52–780×; `sdcardfs-only` — 1.0–6.6×. Модуль (сырой f2fs)
-быстрее sdcardfs везде, где есть create/rename (rename 5.3×, mkdir 6.6×, create 2.5×). Замер от root —
-нижняя оценка; от uid 2000 create/rename/unlink в 6–8× медленнее.
+## Инструменты и грабли
+- **Обёртки `ph.sh`/`ad.sh`** (телефон, `dev.ip`) и `vm.sh` (5556): сами делают
+  `start-server` + `connect` (демон умирает между вызовами). `adb shell "su 0 sh …"` рвёт по `;`.
+  IP меняется после reboot.
+- **`adb push` и MSYS.** `MSYS_NO_PATHCONV=1` ломает **источник** (`cannot stat '/e/projects/…'`),
+  без него MSYS конвертирует **приёмник** (`…/PortableGit/data/local/tmp/…`). Верно:
+  `NO_PATHCONV=1` + источники через `cygpath -m`. Готовые скрипты — `push.sh` (телефон) и
+  `push-vm.sh` (ВМ).
+- **`su` внутри redroid-ВМ после `adb root` висит** (ждёт решения политики Magisk): команда уходит
+  в таймаут, инструмент убивает её по SIGTERM **без вывода**. `su` там не нужен — shell уже uid=0.
+  `host.sh` живёт на **телефоне**: `ph.sh shell "su 0 sh /data/local/tmp/redroid/host.sh restart"`.
+- `stat -f -c %t`: f2fs `0xf2f52010`, fuse `0x65735546`, sdcardfs `0x5dca2df5`, tmpfs `0x01021994`.
+  Печатается **hex без `0x`**: `1021994` — это tmpfs, а не десять миллионов.
+- **`acl-dump`** (`C:\Users\Nikita\unfuse-build\acl-dump`) — единственный способ прочитать
+  POSIX ACL: toybox `getfattr` обрывается на NUL в версии, `ls` знак `+` не рисует.
+- **`vold` перезапускается незаметно** (`init.svc_debug_pid.vold` vs `ro.boottime.vold`):
+  снимает ОБА хука, накат — дважды за загрузку, сторожа нет.
+- **vold'ов может быть несколько.** redroid-ВМ делит с телефоном PID-namespace, и её init
+  поднимает свой vold: `pidof vold` на `marble` = `867 36504`, `cmdline` у обоих одинаковый.
+  Свой vold — тот, у кого `PPid=1` в своём namespace; `find_vold()` теперь предпочитает его и
+  говорит в stderr, если кандидатов больше одного. `--pid` руками не задавать. Иначе патч уходит
+  в чужой vold, а `--check` рапортует успех — скрытый F4.
+- **Свой давний краш-петль телефона (не наш):** `system_server` ~на 38-й секунде каждой
+  загрузки (`AbstractMethodError … IProcessObserver.onProcessStarted`) — LSPosed со scope
+  `system`. **Не приписывать модулю.**
+- **Перезагрузку не путать с нашими действиями.** `ro.boot.bootreason=reboot,vold-failed`
+  = сработала `reboot_on_failure` сервиса vold (патчим его память живьём — исключать нельзя).
+  `docker restart` контейнера перезагрузить телефон не может. См. `docs/marble-reboot-vold-failed.md`.
+
+## Бенчмарк (2000×4 КиБ, root в ns приложения)
+FUSE без модуля медленнее сырого дерева в 52–780×; `sdcardfs-only` — 1.0–6.6×. Модуль быстрее
+sdcardfs везде, где есть create/rename (rename 5.3×, mkdir 6.6×, create 2.5×).

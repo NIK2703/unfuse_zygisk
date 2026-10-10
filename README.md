@@ -6,3 +6,26 @@ Benchmark results for various operations on 2000 4 KiB files. For large files, t
 <img width="925" height="512" alt="3" src="https://github.com/user-attachments/assets/8131bc39-cf71-4d1a-94b9-b52dabbb70a0" />
 <img width="924" height="412" alt="1" src="https://github.com/user-attachments/assets/1219d3c5-3c83-4890-b28b-cb99f436eb16" />
 <img width="934" height="415" alt="2" src="https://github.com/user-attachments/assets/52611c31-2ce3-4c28-a525-cadf16e77a04" />
+
+## Two builds, one repository
+
+The same goal is reached by two independent mechanisms, and this repository builds
+both from one tree:
+
+| build | archive | how |
+| --- | --- | --- |
+| `unfuse` | `out/unfuse-<version>.zip` | patches vold so that its FUSE mount for emulated storage becomes a bind of the raw `/data/media`, shapes the tree with ACLs, and patches bionic entry points inside each app |
+| `unfuse-sdcardfs` | `out/unfuse-sdcardfs-<version>.zip` | mounts sdcardfs on `/mnt/runtime/*/emulated` and binds it into each app's private mount namespace |
+
+They are alternatives, not companions: on Android 11 they set `persist.sys.fuse`
+to opposite values, and both install under the same module id, so installing one
+replaces the other. `unfuse-sdcardfs` needs a kernel with the `sdcardfs` driver;
+`unfuse` does not.
+
+```sh
+./build.sh                  # both modules, arm64-v8a + armeabi-v7a
+./build.sh unfuse           # one of them
+./build.sh unfuse-sdcardfs
+```
+
+Layout, shared code and build details: [docs/repo-layout.md](docs/repo-layout.md).

@@ -422,22 +422,74 @@ static bool pid_is_vold(pid_t pid, char *exe, size_t exelen) {
     return false;
 }
 
+/* Родитель процесса, из /proc/<pid>/status. -1 — не прочиталось. */
+static int ppid_of(pid_t pid) {
+    char path[64];
+    char buf[512];
+    size_t got = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    if (read_all(path, buf, sizeof(buf) - 1, &got) != 0 || got == 0) return -1;
+    buf[got] = '\0';
+    const char *p = strstr(buf, "PPid:");
+    if (!p) return -1;
+    return atoi(p + 5);
+}
+
+/* Найти vold.
+ *
+ * ВАЖНО — vold'ов может быть НЕСКОЛЬКО (замер на marble, 2026-10-10).
+ * redroid-контейнер на телефоне запущен с --privileged и делит с ним PID-
+ * namespace, поэтому его собственный init (`/system/bin/init second_stage
+ * androidboot.hardware=redroid`) поднимает СВОЙ vold — и `pidof vold` на
+ * телефоне возвращает два pid сразу (867 от init телефона и 36504 от init
+ * контейнера). Прежний поиск возвращал первый подходящий из /proc, то есть
+ * выбирал монеткой: при неверном выборе патч уходил в vold контейнера, а
+ * `--check` потом рапортовал успех — модуль молча оставался недоналоженным,
+ * и это ровно класс F4 (docs/android-11-app-access-fix.md), только
+ * неотличимый от нормы по коду возврата.
+ *
+ * Различитель — родитель. У vold своей инстанции родитель — её init, то есть
+ * PPid=1 в её собственном PID-namespace; у чужого vold, видного снаружи,
+ * родитель не 1 (на marble у 36504 это 36455). Правило instance-relative,
+ * поэтому работает и на телефоне, и внутри контейнера.
+ *
+ * Прежнее поведение остаётся запасным: если PPid=1 нет ни у одного кандидата,
+ * берётся первый найденный. */
 static pid_t find_vold(int wait_sec, char *exe, size_t exelen) {
     for (int tick = 0;; tick++) {
+        pid_t cand[8];
+        int ncand = 0;
+
         DIR *d = opendir("/proc");
         if (d) {
             struct dirent *e;
-            while ((e = readdir(d))) {
+            while ((e = readdir(d)) && ncand < (int)(sizeof(cand) / sizeof(cand[0]))) {
                 if (!isdigit((unsigned char)e->d_name[0])) continue;
                 pid_t pid = (pid_t)atoi(e->d_name);
                 if (pid <= 0) continue;
-                if (pid_is_vold(pid, exe, exelen)) {
-                    closedir(d);
-                    return pid;
-                }
+                if (pid_is_vold(pid, NULL, 0)) cand[ncand++] = pid;
             }
             closedir(d);
         }
+
+        pid_t chosen = -1;
+        for (int i = 0; i < ncand; i++)
+            if (ppid_of(cand[i]) == 1) { chosen = cand[i]; break; }
+        if (chosen < 0 && ncand > 0) chosen = cand[0];
+
+        if (chosen > 0 && pid_is_vold(chosen, exe, exelen)) {
+            if (ncand > 1) {
+                /* Сказать, кого выбрали. Без этого строка в логе не отличает
+                 * «патч ушёл не в тот vold» от «патч не встал»: код возврата у
+                 * обоих случаев одинаковый. Молчим, когда vold один. */
+                fprintf(stderr, "vold: кандидатов %d:", ncand);
+                for (int i = 0; i < ncand; i++) fprintf(stderr, " %d", (int)cand[i]);
+                fprintf(stderr, "; выбран %d (PPid=%d)\n", (int)chosen, ppid_of(chosen));
+            }
+            return chosen;
+        }
+
         if (tick >= wait_sec * 10) return -1;
         usleep(100 * 1000);
     }

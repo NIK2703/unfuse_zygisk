@@ -16,3 +16,8 @@
 *.log
 *.tmp
 .DS_Store
+
+# Скомпилированные помощники стенда sdcardfs: собираются из лежащих рядом
+# tools/sdcardfs/*.c
+/tools/sdcardfs/runas
+/tools/sdcardfs/nsprobe
