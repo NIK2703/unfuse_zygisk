@@ -8,6 +8,14 @@
  * gid 9997, mask 0007, so the mode is shaped pre-syscall and the ACL lands
  * after the chmod (rename applies no default ACL).
  *
+ * A kernel built without POSIX ACL for the fs (CONFIG_EXT4_FS_POSIX_ACL is not
+ * set — the x0 device) answers EOPNOTSUPP and the setxattr arm is dead. The
+ * first one is probed (g_acl) and the grant falls back to what sdcardfs really
+ * was underneath — the group: the dir mode carries S_ISGID so gid 9997 reaches
+ * every object created inside it, and tools/storage-fix.c moves the tree to
+ * that group at boot. Modes stay the same in both arms; only their carrier of
+ * the grant differs.
+ *
  * Only roots are patched (kHooks), see below; no trampoline (handlers syscall
  * directly), handlers must be reentrant (syscalls only). Both ABIs:
  * arm64-v8a (20-byte entry patch, bti jc) and armeabi-v7a (8/10-byte entry
@@ -39,6 +47,7 @@
 // про две формы и выравнивание). Включается всегда: на AArch64 не используется.
 #include "arm32_patch.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +56,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/xattr.h>  // XATTR_CREATE — the probe's flag (raw syscalls otherwise)
 #include <unistd.h>
 
 #include <dlfcn.h>
@@ -76,6 +86,15 @@ struct acl_entry {
     uint16_t e_perm;
     uint32_t e_id;
 };
+
+// Whether the filesystem this process writes storage on knows POSIX ACL. -1 —
+// not probed yet, 0 — no (kernel built without CONFIG_*_FS_POSIX_ACL; the
+// setxattr below answers EOPNOTSUPP), 1 — yes. One probe per process, at the
+// first ACL write. The answer also reaches the mode arm: without ACL the grant
+// rides the group, and as_sdcardfs_dir then carries S_ISGID — the only thing
+// that passes gid 9997 to objects created later. Benign race: all threads
+// compute the same value, and only the flag's usefulness is at stake.
+int g_acl = -1;
 
 // Shared storage: /storage/ (emulated/self/removable), /mnt/user,
 // /mnt/runtime (same tree pre-Zygote bind), /mnt/pass_through (AOSP FUSE),
@@ -147,7 +166,14 @@ mode_t as_sdcardfs_file(mode_t m) {
 }
 
 mode_t as_sdcardfs_dir(mode_t m) {
-    return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP | S_IXGRP;
+    mode_t r = (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IWGRP | S_IXGRP;
+    // No POSIX ACL here (probed, see g_acl): the grant goes through the group,
+    // and S_ISGID is what makes the kernel hand gid 9997 to everything created
+    // inside this dir. Written into the mode — chmod is the only writer left
+    // on such a kernel, and it must not be the one to strip the bit (fix_fd
+    // probes before shaping for exactly that reason).
+    if (g_acl == 0) r |= S_ISGID;
+    return r;
 }
 
 mode_t widen_existing(int dirfd, const char *path, mode_t mode, int at_flags) {
@@ -187,6 +213,7 @@ void acl_build(uint8_t *buf, size_t *len, mode_t mode) {
 }
 
 int acl_write(const char *path, const char *name, mode_t mode) {
+    if (g_acl == 0) return 0;  // no ACL on this fs — the mode carries the grant
     uint8_t buf[sizeof(uint32_t) + 5 * sizeof(acl_entry)];
     size_t len = 0;
     acl_build(buf, &len, mode);
@@ -194,10 +221,45 @@ int acl_write(const char *path, const char *name, mode_t mode) {
 }
 
 int acl_write_fd(int fd, const char *name, mode_t mode) {
+    if (g_acl == 0) return 0;  // no ACL on this fs — the mode carries the grant
     uint8_t buf[sizeof(uint32_t) + 5 * sizeof(acl_entry)];
     size_t len = 0;
     acl_build(buf, &len, mode);
     return static_cast<int>(syscall(SYS_fsetxattr, fd, name, buf, len, 0));
+}
+
+// The probe is the write itself, with XATTR_CREATE: where the ACL already
+// exists a supporting fs answers EEXIST and writes nothing, and EPERM is a
+// permission answer only a supporting fs gives — so EOPNOTSUPP is the one
+// answer that means "no POSIX ACL here". `mode` only shapes the probe buffer;
+// it is a valid ACL either way.
+void probe_acl_fd(int fd, mode_t mode) {
+    if (g_acl != -1) return;
+    uint8_t buf[sizeof(uint32_t) + 5 * sizeof(acl_entry)];
+    size_t len = 0;
+    acl_build(buf, &len, mode);
+    const long r = static_cast<long>(syscall(SYS_fsetxattr, fd, kAclAccess, buf, len, XATTR_CREATE));
+    g_acl = (r == 0 || errno != EOPNOTSUPP) ? 1 : 0;
+}
+
+void probe_acl(const char *path, mode_t mode) {
+    if (g_acl != -1) return;
+    uint8_t buf[sizeof(uint32_t) + 5 * sizeof(acl_entry)];
+    size_t len = 0;
+    acl_build(buf, &len, mode);
+    const long r = static_cast<long>(syscall(SYS_setxattr, path, kAclAccess, buf, len, XATTR_CREATE));
+    g_acl = (r == 0 || errno != EOPNOTSUPP) ? 1 : 0;
+}
+
+// h_fchmodat has no fd at hand: open the target once, and only while the
+// answer is still unknown — three syscalls, at most once per process.
+void probe_acl_at(int dirfd, const char *path) {
+    if (g_acl != -1) return;
+    const int fd = static_cast<int>(
+        syscall(SYS_openat, dirfd, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW, 0));
+    if (fd < 0) return;
+    probe_acl_fd(fd, 0660);
+    syscall(SYS_close, fd);
 }
 
 // Mode first (it defines the ACL mask), then ACL: chmod rewrites the mode, so
@@ -208,6 +270,11 @@ void fix_fd(int fd) {
     if (S_ISLNK(st.st_mode)) return;
     const bool dir = S_ISDIR(st.st_mode);
     if (!dir && !S_ISREG(st.st_mode)) return;
+
+    // Probe before shaping: the answer decides whether as_sdcardfs_dir carries
+    // the setgid bit below, and the chmod must not be the write that strips it
+    // off a dir the kernel inherited it for.
+    probe_acl_fd(fd, st.st_mode);
 
     const mode_t want = dir ? as_sdcardfs_dir(st.st_mode) : as_sdcardfs_file(st.st_mode);
     syscall(SYS_fchmod, fd, want);
@@ -221,6 +288,8 @@ void fix_object(const char *path) {
     if (S_ISLNK(st.st_mode)) return;
     const bool dir = S_ISDIR(st.st_mode);
     if (!dir && !S_ISREG(st.st_mode)) return;
+
+    probe_acl(path, st.st_mode);
 
     const mode_t want = dir ? as_sdcardfs_dir(st.st_mode) : as_sdcardfs_file(st.st_mode);
 
@@ -295,7 +364,10 @@ extern "C" int h_mkdirat(int dirfd, const char *path, mode_t mode) {
 }
 
 extern "C" int h_fchmodat(int dirfd, const char *path, mode_t mode, int at_flags) {
-    if (is_storage(dirfd, path)) mode = widen_existing(dirfd, path, mode, at_flags);
+    if (is_storage(dirfd, path)) {
+        probe_acl_at(dirfd, path);
+        mode = widen_existing(dirfd, path, mode, at_flags);
+    }
     return static_cast<int>(syscall(SYS_fchmodat, dirfd, path, mode, at_flags));
 }
 
@@ -303,6 +375,7 @@ extern "C" int h_fchmod(int fd, mode_t mode) {
     if (fd_is_storage(fd)) {
         struct stat st;
         if (syscall(SYS_fstat, fd, &st) == 0) {
+            probe_acl_fd(fd, st.st_mode);
             mode = S_ISDIR(st.st_mode) ? as_sdcardfs_dir(mode) : as_sdcardfs_file(mode);
         }
     }

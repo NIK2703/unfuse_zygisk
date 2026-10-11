@@ -25,6 +25,12 @@ unfuse_relabel_media_root
 # Android* dirs every boot, and chmod touches only USER_OBJ/GROUP_OBJ/MASK/
 # OTHER; a default ACL also makes the kernel skip umask. vold appends default
 # ACLs after the service stage — tools/vold-noacl.c stops that.
+#
+# На ядре без POSIX ACL (CONFIG_EXT4_FS_POSIX_ACL не выставлен — устройство x0)
+# setxattr отдаёт EOPNOTSUPP, и storage-fix сам переходит на награду через
+# группу: дерево уходит в gid 9997 (есть у каждого приложения), наследование
+# держит S_ISGID на каталогах. Скрипт при этом ничего не меняет — режим вызова
+# и проверки тот же.
 FIX="$MODDIR/tools/storage-fix"
 [ -x "$FIX" ] || exit 1
 

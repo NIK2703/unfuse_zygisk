@@ -22,6 +22,19 @@
  * Dirs get access + default ACL: the first opens the dir, the second is inherited by
  * everything created inside (incl. by vold and MediaProvider).
  *
+ * A kernel built without POSIX ACL for this filesystem (CONFIG_EXT4_FS_POSIX_ACL
+ * is not set — the x0 device) rejects every system.posix_acl_* setxattr with
+ * EOPNOTSUPP: the model above is unreachable and the tree stays 0770
+ * media_rw:media_rw, which no app can enter. The fallback is the grant sdcardfs
+ * synthesised: the object moves to group 9997 — every app already carries it —
+ * and the group bits of the mode, rw/rwx after the same helpers, do the
+ * granting. Modes stay AOSP's (0770/0660, other untouched); dirs get S_ISGID so
+ * that objects created later inherit the 9997 group rather than the creator's
+ * (an app's own gid is its uid). chmod goes after chown, so the mode is the last
+ * word on the bits. Detected once, from the first setxattr that reports it; the
+ * mode arm of the libc hooks (src/hook_libc.cpp) probes the same way and keeps
+ * the same setgid chain alive.
+ *
  * Modes: <dir>... grant group 9997 rwx/rw recursively; --traverse <dir> r-x on the
  * dir only (volume root: traverse, no write); --check <dir>... verify the 9997 entry
  * (0 ok, 1 not); --app-dirs <dir>... add the per-package entry to
@@ -116,12 +129,13 @@ struct acl_entry {
 static unsigned long stat_errors;
 
 /* Read an ACL into entries: >=0 count, -1 error (errno set), -2 no attribute
- * (not an error for the caller — just "no ACL set"). */
+ * (not an error for the caller — just "no ACL set"), -3 the filesystem has no
+ * POSIX ACL at all (kernel built without it: EOPNOTSUPP, not ENODATA). */
 static int acl_read(const char *path, const char *name, struct acl_entry *out, size_t maxn) {
     uint8_t buf[sizeof(uint32_t) + ACL_MAX_ENTRIES * sizeof(struct acl_entry)];
 
     ssize_t len = getxattr(path, name, buf, sizeof(buf));
-    if (len < 0) return errno == ENODATA ? -2 : -1;
+    if (len < 0) return errno == ENODATA ? -2 : (errno == EOPNOTSUPP ? -3 : -1);
     if (len < (ssize_t)sizeof(uint32_t)) {
         errno = EINVAL;
         return -1;
@@ -146,6 +160,19 @@ static int acl_allows_everybody(const char *path, const char *name, uint16_t *pe
     struct acl_entry e[ACL_MAX_ENTRIES];
 
     int n = acl_read(path, name, e, ACL_MAX_ENTRIES);
+
+    /* No POSIX ACL on this fs — the grant is the group (grant_by_group below):
+     * gid 9997 plus the group bits of the mode. The default "ACL" is the
+     * S_ISGID bit: it is what passes the group to new objects. */
+    if (n == -3) {
+        struct stat st;
+        if (stat(path, &st) != 0 || st.st_gid != AID_EVERYBODY) return 0;
+        const mode_t need = S_ISDIR(st.st_mode) ? S_IRWXG : (S_IRGRP | S_IWGRP);
+        if ((st.st_mode & need) != need) return 0;
+        if (strcmp(name, XATTR_ACL_DEFAULT) == 0 && (st.st_mode & S_ISGID) == 0) return 0;
+        if (perm_out) *perm_out = (uint16_t)((st.st_mode & S_IRWXG) >> 3);
+        return 1;
+    }
     if (n <= 0) return 0;
 
     uint16_t perm = 0, mask = 0;
@@ -299,14 +326,44 @@ static mode_t traverse_mode(mode_t m) {
     return (m & S_IRWXU) | (m & S_IRWXG) | S_IRGRP | S_IXGRP | (m & S_IRWXO);
 }
 
+/* Set by the first setxattr that reports the fs has no POSIX ACL; from then on
+ * the ACL arm is not attempted at all. */
+static int acl_unsupported;
+
+/* The fallback arm (see the header): no ACL, so the grant rides the group — the
+ * object moves to 9997, which every app carries, and the mode keeps the group
+ * bits the helpers above compute. S_ISGID on a dir is what makes the kernel hand
+ * the same group to everything created inside; chmod goes after chown so the
+ * mode is the last word on the bits. */
+static int grant_by_group(const char *path, mode_t want, int is_dir) {
+    if (chown(path, (uid_t)-1, AID_EVERYBODY) != 0) return -1;
+    return chmod(path, want | (is_dir ? S_ISGID : 0));
+}
+
+/* Was the failing setxattr the "no POSIX ACL here" answer? If it was, the flag
+ * is set and the caller takes the group arm; any other errno stays an error. */
+static int acl_apply_or_fallback(const char *path, const char *name, mode_t mode,
+                                 mode_t want, int is_dir) {
+    if (acl_unsupported || acl_apply(path, name, mode) != 0) {
+        if (!acl_unsupported) {
+            if (errno != EOPNOTSUPP) return -1;
+            acl_unsupported = 1;
+        }
+        return grant_by_group(path, want, is_dir);
+    }
+    return 0;
+}
+
 static int fix_dir(const char *path, mode_t m, int traverse_only) {
     const mode_t want = traverse_only ? traverse_mode(m) : dir_mode(m);
-    int bad = 0;
 
-    if (acl_apply(path, XATTR_ACL_ACCESS, want) != 0) bad = 1;
-    if (acl_apply(path, XATTR_ACL_DEFAULT, want) != 0) bad = 1;
+    if (acl_apply_or_fallback(path, XATTR_ACL_ACCESS, want, want, 1) != 0) {
+        stat_errors++;
+        return -1;
+    }
+    if (acl_unsupported) return 0;
 
-    if (bad) {
+    if (acl_apply(path, XATTR_ACL_DEFAULT, want) != 0) {
         stat_errors++;
         return -1;
     }
@@ -314,7 +371,9 @@ static int fix_dir(const char *path, mode_t m, int traverse_only) {
 }
 
 static int fix_file(const char *path, mode_t m) {
-    if (acl_apply(path, XATTR_ACL_ACCESS, file_mode(m)) != 0) {
+    const mode_t want = file_mode(m);
+
+    if (acl_apply_or_fallback(path, XATTR_ACL_ACCESS, want, want, 0) != 0) {
         stat_errors++;
         return -1;
     }
@@ -325,12 +384,26 @@ static int fix_file(const char *path, mode_t m) {
  * the position: dir_mode is defined just before fix_dir). */
 static int fix_app_dir(const char *path, mode_t m, uint32_t uid) {
     const mode_t want = dir_mode(m);
-    int bad = 0;
 
-    if (acl_apply_extra(path, XATTR_ACL_ACCESS, want, uid) != 0) bad = 1;
-    if (acl_apply_extra(path, XATTR_ACL_DEFAULT, want, uid) != 0) bad = 1;
+    if (acl_unsupported || acl_apply_extra(path, XATTR_ACL_ACCESS, want, uid) != 0) {
+        if (!acl_unsupported) {
+            if (errno != EOPNOTSUPP) {
+                stat_errors++;
+                return -1;
+            }
+            acl_unsupported = 1;
+        }
+        /* The per-package entry has no counterpart here and needs none: the
+         * app is the owner of <pkg> (owner bits always win), and the 9997
+         * group is the cross-app grant. */
+        if (grant_by_group(path, want, 1) != 0) {
+            stat_errors++;
+            return -1;
+        }
+        return 0;
+    }
 
-    if (bad) {
+    if (acl_apply_extra(path, XATTR_ACL_DEFAULT, want, uid) != 0) {
         stat_errors++;
         return -1;
     }
@@ -443,13 +516,15 @@ static void perm_text(uint16_t perm, char *out) {
     out[3] = '\0';
 }
 
-/* Один ACL строкой, без подписи. 0 — есть, -2 — записи нет, -1 — ошибка. */
+/* Один ACL строкой, без подписи. 0 — есть, -2 — записи нет, -3 — у ФС нет POSIX
+ * ACL, -1 — ошибка. */
 static int format_acl(const char *path, const char *name, char *out, size_t outlen) {
     struct acl_entry e[ACL_MAX_ENTRIES];
     char p[4], item[64];
 
     int n = acl_read(path, name, e, ACL_MAX_ENTRIES);
     if (n == -2) return -2;
+    if (n == -3) return -3;
     if (n < 0) return -1;
 
     out[0] = '\0';
@@ -495,6 +570,8 @@ static void dump_path(const char *path) {
 
     int ra = format_acl(path, XATTR_ACL_ACCESS, a, sizeof a);
     if (ra == -2)        printf("  access  : none\n");
+    else if (ra == -3)   printf("  access  : POSIX ACL ядром не поддерживается — награда через группу 9997 (gid=%u)\n",
+                                (unsigned)st.st_gid);
     else if (ra < 0)   { printf("  access  : ERROR errno=%d (%s)\n", errno, strerror(errno)); stat_errors++; }
     else                 printf("  access  :%s\n", a);
 
@@ -502,6 +579,8 @@ static void dump_path(const char *path) {
 
     int rd = format_acl(path, XATTR_ACL_DEFAULT, d, sizeof d);
     if (rd == -2)        printf("  default : none\n");
+    else if (rd == -3)   printf("  default : POSIX ACL ядром не поддерживается — наследование через S_ISGID (%s)\n",
+                                (st.st_mode & S_ISGID) ? "есть" : "НЕТ");
     else if (rd < 0)   { printf("  default : ERROR errno=%d (%s)\n", errno, strerror(errno)); stat_errors++; }
     else if (ra == 0 && strcmp(a, d) == 0) /* повтор access — не печатаем */ ;
     else                 printf("  default :%s\n", d);
