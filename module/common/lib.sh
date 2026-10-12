@@ -23,11 +23,21 @@ unfuse_is_android_11() { [ "$(getprop ro.build.version.sdk)" = "30" ]; }
 # unfuse_setprop <имя> <значение>
 #
 # Через resetprop -n, если он есть. resetprop, а не setprop, по двум причинам:
-#   * -n не персистит значение — без модуля устройство возвращается к тому, что
-#     поставил вендор, а не к тому, что модуль выставил один раз;
+#   * -n кладёт значение прямо в область свойств, минуя property_service, — а
+#     тот до load_persist_props молча не пишет на диск persist.* (заслон:
+#     property_service.cpp:195-198, снимается только по её завершении);
 #   * external_storage.* не объявлен в property_contexts и падает в catch-all
 #     `* u:object_r:default_prop:s0` (property_contexts:114), а не в system_prop.
 # setprop оставлен фолбэком на случай, когда resetprop недоступен.
+#
+# Чего -n НЕ делает: не персистит. load_persist_props (init.rc:405-406, из
+# late-init init.rc:437) читает /data/property/persistent_properties и
+# перезаписывает память тем, что там лежит, — всё, что выставлено раньше, теряется
+# (персист — это -p, Magisk 26+). Именно на этом спотыкалась sdcardfs-сборка:
+# её `persist.sys.fuse false` не доживало до zygote-start. Сборка больше на это не
+# рассчитывает — см. её post-fs-data.sh и src/unfuse_sdcardfs.cpp. Тем же
+# механизмом (-n) работает и system.prop той сборки: его применяет сам загрузчик
+# модулей, и он тоже не персистится (module.cpp:282-286 → resetprop.cpp:452-457).
 unfuse_setprop() {
     if command -v resetprop >/dev/null 2>&1; then
         resetprop -n "$1" "$2"
@@ -76,6 +86,11 @@ unfuse_install_common() {
     set_perm "$MODPATH/service.sh"      0 0 0755 2>/dev/null
     set_perm "$MODPATH/storage.sh"      0 0 0755 2>/dev/null
     set_perm "$MODPATH/description.txt" 0 0 0644 2>/dev/null
+
+    # Present only in the sdcardfs build; set_perm_recursive above already gives
+    # it 0644, this line is here so the file's permissions are stated where the
+    # other files' are. Not executable: the module loader reads it, no shell does.
+    set_perm "$MODPATH/system.prop" 0 0 0644 2>/dev/null
 
     # Leftovers of the old config; nothing reads them.
     rm -f /data/adb/unfuse_zygisk.conf 2>/dev/null

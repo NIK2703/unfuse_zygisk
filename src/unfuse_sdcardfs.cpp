@@ -5,38 +5,46 @@
  *
  * (1) Places the storage source under the point Zygote is about to bind onto
  * /storage, in the process's private mount namespace, so /storage/emulated is
- * substituted too. Which point that is depends on the release: 14 and up always
- * bind /mnt/user/<user>, while 11, 12, 12L and 13 have a second arm that binds
- * /mnt/runtime/<view> whenever persist.sys.fuse is not true. Both are covered —
- * see zygote_uses_runtime_view(). (2) Clears *args->mount_storage_dirs so
- * Zygote does not cover Android/{data,obb} with a per-package tmpfs, giving full
- * Android/data and Android/obb as before scoped storage.
+ * substituted too. Which point that is depends on the release AND on the
+ * storage form — Zygote's MountEmulatedStorage() has two arms and the ROM picks
+ * one by property. Both arms are served, at once, from the table below: see
+ * kPoints and the header of preAppSpecialize(). The SD card is served the same
+ * way, one component deeper: see attach_card_points(). (2) Clears
+ * *args->mount_storage_dirs so Zygote does not cover Android/{data,obb} with a
+ * per-package tmpfs, giving full Android/data and Android/obb as before scoped
+ * storage.
  *
  * The source is /mnt/runtime/full/emulated — sdcardfs, mask 0007, gid 9997 ->
- * 0770/0660, raised by storage.sh since this ROM has
- * external_storage.sdcardfs.enabled=0 and vold does not mount it. There is no
- * second source: the installer refuses the module on a kernel without sdcardfs,
- * so the bind is checked by fs type and a mismatch is reported rather than
- * worked around.
+ * 0770/0660. storage.sh raises it at post-fs-data, and vold raises its own on
+ * the same points whenever external_storage.sdcardfs.enabled (Utils.cpp:1006)
+ * is not 0 — the two carry the same masks (sdcard.cpp), and vold's lands on
+ * top, so the source survives either way. There is no second source: the
+ * installer refuses the module on a kernel without sdcardfs, so the bind is
+ * checked by fs type and a mismatch is reported rather than worked around.
  *
- * DEFAULT and ANDROID_WRITABLE (SAF provider com.android.externalstorage behind
- * the system "Files" app) are handled; NONE, INSTALLER and PASS_THROUGH are
- * skipped. No app list: every Zygote-started process is covered. ANDROID_WRITABLE
- * is the one mode number that is not the same on every release — 8 on 11, 4 from
- * 12 on — so both are accepted; see is_android_writable().
+ * persist.sys.fuse is NOT read here, and that is the point. The property
+ * decides which arm Zygote takes, and the module used to switch on it — but the
+ * value belongs to the ROM: init.rc:792 sets it true in on post-fs-data, and
+ * load_persist_props (init.rc:437) restores whatever the store holds after
+ * every module script has run, so post-fs-data.sh could never make it stick.
+ * Depending on a value the module cannot set was the bug; serving both arms
+ * removes the dependence instead of fighting for the value.
+ *
+ * No app list: every Zygote-started process is covered.
  *
  * The module reports nothing and writes nothing to disk: a bind that does not
  * take is silent, and Zygote is simply left to do what it would have done
  * without the module.
  */
 
+#include <dirent.h>
 #include <jni.h>
 #include <sched.h>
-#include <strings.h>
+#include <stdio.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
-#include <sys/system_properties.h>
 
+#include <cstring>
 #include <string>
 
 #include "zygisk.hpp"
@@ -46,27 +54,17 @@ namespace {
 // The source: sdcardfs with full access (mask=0007, gid=9997).
 constexpr const char *kSourceSdcardfs = "/mnt/runtime/full/emulated";
 
-// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is
-// IVold.REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it.
-//
-// DEFAULT is 1 on every release. ANDROID_WRITABLE is NOT: 11 still carries the
-// long enum (READ, WRITE, LEGACY, FULL) and numbers it 8, while 12 dropped
-// those and renumbered it to 4. Both are accepted here instead of branching on
-// the release, because the two values cannot collide. 4 is LEGACY on 11, and
-// 11's StorageManagerService never hands LEGACY out — only NONE, DEFAULT, READ,
-// WRITE, INSTALLER, FULL and ANDROID_WRITABLE leave getMountMode(), and the two
-// ExternalStorageMountPolicy implementations return nothing outside NONE,
-// DEFAULT, READ and WRITE. 8 is past the end of the 12+ enum, so it cannot
-// occur there. A release that renumbers again shows up as an android_writable
-// process the module declines.
+// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is IVold.
+// REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it.
+constexpr int kMountModeExternalNone = 0;
 constexpr int kMountModeExternalDefault = 1;
-constexpr int kMountModeExternalAndroidWritable = 4;      // 12 and up
-constexpr int kMountModeExternalAndroidWritableR = 8;     // 11 only
-
-bool is_android_writable(int mode) {
-    return mode == kMountModeExternalAndroidWritable ||
-           mode == kMountModeExternalAndroidWritableR;
-}
+constexpr int kMountModeExternalRead = 2;
+constexpr int kMountModeExternalWrite = 3;
+constexpr int kMountModeExternalLegacy = 4;            // LEGACY on 11, ANDROID_WRITABLE from 12
+constexpr int kMountModeExternalInstaller = 5;
+constexpr int kMountModeExternalFull = 6;
+constexpr int kMountModeExternalPassThrough = 7;
+constexpr int kMountModeExternalAndroidWritable = 8;   // 11 only
 
 // AID_USER_OFFSET from android_filesystem_config.h
 constexpr unsigned kAidUserOffset = 100000;
@@ -74,61 +72,94 @@ constexpr unsigned kAidUserOffset = 100000;
 // SDCARDFS_SUPER_MAGIC (include/uapi/linux/magic.h)
 constexpr unsigned long kSdcardFsMagic = 0x5dca2df5UL;
 
-// android::base::GetBoolProperty: the same set of spellings it accepts, and the
-// caller's fallback when the property is unset or unreadable.
-bool prop_bool(const char *name, bool fallback) {
-    char v[PROP_VALUE_MAX];
-    if (__system_property_get(name, v) <= 0) return fallback;
-    static const char *const kTrue[] = {"1", "y", "yes", "on", "true", "t"};
-    static const char *const kFalse[] = {"0", "n", "no", "off", "false", "f"};
-    for (const char *s : kTrue) {
-        if (strcasecmp(v, s) == 0) return true;
-    }
-    for (const char *s : kFalse) {
-        if (strcasecmp(v, s) == 0) return false;
-    }
-    return fallback;
-}
-
-// Zygote's MountEmulatedStorage() has two arms, and the module has to place the
-// source where the arm that will actually run is going to look.
+// Zygote's MountEmulatedStorage() (Zygote.cpp:801-858) binds exactly one point
+// onto /storage, and which one depends on the storage form:
 //
-// 11 (and 12/12L/13) keeps the pre-FUSE shape: when persist.sys.fuse is not
-// true, Zygote binds ExternalStorageViews[mount_mode] — /mnt/runtime/<view> —
-// onto /storage, and /mnt/user/<user> only onto /storage/self. The
-// substitution at /mnt/user/<user>/emulated is then off the path entirely.
-// 14 dropped that arm: /mnt/user/<user> is bound onto /storage unconditionally,
-// so the runtime view never matters there.
+//   FUSE arm — persist.sys.fuse true, Zygote.cpp:837-850. Everything except
+//   PASS_THROUGH and INSTALLER gets /mnt/user/<user>; INSTALLER gets
+//   /mnt/installer/<user>; ANDROID_WRITABLE gets /mnt/androidwritable/<user>
+//   when app-data isolation is on.
 //
-// Rather than guess the ROM, mirror Zygote's own test — the same property, the
-// same default it reads (false; vold reads the same name with a default of
-// true, which is why the two can disagree on a device that sets neither).
-bool zygote_uses_runtime_view() { return !prop_bool("persist.sys.fuse", false); }
+//   sdcardfs arm — Zygote.cpp:851-857, ExternalStorageViews[mount_mode]
+//   (Zygote.cpp:329-338).
+//
+// The module places the source at every point its mode can land on. The arm
+// that runs finds it; the other arm's points are left unused, which costs one
+// VFS mount and nothing else. That is the whole reason the module no longer
+// needs to know the property's value.
+//
+// Every mode gets the same source, so a READ-mode process sees the writable
+// view where the ROM would have given it a read-only one (the stock masks are
+// 6/23/7/7 for default/read/write/full, the module's is 7 for all four). That is
+// the module's promise — direct access to all storage for all apps — and not a
+// side effect of the table: the source is one, and there is deliberately no
+// second one (see the file header).
+//
+// PASS_THROUGH is the one mode with no row: on the FUSE arm vold fills
+// /mnt/pass_through/<user> from /mnt/runtime/full (Utils.cpp:1568-1573), and on
+// the other arm its view IS /mnt/runtime/full. Both are sdcardfs already.
+//
+// %u is the user id. /mnt/runtime/full/emulated is the source itself and is
+// therefore never a destination — binding it onto itself would add nothing.
+struct Point {
+    int mode;
+    const char *path;
+};
 
-// ExternalStorageViews[] in that arm, restricted to the two modes the module
-// handles. ANDROID_WRITABLE maps to /mnt/runtime/full, which is the sdcardfs
-// source itself, so the caller skips it when the destination already is that
-// source.
-const char *runtime_view_for_mode(int mode) {
-    if (mode == kMountModeExternalDefault) return "default";
-    if (is_android_writable(mode)) return "full";
-    return nullptr;
-}
+constexpr Point kPoints[] = {
+    // DEFAULT, READ, WRITE — the ordinary app modes. FUSE arm: /mnt/user.
+    // sdcardfs arm: ExternalStorageViews[1..3].
+    {kMountModeExternalDefault, "/mnt/user/%u/emulated"},
+    {kMountModeExternalDefault, "/mnt/runtime/default/emulated"},
+    {kMountModeExternalRead, "/mnt/user/%u/emulated"},
+    {kMountModeExternalRead, "/mnt/runtime/read/emulated"},
+    {kMountModeExternalWrite, "/mnt/user/%u/emulated"},
+    {kMountModeExternalWrite, "/mnt/runtime/write/emulated"},
+
+    // Mode 4 is two different things. On 11 it is LEGACY, which no
+    // ExternalStorageMountPolicy returns and StorageManagerService therefore
+    // never hands out; from 12 on it is ANDROID_WRITABLE, which 11 numbers 8.
+    // The two meanings cannot collide, so one row carries both and is right on
+    // either release. A release that renumbers again shows up as a process
+    // whose mode is in no row, and the module declines it.
+    {kMountModeExternalLegacy, "/mnt/user/%u/emulated"},             // LEGACY / ANDROID_WRITABLE
+    {kMountModeExternalLegacy, "/mnt/runtime/write/emulated"},       // LEGACY
+    {kMountModeExternalLegacy, "/mnt/androidwritable/%u/emulated"},  // ANDROID_WRITABLE
+
+    // INSTALLER: the FUSE arm binds /mnt/installer, the other arm
+    // ExternalStorageViews[5] = /mnt/runtime/write. Installer sessions are apps
+    // like any other, so they get the same tree.
+    {kMountModeExternalInstaller, "/mnt/installer/%u/emulated"},
+    {kMountModeExternalInstaller, "/mnt/runtime/write/emulated"},
+
+    // FULL: only /mnt/user is left, since the sdcardfs arm's view for it is the
+    // source itself.
+    {kMountModeExternalFull, "/mnt/user/%u/emulated"},
+
+    // ANDROID_WRITABLE, 11's numbering: same as the mode-4 row plus 11's own
+    // value.
+    {kMountModeExternalAndroidWritable, "/mnt/user/%u/emulated"},
+    {kMountModeExternalAndroidWritable, "/mnt/androidwritable/%u/emulated"},
+};
 
 void rollback(const std::string &dst) { umount2(dst.c_str(), MNT_DETACH); }
 
-// Binds the sdcardfs source onto dst; true only if it is really sdcardfs under
-// the point afterwards. What matters is the fs type, not mount(2) success:
-// storage.sh failing to raise its mounts would leave an empty directory under
-// the point, and Zygote would bind that onto /storage. statfs() does not touch
-// the inode, so unlike stat() it cannot be denied by directory permissions.
-bool attach_sdcardfs(const std::string &dst) {
-    if (mount(kSourceSdcardfs, dst.c_str(), nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+// Binds src onto dst; true only if it is really sdcardfs under the point
+// afterwards. What matters is the fs type, not mount(2) success: storage.sh
+// failing to raise its mounts, or a point that does not exist at all
+// (ENOENT — the ordinary case for the arm that is not in use), would otherwise
+// pass for a substitution. statfs() does not touch the inode, so unlike stat()
+// it cannot be denied by directory permissions.
+//
+// The source is an argument because the card is a second one — see
+// attach_card_points below.
+bool attach_source(const char *src, const char *dst) {
+    if (mount(src, dst, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
         return false;
     }
 
     struct statfs st {};
-    if (statfs(dst.c_str(), &st) != 0) {
+    if (statfs(dst, &st) != 0) {
         rollback(dst);
         return false;
     }
@@ -140,12 +171,109 @@ bool attach_sdcardfs(const std::string &dst) {
     return true;
 }
 
+bool attach_sdcardfs(const char *dst) {
+    return attach_source(kSourceSdcardfs, dst);
+}
+
+// ---- the SD card -----------------------------------------------------------
+//
+// The public volume is served exactly like the emulated point, one component
+// deeper: vold mounts sdcardfs for it at /mnt/runtime/{default,read,write,full}/
+// <stableName> — the same four views with the same masks (PublicVolume.cpp:126-129
+// names them, the sdcardfs fork at :166-230 runs /system/bin/sdcard with -u/-g
+// 1023) — and on the FUSE arm the app's path to the card is
+// /mnt/user/<user>/<stableName>, because Zygote binds /mnt/user/<user> onto
+// /storage (Zygote.cpp:849) and the card sits under it by its stableName
+// (PublicVolume.cpp:135-139 setPath, MountUserFuse writes
+// /mnt/user/<user>/<stableName>).
+//
+// So every kPoints row this mode can land on has a card row under it: the
+// row's path with its trailing "/emulated" replaced by the card's stableName.
+// The name is the volume's fsUuid (PublicVolume.cpp:117-121) — different per
+// card and unknowable ahead of time — so there is no table: the names are read
+// from /mnt/runtime/full, the full view, at each app start, which is exactly
+// when they are needed and the only moment there is to read them. No card
+// mounted and the directory holds one entry ("emulated"), so the loop does
+// nothing; a card inserted while apps run is picked up by every app that
+// starts afterwards, which is the same freshness model the emulated arm has
+// (it is read from the mount table at the same moment).
+//
+// What this fixes is the mode mask: an app in DEFAULT/READ/WRITE would
+// otherwise reach the card through its view's mask (the stock 6/23/7 of the
+// four views, against the module's 7 for all four) and fail to write where the
+// module's promise says it must not. FUSE is not in this arm's way to fix:
+// with persist.sys.fuse false (the module's system.prop) vold never mounts FUSE
+// for the card at all — PublicVolume.cpp:233-236 leaves the sdcardfs views as
+// the only ones — and where FUSE is mounted (12+, or an 11 whose store holds
+// the pair true) the bind goes over the FUSE mount in the app's own namespace,
+// which is the same thing the emulated rows do for /mnt/user/<user>/emulated,
+// and the fs-type check rejects it if it does not take.
+//
+// Deliberately independent of the emulated result: the card is a separate
+// volume. A card that took is not rolled back because the emulated rows found
+// nothing, and it does not become a reason to clear mount_storage_dirs — that
+// flag belongs to the emulated model, and clearing it while the emulated bind
+// did not take is the half-applied state the file header warns about.
+constexpr const char *kCardNamesDir = "/mnt/runtime/full";
+constexpr int kCardNamesMax = 16;   // cards a device can carry at once
+
+bool attach_card_points(int mode, unsigned user) {
+    DIR *dir = opendir(kCardNamesDir);
+    if (dir == nullptr) return false;
+
+    bool any = false;
+    int seen = 0;
+    struct dirent *de;
+    while (seen < kCardNamesMax && (de = readdir(dir)) != nullptr) {
+        const char *name = de->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+            strcmp(name, "emulated") == 0) {
+            continue;
+        }
+        seen++;
+
+        char src[128];
+        const int sn = snprintf(src, sizeof(src), "%s/%s", kCardNamesDir, name);
+        if (sn <= 0 || static_cast<unsigned>(sn) >= sizeof(src)) continue;
+
+        for (const Point &p : kPoints) {
+            if (p.mode != mode) continue;
+            // The row's path ends in "/emulated"; the card's stableName takes
+            // exactly its place, so the base is everything before that slash.
+            const char *tail = strstr(p.path, "/emulated");
+            if (tail == nullptr) continue;
+            char base[64];
+            const size_t blen = static_cast<size_t>(tail - p.path);
+            if (blen == 0 || blen >= sizeof(base)) continue;
+            memcpy(base, p.path, blen);
+            base[blen] = '\0';
+
+            char dst[128];
+            char formatted[64];
+            const int fn = snprintf(formatted, sizeof(formatted), base, user);
+            if (fn <= 0 || static_cast<unsigned>(fn) >= sizeof(formatted)) continue;
+            const int dn = snprintf(dst, sizeof(dst), "%s/%s", formatted, name);
+            if (dn <= 0 || static_cast<unsigned>(dn) >= sizeof(dst)) continue;
+            // A row whose base is the source itself would bind it onto itself;
+            // no kPoints row is, but the guard costs one strcmp.
+            if (strcmp(src, dst) == 0) continue;
+            if (attach_source(src, dst)) any = true;
+        }
+    }
+    closedir(dir);
+    return any;
+}
+
 class UnfuseZygisk : public zygisk::ModuleBase {
 public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const int mode = args->mount_external;
-        const bool android_writable = is_android_writable(mode);
-        if (mode != kMountModeExternalDefault && !android_writable) return;
+
+        // NONE: Zygote returns before binding anything onto /storage
+        // (Zygote.cpp:811-814), so there is no point to substitute — and a
+        // process that asked for no storage must not be given any.
+        // PASS_THROUGH: sdcardfs on both arms already, see kPoints.
+        if (mode == kMountModeExternalNone || mode == kMountModeExternalPassThrough) return;
 
         // Private namespace copy: otherwise the mount leaks into zygote and all
         // its children. unshare() also copies propagation settings, so make the
@@ -153,35 +281,26 @@ public:
         if (unshare(CLONE_NEWNS) != 0) return;
         if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return;
 
-        const std::string user =
-            std::to_string(static_cast<unsigned>(args->uid) / kAidUserOffset);
+        const unsigned user = static_cast<unsigned>(args->uid) / kAidUserOffset;
 
-        // Zygote takes whatever point it finds under /storage: usually
-        // /mnt/user/<user>/emulated, or /mnt/androidwritable/<user>/emulated for
-        // ANDROID_WRITABLE with persist.sys.vold_app_data_isolation_enabled.
-        bool ok = attach_sdcardfs("/mnt/user/" + user + "/emulated");
-
-        if (android_writable && attach_sdcardfs("/mnt/androidwritable/" + user + "/emulated")) {
-            ok = true;
+        // Every point this mode can land on, on either arm. One of them is where
+        // Zygote is about to look; a point that is not there fails with ENOENT
+        // and a point that is already something else fails the fs-type check, so
+        // "any of them took" is exactly "the path is covered".
+        bool ok = false;
+        for (const Point &p : kPoints) {
+            if (p.mode != mode) continue;
+            char dst[64];
+            const int n = snprintf(dst, sizeof(dst), p.path, user);
+            if (n <= 0 || static_cast<unsigned>(n) >= sizeof(dst)) continue;
+            if (attach_sdcardfs(dst)) ok = true;
         }
 
-        // The other arm of Zygote's MountEmulatedStorage(): when it is going to
-        // bind /mnt/runtime/<view> onto /storage instead of /mnt/user/<user>,
-        // the substitution above is off the path. Put the source there as well.
-        // Both binds are kept: /storage/self comes from /mnt/user/<user> even on
-        // that arm, so dropping the first would lose it.
-        if (zygote_uses_runtime_view()) {
-            const char *view = runtime_view_for_mode(mode);
-            if (view != nullptr) {
-                const std::string dst =
-                    std::string("/mnt/runtime/") + view + "/emulated";
-                // ANDROID_WRITABLE's view is /mnt/runtime/full, which IS the
-                // sdcardfs source: binding it onto itself adds nothing.
-                if (dst != kSourceSdcardfs && attach_sdcardfs(dst)) {
-                    ok = true;
-                }
-            }
-        }
+        // The SD card, on its own verdict: it does not vote for ok and does not
+        // get rolled back by it — the emulated row set and the card rows are
+        // separate volumes (see the comment above attach_card_points).
+        attach_card_points(mode, user);
+
         if (!ok) return;
 
         if (args->mount_storage_dirs != nullptr) {

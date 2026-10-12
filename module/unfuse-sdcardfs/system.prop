@@ -1,0 +1,55 @@
+# system.prop — Android 11: форма хранилища через свойство.
+#
+# Запрошено Nikita 2026-10-11 как проверка гипотезы: он выставил вручную эту пару
+# (persist.sys.fuse и persist.sys.fflag.override.settings_fuse) в false и получил
+# sdcardfs в FX Explorer. Здесь та же пара, но штатным механизмом загрузчика.
+#
+# Читает этот файл не скрипт модуля, а загрузчик модулей — и в обеих реализациях
+# он делает это на стадии post-fs-data, ПОСЛЕ post-fs-data.sh этого модуля:
+#
+#   Magisk   — magiskd: MagiskD::post_fs_data() (bootstages.cpp:307) сначала
+#              handle_modules() (module.cpp:469 exec_module_scripts("post-fs-data")),
+#              и только потом load_modules() (bootstages.cpp:349), который читает
+#              system.prop и применяет его через load_prop_file(buf, true)
+#              (module.cpp:282-286). Второй аргумент — skip_svc, то есть
+#              resetprop -n (resetprop.cpp:452-457).
+#   KernelSU — ksud: on_post_fs_data() (init_event.rs, вызов из cli.rs:517)
+#              выполняет exec_stage_script("post-fs-data"), и сразу за ним —
+#              load_system_prop() (module.rs:397) → resetprop.rs:253, где в
+#              комментарии прямо написано «Equivalent to resetprop -n --file»;
+#              в ResetProp выставлено skip_svc: true, persistent: false.
+#
+# `-n` значит: запись идёт прямо в область свойств, минуя property_service, и в
+# store (/data/property/persistent_properties) не попадает — ветка persist в
+# resetprop.cpp:200-206 требует флага `-p`, которого здесь нет ни у Magisk, ни у
+# KernelSU. Отсюда всё остальное: этот файл — заявка на память, а не на store.
+#
+# Что это даёт и чего не даёт (подробный разбор — docs/android-11-persist-fuse-prop.md, §5.2):
+#
+#   * store не содержит пары вовсе → наши значения доживают до zygote-start и до
+#     bootCompleted → FUSE выключен по-настоящему (vold не монтирует FUSE-том,
+#     Zygote биндит /mnt/runtime/*/emulated). Это и есть целевой случай;
+#   * store содержит ровно ту же пару → load_persist_props (init.rc:405-406, из
+#     late-init:437) возвращает её из store, наш файл — no-op. Это случай
+#     устройства Nikita после ручной правки (props.txt: оба false);
+#   * store содержит пару, отличную от нашей, → load_persist_props снова
+#     побеждает, а расхождение попары ловит StorageManagerService:
+#     updateFusePropFromSettings() (sms11.java:1883-1897) на bootCompleted
+#     сравнивает mIsFuseEnabled (снимок persist.sys.fuse) с
+#     persist.sys.fflag.override.settings_fuse, и при расхождении пишет
+#     SystemProperties.set(PROP_FUSE, settingsFuseFlag) и делает жёсткую
+#     перезагрузку. Петли при этом нет: в store уезжает именно Settings-значение,
+#     то есть на следующей загрузке пара согласована — либо в нашу пользу
+#     (store: fuse=true, settings_fuse нет → станет false/false и заработает),
+#     либо против (store: fuse=false, settings_fuse=true → станет true/true и
+#     останется FUSE). Худшее — одна лишняя перезагрузка на первой загрузке.
+#
+# Порядок строк значения не имеет; обе нужны вместе — по одной система их
+# разведёт и перезагрузится (см. выше).
+#
+# Не персистится, и это осознанно: записать пару в store — значит владеть чужим
+# значением, которое ROM или сам StorageManagerService вернут обратно (разбор —
+# §5.1 вариант (a) и §5.2).
+
+persist.sys.fflag.override.settings_fuse=false
+persist.sys.fuse=false

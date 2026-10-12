@@ -6,17 +6,17 @@
 # namespace, so by the time the first app launches this must already exist:
 #
 #   * the media_rw_data_file label on the /data/media root;
-#   * the /mnt/runtime/*/emulated mounts, which storage.sh raises as sdcardfs;
-#   * on Android 11, persist.sys.fuse off — see below.
+#   * the /mnt/runtime/*/emulated mounts, which storage.sh raises as sdcardfs.
 #
 # storage.sh does all of that. It runs again from service.sh, after vold.
 #
+# persist.sys.fuse is NOT set by this script. The pair of Android 11 storage-form
+# properties lives in system.prop — a file the module loader applies itself, and
+# only after this script has returned. See below for both.
 
 MODDIR=${MODDIR:-${0%/*}}
-# Общие примитивы обеих сборок: проверка релиза и смена свойства.
-. "$MODDIR/lib.sh"
 
-# --- Android 11: форму хранилища выбирает булево свойство, и нам нужна sdcardfs
+# --- Android 11: why persist.sys.fuse is not set here -------------------------
 #
 # 11 — единственный релиз, где FUSE и sdcardfs переключаются свойством
 # persist.sys.fuse, и переключаются сразу в двух местах:
@@ -25,42 +25,38 @@ MODDIR=${MODDIR:-${0%/*}}
 #     false)`. При true поверх sdcardfs монтируется FUSE-том, при false — нет;
 #   * Zygote: Zygote.cpp:834 `if (isFuse)`. При true в /storage биндится
 #     /mnt/user/<u> (том FUSE), при false — ExternalStorageViews[mode], то есть
-#     /mnt/runtime/{default,read,write,full} (Zygote.cpp:329-339, 852-856) —
-#     ровно те точки, которые поднимает storage.sh.
+#     /mnt/runtime/{default,read,write,full} (Zygote.cpp:329-338, 851-857).
 #
-# С 12 ни той, ни другой ветки нет: там всегда FUSE, и свойство не читает никто
-# (проверено по 30..37, byver/a3*). Поэтому весь блок — только SDK 30.
+# Раньше здесь стояло `resetprop -n persist.sys.fuse false`. Оно не работало, и
+# работать не могло: порядок загрузки не оставляет модулю шанса. init.rc:792 в
+# on post-fs-data ставит true; наш скрипт перекрывает его в памяти; затем
+# late-init (init.rc:415) до zygote-start (init.rc:443) запускает
+# load_persist_props (init.rc:405-406, 437), а тот читает
+# /data/property/persistent_properties — где лежит true — и перезаписывает
+# память. Замер по dmesg устройства: Magisk выходит из post-fs-data в 13.081 с,
+# load_persist_props — в 13.136 (56 мс), ветка init.rc:797 по true — в 13.181.
+# Записать в стор самому (resetprop -p) можно, но это уже не настройка модуля, а
+# правка чужого значения: ROM или любой setprop вернут его обратно.
 #
-# AOSP ставит свойство в true: init.rc:792 в on post-fs-data делает
-# `setprop persist.sys.fuse true` с комментарием "Enable FUSE by default".
-# Модулю нужна обратная форма, поэтому здесь оно снимается.
+# Поэтому здесь свойство не трогается — модуль от него не зависит. Zygisk-плечо
+# (src/unfuse_sdcardfs.cpp) кладёт sdcardfs в namespace приложения на точки
+# ОБЕИХ веток Zygote сразу, и какая бы ветка ни сработала, источник лежит там,
+# где она его ищет. Разбор — docs/android-11-persist-fuse-prop.md.
 #
-# Порядок обязателен, и он наш. init.rc держит на свойстве триггеры
-# (init.rc:797-808), которые биндят /storage в корневом namespace под
-# zygote-start, а VolumeManager::linkPrimary() (VolumeManager.cpp:382-395) под
-# !isFuse создаёт /mnt/user/<u>/primary — без него не разрешается /sdcard.
-# Значит свойство должно стоять до zygote-start, и post-fs-data — единственное
-# место. Скрипт запускается действием `on post-fs-data` из /system/etc/init,
-# /system_ext/etc/init, /product/etc/init, /odm/etc/init или /vendor/etc/init, а
-# эти каталоги init разбирает ПОСЛЕ /system/etc/init/hw/init.rc
-# (init.cpp:277-291), и команды одного триггера идут в порядке разбора: наша
-# строка оказывается после init.rc:792 и переживает её. resetprop -n значение не
-# персистит — без модуля устройство возвращается к тому, что поставил вендор.
+# --- и всё же свойство ставится: system.prop -----------------------------------
 #
-# external_storage.sdcardfs.enabled здесь НЕ трогается, и это осознанно. Им
-# IsSdcardfsUsed() (Utils.cpp:1006-1009) решает, форкать ли /system/bin/sdcard
-# (EmulatedVolume.cpp:308), а читается оно в КОНСТРУКТОРЕ EmulatedVolume — то
-# есть при старте vold, а vold стартует в on early-fs (init.rc:451-453), до
-# post-fs-data (init.rc:434). Поставить его отсюда — получить vold, который
-# sdcard уже форкнул, но дальше считает, что sdcardfs нет, и лезет с ACL,
-# квотами и fixupAppDir в дерево, которое отдаёт sdcardfs (Utils.cpp:141,254,
-# 282,298,1568,1620; VolumeManager.cpp:784,1058). Оставляем как есть: при 0 точки
-# наши, при 1 vold поднимет sdcardfs сам теми же масками (sdcard.cpp:178-189:
-# 0006/1015, 0027/9997, 0007/9997, 0007/9997) и ляжет сверху. Что получилось —
-# говорит sdcardfs_verify() в storage.sh, а не это свойство.
-if unfuse_is_android_11 &&
-   [ "$(getprop persist.sys.fuse)" != "false" ]; then
-    unfuse_setprop persist.sys.fuse false
-fi
+# Пара persist.sys.fflag.override.settings_fuse + persist.sys.fuse лежит в
+# system.prop — файле рядом с этим скриптом. Ставит его загрузчик модулей, и
+# ставит на этой же стадии, но ПОСЛЕ нас: Magisk — MagiskD::post_fs_data()
+# (bootstages.cpp:307): handle_modules() со скриптами, затем load_modules() с
+# system.prop (bootstages.cpp:349, module.cpp:282-286); KernelSU — так же
+# (init_event.rs: exec_stage_script("post-fs-data"), затем load_system_prop()).
+#
+# Механизм тот же самый, что у снятой строки, — resetprop -n: запись мимо
+# property_service, без персиста. Значит и судьба та же: если store уже содержит
+# пару, load_persist_props вернёт её и system.prop останется заявкой на память.
+# Разница только в том, что в system.prop лежит ОБА значения: система сравнивает
+# их между собой на bootCompleted и при расхождении перезагружается один раз,
+# после чего пара согласована. Подробно — docs/android-11-persist-fuse-prop.md, §5.2.
 
 sh "$MODDIR/storage.sh"

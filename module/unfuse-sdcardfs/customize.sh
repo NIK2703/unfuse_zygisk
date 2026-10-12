@@ -2,9 +2,8 @@
 #
 # customize.sh — called by the Magisk/KernelSU installer while unpacking the
 # module (сборка unfuse-sdcardfs): checks the build is present and the kernel can
-# serve it, sets permissions, and prints the lines described at the bottom (the
-# storage path, and on Android 11 the storage form — neither is readable before
-# the first boot).
+# serve it, sets permissions, and prints the one line described at the bottom
+# (the storage path — not readable anywhere before the first boot).
 #
 # Общий шаг установщика (права на дерево, уборка мёртвого конфига) и проверка
 # zygisk-плеча лежат в module/common/lib.sh — том же файле, что уходит в архив и
@@ -53,19 +52,18 @@ fi
 #
 ui_print "- Storage path: sdcardfs (kernel has sdcardfs)"
 
-# --- and one more fact, only on Android 11 ------------------------------------
+# --- and nothing about the storage form ---------------------------------------
 #
-# On 11 the storage form is a boot property, and the module flips it itself at
-# post-fs-data (post-fs-data.sh) — the same kind of fact as the kernel above:
-# not readable anywhere before the first boot. Whether it is set to true now or
-# not decides what the next boot does, so both outcomes are said out loud.
+# On 11 the form is a boot property (persist.sys.fuse), and the module used to
+# print what it would do about it. The property is not decided by the module —
+# init.rc:792 sets it, load_persist_props restores it from the store after every
+# module script has run, and the Zygisk arm serves both forms either way (see
+# post-fs-data.sh) — so a line here would describe a decision the module does not
+# make.
 #
-if unfuse_is_android_11; then
-    if [ "$(getprop persist.sys.fuse)" = "true" ]; then
-        ui_print "- Android 11: FUSE включён, модуль снимет его при загрузке"
-        ui_print "  persist.sys.fuse=false (AOSP ставит true, init.rc:792)."
-        ui_print "  Без модуля значение вернётся."
-    else
-        ui_print "- Android 11: FUSE уже выключен — форма sdcardfs активна"
-    fi
-fi
+# The pair of properties is still shipped, in system.prop: the loader applies it
+# after the module's post-fs-data.sh and, being a direct write (resetprop -n in
+# both Magisk and KernelSU), it does not reach the store. What that can and cannot
+# achieve is in docs/android-11-persist-fuse-prop.md, §5.2. Nothing about it is
+# printed here either: it is not a promise, it is an attempt, and the module list
+# shows what actually happened only as far as status.sh can see it (the kernel).

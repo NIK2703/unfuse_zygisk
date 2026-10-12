@@ -33,8 +33,25 @@ unfuse_relabel_media_root
 
 # --- 2. sdcardfs on /mnt/runtime/*/emulated ------------------------------------
 #
-# external_storage.sdcardfs.enabled=0 on this firmware (in /vendor/build.prop),
-# so vold never runs /system/bin/sdcard and those points stay empty directories.
+# The points themselves always exist — init.rc:213-221 mkdirs all four — but
+# whether vold mounts anything on them depends on
+# external_storage.sdcardfs.enabled, which IsSdcardfsUsed() (Utils.cpp:1006-1009)
+# reads with a default of true and hands to EmulatedVolume as mUseSdcardFs:
+#
+#   * unset or 1 (the default, and what this ROM does: dmesg shows vold forking
+#     /system/bin/sdcard at 56.3 s, and /proc/mounts then carries a second
+#     sdcardfs on all four points with vold's flags — nosuid,nodev,noexec,noatime
+#     — and masks 6/23/7/7): vold mounts them itself, and its mounts land ON TOP
+#     of ours. Ours are then the early source: they are up from post-fs-data,
+#     vold's only a minute later, and vold's unmountSdcardFs() removes both when
+#     it takes the points down.
+#   * 0: vold never runs /system/bin/sdcard and the points stay empty
+#     directories. What is mounted here is the only source the module has.
+#
+# Either way the module ends with sdcardfs on all four points with the masks
+# below — which is why nothing here reads that property: the work is the same in
+# both cases, and whether it took is decided by sdcardfs_verify(), not by a
+# property.
 #
 # Why not /system/bin/sdcard: AOSP's sdcard.cpp mounts only default/emulated with
 # a real mount(2) and derives read/write/full via bind + MS_REMOUNT. Here

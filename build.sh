@@ -18,6 +18,10 @@
 #   unfuse-sdcardfs (Zygisk, C++, NDK clang++):
 #     module/unfuse-sdcardfs/zygisk/<abi>.so — сам модуль: биндит sdcardfs
 #                                       /mnt/runtime/*/emulated в namespace приложения.
+#     module/unfuse-sdcardfs/system.prop     — пара свойств формы хранилища для
+#                                       Android 11 (persist.sys.fuse и
+#                                       persist.sys.fflag.override.settings_fuse);
+#                                       применяет загрузчик модулей, без персиста.
 #     Утилит нет: всё, что нужно, делает storage.sh.
 #
 # module/common/ — то, что в обоих архивах совпадает: META-INF установщика и lib.sh
@@ -256,7 +260,8 @@ strip_all() {
 # staging = module/common/ поверх module/<variant>/. Права нормализованы, а не
 # взяты с файловой системы: иначе архив зависел бы от umask сборочной машины.
 # Скрипты, утилиты и заглушка установщика исполняемые (их читает либо установщик,
-# либо загрузчик модуля), остальное 0644. customize.sh выставляет те же права ещё
+# либо загрузчик модуля), остальное 0644 — в том числе system.prop: его читает
+# загрузчик модулей, а не shell. customize.sh выставляет те же права ещё
 # раз при установке — здесь важно только то, что сам zip корректен.
 pack() {
     local variant="$1"
