@@ -189,11 +189,13 @@ bool attach_sdcardfs(const char *dst) {
 //
 // So every kPoints row this mode can land on has a card row under it: the
 // row's path with its trailing "/emulated" replaced by the card's stableName.
-// The name is the volume's fsUuid (PublicVolume.cpp:117-121) — different per
+// The name is the volume's fsUuid (PublicVolume.cpp:118-122) — different per
 // card and unknowable ahead of time — so there is no table: the names are read
-// from /mnt/runtime/full, the full view, at each app start, which is exactly
-// when they are needed and the only moment there is to read them. No card
-// mounted and the directory holds one entry ("emulated"), so the loop does
+// from the mount points at each app start, which is exactly when they are
+// needed and the only moment there is to read them. A card that appears in one
+// name dir appears in all of them (it is one volume), so which dirs are read
+// is only about coverage, and several are read on purpose: see kCardNameDirs.
+// No card mounted and every dir holds only its fixed entries, so the loop does
 // nothing; a card inserted while apps run is picked up by every app that
 // starts afterwards, which is the same freshness model the emulated arm has
 // (it is read from the mount table at the same moment).
@@ -203,7 +205,7 @@ bool attach_sdcardfs(const char *dst) {
 // four views, against the module's 7 for all four) and fail to write where the
 // module's promise says it must not. FUSE is not in this arm's way to fix:
 // with persist.sys.fuse false (the module's system.prop) vold never mounts FUSE
-// for the card at all — PublicVolume.cpp:233-236 leaves the sdcardfs views as
+// for the card at all — PublicVolume.cpp:230-236 leaves the sdcardfs views as
 // the only ones — and where FUSE is mounted (12+, or an 11 whose store holds
 // the pair true) the bind goes over the FUSE mount in the app's own namespace,
 // which is the same thing the emulated rows do for /mnt/user/<user>/emulated,
@@ -214,27 +216,109 @@ bool attach_sdcardfs(const char *dst) {
 // nothing, and it does not become a reason to clear mount_storage_dirs — that
 // flag belongs to the emulated model, and clearing it while the emulated bind
 // did not take is the half-applied state the file header warns about.
-constexpr const char *kCardNamesDir = "/mnt/runtime/full";
+//
+// Where the card is read from is not one dir but several, and why matters.
+// First the names: the fsUuid appears in every view dir and in the raw dir
+// alike (PublicVolume.cpp:124-129 builds all five paths from one string), so a
+// card mounted normally leaves its name everywhere; the ROM may nonetheless
+// skip a dir — with external_storage.sdcardfs.enabled=0 PublicVolume:161-164
+// returns before the views exist and only the raw is mounted — so the name
+// search walks every dir and each name is used once. "self" is skipped: init.rc
+// creates it as a plain 0755 directory under every view (init.rc:215-221), it
+// is not a volume, and binding it would only fail the fs-type check.
+// Then the source: the full view is what the module promises, but it is the one
+// dir the sdcardfs path may not have, while the raw — /mnt/media_rw/<name>,
+// mounted by PublicVolume.cpp:143-155 with gid AID_MEDIA_RW and mask 0007 —
+// exists for every visible volume regardless. The source candidates are tried
+// in order and the first real filesystem wins. Because a card may be ntfs or
+// exfat, the check accepts the card filesystems, not just sdcardfs: the point
+// is that a real filesystem is under dst (a missed bind rolls back and leaves
+// Zygote's own view alone), and the emulated arm — the one the installer
+// refuses to run without sdcardfs — keeps its own strict check untouched.
+constexpr const char *kCardNameDirs[] = {
+    "/mnt/runtime/full",
+    "/mnt/runtime/write",
+    "/mnt/media_rw",
+    "/mnt/runtime/default",
+    "/mnt/runtime/read",
+};
+constexpr const char *kCardSrcDirs[] = {
+    "/mnt/runtime/full",
+    "/mnt/media_rw",
+};
 constexpr int kCardNamesMax = 16;   // cards a device can carry at once
+constexpr int kCardNameLen = 48;    // enough for any fsUuid (max 36 + slack)
+
+// Filesystems a card source may be: the sdcardfs view the ROM mounts, or the
+// raw filesystem of the card itself (PublicVolume.cpp:143-155 mounts vfat/exfat
+// at /mnt/media_rw; the others a device may carry). SDCARDFS_SUPER_MAGIC,
+// MSDOS_SUPER_MAGIC (vfat), EXFAT_SUPER_MAGIC, F2FS_SUPER_MAGIC, NTFS magic.
+constexpr unsigned long kCardFsMagics[] = {
+    0x5dca2df5UL,  // sdcardfs
+    0x00004d44UL,  // vfat
+    0x00005df5UL,  // exfat
+    0xf2f52010UL,  // f2fs
+    0x5346544eUL,  // ntfs
+};
+
+bool is_card_fs(unsigned long type) {
+    for (unsigned long magic : kCardFsMagics) {
+        if (type == magic) return true;
+    }
+    return false;
+}
+
+// Like attach_source, but for the card: any real card filesystem counts, not
+// only sdcardfs, because the card's full view may be missing while its raw
+// exists. Same verdict discipline — true only if a filesystem is under dst.
+bool attach_card_source(const char *src, const char *dst) {
+    if (mount(src, dst, nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        return false;
+    }
+    struct statfs st {};
+    if (statfs(dst, &st) != 0 ||
+        !is_card_fs(static_cast<unsigned long>(st.f_type))) {
+        rollback(dst);
+        return false;
+    }
+    return true;
+}
 
 bool attach_card_points(int mode, unsigned user) {
-    DIR *dir = opendir(kCardNamesDir);
-    if (dir == nullptr) return false;
+    // Collect the volume names first. One card shows up in every name dir, so
+    // the set keeps each name at one entry and the mount work below once per
+    // card, whichever dir it was found in.
+    char names[kCardNamesMax][kCardNameLen];
+    int count = 0;
+
+    for (const char *dir : kCardNameDirs) {
+        DIR *d = opendir(dir);
+        if (d == nullptr) continue;
+        struct dirent *de;
+        while (count < kCardNamesMax && (de = readdir(d)) != nullptr) {
+            const char *name = de->d_name;
+            if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+                strcmp(name, "emulated") == 0 || strcmp(name, "self") == 0) {
+                continue;
+            }
+            bool known = false;
+            for (int i = 0; i < count; ++i) {
+                if (strcmp(names[i], name) == 0) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                snprintf(names[count], kCardNameLen, "%s", name);
+                ++count;
+            }
+        }
+        closedir(d);
+    }
 
     bool any = false;
-    int seen = 0;
-    struct dirent *de;
-    while (seen < kCardNamesMax && (de = readdir(dir)) != nullptr) {
-        const char *name = de->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
-            strcmp(name, "emulated") == 0) {
-            continue;
-        }
-        seen++;
-
-        char src[128];
-        const int sn = snprintf(src, sizeof(src), "%s/%s", kCardNamesDir, name);
-        if (sn <= 0 || static_cast<unsigned>(sn) >= sizeof(src)) continue;
+    for (int i = 0; i < count; ++i) {
+        const char *name = names[i];
 
         for (const Point &p : kPoints) {
             if (p.mode != mode) continue;
@@ -254,13 +338,22 @@ bool attach_card_points(int mode, unsigned user) {
             if (fn <= 0 || static_cast<unsigned>(fn) >= sizeof(formatted)) continue;
             const int dn = snprintf(dst, sizeof(dst), "%s/%s", formatted, name);
             if (dn <= 0 || static_cast<unsigned>(dn) >= sizeof(dst)) continue;
-            // A row whose base is the source itself would bind it onto itself;
-            // no kPoints row is, but the guard costs one strcmp.
-            if (strcmp(src, dst) == 0) continue;
-            if (attach_source(src, dst)) any = true;
+
+            // Sources in order, first real filesystem wins. A source equal to
+            // dst would bind it onto itself; no kPoints row is, but the guard
+            // costs one strcmp.
+            for (const char *srcdir : kCardSrcDirs) {
+                char src[128];
+                const int sn = snprintf(src, sizeof(src), "%s/%s", srcdir, name);
+                if (sn <= 0 || static_cast<unsigned>(sn) >= sizeof(src)) continue;
+                if (strcmp(src, dst) == 0) continue;
+                if (attach_card_source(src, dst)) {
+                    any = true;
+                    break;
+                }
+            }
         }
     }
-    closedir(dir);
     return any;
 }
 
