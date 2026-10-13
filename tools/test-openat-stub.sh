@@ -39,8 +39,17 @@ fi
 # разная, и finder'ов тоже два — тест обязан пройти по обоим.
 # libc-arm.so назван без суффикса версии (это база, как libc-arm64.so), поэтому
 # его приходится перечислять отдельно: под libc-arm-a*.so он не подходит.
+#
+# Дубли снимаются по содержимому, а не по имени: база и версионная копия — один
+# и тот же файл (libc-arm64.so == libc-arm64-a16.so, libc-arm.so ==
+# libc-arm-a16.so — md5 совпадает), потому что A16 снимали с устройства дважды,
+# под обоими именами. Без этого счёт ниже ловил бы копии вместо пропущенного
+# релиза: на 19 файлах в каталоге он и встал (18 под glob против 16 в
+# WANT_IMAGES), то есть стаб перестал проверяться на хосте вообще.
 # shellcheck disable=SC2207
-IMAGES=($(cd "$ROOT/device/libc" && ls libc-arm64*.so libc-arm-a*.so libc-arm.so 2>/dev/null | sort))
+IMAGES=($(cd "$ROOT/device/libc" && for f in libc-arm64*.so libc-arm-a*.so libc-arm.so; do
+    [ -f "$f" ] && printf '%s %s\n' "$(md5sum "$f" | cut -c1-32)" "$f"
+done | sort -k2 | awk '!seen[$1]++ { print $2 }'))
 if (( ${#IMAGES[@]} != WANT_IMAGES )); then
     echo "эталонных образов ${#IMAGES[@]}, ожидалось $WANT_IMAGES — тест был бы неполным" >&2
     exit 2
@@ -56,8 +65,7 @@ echo "=== хостовый тест поиска стаба openat ($CC) ==="
     cd "$WORK" || exit 2
     "$CC" -std=c11 -O1 -Wall -Wextra -Wno-unused-function \
           test-openat-stub.c -o probe 2>&1 || exit 2
-    ./probe ../../device/libc/libc-arm64*.so ../../device/libc/libc-arm-a*.so \
-            ../../device/libc/libc-arm.so
+    ./probe "${IMAGES[@]/#/../../device/libc/}"
 ) 
 rc=$?
 echo
