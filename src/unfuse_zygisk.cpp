@@ -7,8 +7,9 @@
  * MountUserFuse() binds /data/media on the shared /mnt/user/<user>/emulated,
  * reaching every app mount namespace by propagation. Zygote then binds
  * /mnt/user/<user> onto /storage; left over is not covering Android/{data,obb}
- * with a per-package tmpfs. ANDROID_WRITABLE is 8 on 11 and 4 from 12, both
- * accepted: see is_android_writable().
+ * with a per-package tmpfs. Which processes that reaches is decided by
+ * clears_storage_dirs(): every mode the framework isolates, not just the two
+ * the module used to know about.
  *
  * The module says nothing: no logcat line, no journal. What is left to observe
  * it by is the boot marker below — a file, not a message — plus the patch state,
@@ -55,31 +56,66 @@ void claim_once(const char *path) {
     if (fd >= 0) close(fd);
 }
 
-// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is IVold.
-// REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it. DEFAULT is 1
-// on every release; ANDROID_WRITABLE — the SAF provider behind the system
-// "Files" app — is not: 11 numbers it 8 (long enum, READ/WRITE/LEGACY/FULL),
-// 12 dropped those and renumbered it to 4. Both are accepted because the two
-// values cannot collide: 4 is LEGACY on 11, which no ExternalStorageMountPolicy
-// returns, and 8 is past the end of the 12+ enum. A renumbering release shows up
-// as an android_writable process the module declines — and then as storage still
-// isolated in that process, which is the only place it can show up at all.
+// android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is IVold's
+// REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it. The numbering is
+// not stable across releases (IVold.aidl, 11 through 17):
+//
+//   11  : NONE 0, DEFAULT 1, READ 2, WRITE 3, LEGACY 4, INSTALLER 5, FULL 6,
+//         PASS_THROUGH 7, ANDROID_WRITABLE 8
+//   12+ : NONE 0, DEFAULT 1, INSTALLER 2, PASS_THROUGH 3, ANDROID_WRITABLE 4
+//
+// Accepted are the modes whose mount_storage_dirs the framework may have set —
+// all of them except the three it excludes itself in ProcessList.
+// needsStorageDataIsolation() on every release: NONE, INSTALLER, PASS_THROUGH.
+//
+//   DEFAULT         1 on both. The ordinary app.
+//   READ / WRITE    2 and 3, 11 only. Legacy storage: an app granted
+//                   OP_LEGACY_STORAGE (StorageManagerService.getMountModeInternal
+//                   — hasLegacy && hasWrite -> WRITE, && hasRead -> READ). These
+//                   are the apps that want the raw tree most, and until now the
+//                   module declined them: on a ROM with app data isolation on
+//                   they kept the per-package tmpfs over Android/{data,obb}.
+//   FULL            6, 11 only. WRITE_MEDIA_STORAGE, i.e. privileged apps.
+//   ANDROID_WRITABLE 8 on 11, 4 from 12 — the SAF provider behind "Files".
+//
+// LEGACY 4 is never handed out (getMountModeInternal has no LEGACY return), so
+// accepting 4 costs nothing on 11 and is what 12+ numbers ANDROID_WRITABLE.
+// On 12+ the numbers 2 and 3 are INSTALLER and PASS_THROUGH, whose
+// mount_storage_dirs the framework already leaves false — the write is a no-op —
+// and 6 is past COUNT 5, so it never arrives.
 constexpr int kMountModeExternalDefault = 1;
-constexpr int kMountModeExternalAndroidWritable = 4;      // 12 and up
-constexpr int kMountModeExternalAndroidWritableR = 8;     // 11 only
+constexpr int kMountModeExternalRead = 2;              // 11 only
+constexpr int kMountModeExternalWrite = 3;             // 11 only
+constexpr int kMountModeExternalAndroidWritable = 4;   // 12 and up
+constexpr int kMountModeExternalFull = 6;              // 11 only
+constexpr int kMountModeExternalAndroidWritableR = 8;  // 11 only
 
 bool is_android_writable(int mode) {
     return mode == kMountModeExternalAndroidWritable ||
            mode == kMountModeExternalAndroidWritableR;
 }
 
+// Every mode whose mount_storage_dirs the framework may have set. A mode left
+// out of this is one the framework does not isolate, so there is nothing to
+// clear for it — which is also why no mode can be taken by mistake here: the
+// module's action does not depend on which mode it is, it only ever clears one
+// boolean.
+bool clears_storage_dirs(int mode) {
+    return mode == kMountModeExternalDefault ||
+           mode == kMountModeExternalRead ||
+           mode == kMountModeExternalWrite ||
+           mode == kMountModeExternalFull ||
+           is_android_writable(mode);
+}
+
 class UnfuseZygisk : public zygisk::ModuleBase {
 public:
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         const int mode = args->mount_external;
-        // NONE, INSTALLER and PASS_THROUGH are skipped as raw /data/media
-        // consumers; no app list, every Zygote-started process is covered.
-        if (mode != kMountModeExternalDefault && !is_android_writable(mode)) return;
+        // Only the modes the framework isolates are touched — NONE, INSTALLER
+        // and PASS_THROUGH have nothing to clear. No app list: every
+        // Zygote-started process is covered.
+        if (!clears_storage_dirs(mode)) return;
 
         // Zygote must not cover Android/{data,obb} with a per-package tmpfs:
         // the raw tree arrives as vold's bind. The module's own bind and its
