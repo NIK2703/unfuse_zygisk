@@ -9,7 +9,10 @@
  * storage form — Zygote's MountEmulatedStorage() has two arms and the ROM picks
  * one by property. Both arms are served, at once, from the table below: see
  * kPoints and the header of preAppSpecialize(). The SD card is served the same
- * way, one component deeper: see attach_card_points(). (2) Clears
+ * way, one component deeper: see attach_card_points(). The release also decides
+ * what the incoming mode NUMBER means — 12 renumbered Zygote's
+ * MountExternalKind — so it is translated into the table's numbering first: see
+ * table_mode(). (2) Clears
  * *args->mount_storage_dirs so Zygote does not cover Android/{data,obb} with a
  * per-package tmpfs, giving full Android/data and Android/obb as before scoped
  * storage.
@@ -43,7 +46,9 @@
 #include <stdio.h>
 #include <sys/mount.h>
 #include <sys/statfs.h>
+#include <sys/system_properties.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -56,6 +61,9 @@ constexpr const char *kSourceSdcardfs = "/mnt/runtime/full/emulated";
 
 // android.os.storage.StorageManager.MOUNT_MODE_EXTERNAL_*, which is IVold.
 // REMOUNT_MODE_* and Zygote's own MountExternalKind copy of it.
+//
+// This is 11's numbering, and the table below (kPoints) is keyed to it. 12
+// renumbered the enum; table_mode() maps 12+'s values back into these.
 constexpr int kMountModeExternalNone = 0;
 constexpr int kMountModeExternalDefault = 1;
 constexpr int kMountModeExternalRead = 2;
@@ -65,6 +73,53 @@ constexpr int kMountModeExternalInstaller = 5;
 constexpr int kMountModeExternalFull = 6;
 constexpr int kMountModeExternalPassThrough = 7;
 constexpr int kMountModeExternalAndroidWritable = 8;   // 11 only
+
+// MountExternalKind is not the same enum on 11 and on 12+, and the numbers that
+// moved are not decorative (Zygote.cpp:315-326 a30 against :326-337 a31..a37):
+//
+//   11  : NONE 0, DEFAULT 1, READ 2, WRITE 3, LEGACY 4, INSTALLER 5, FULL 6,
+//         PASS_THROUGH 7, ANDROID_WRITABLE 8, COUNT 9
+//   12+ : NONE 0, DEFAULT 1, INSTALLER 2, PASS_THROUGH 3, ANDROID_WRITABLE 4,
+//         COUNT 5
+//
+// READ/WRITE and INSTALLER/PASS_THROUGH share the numbers 2 and 3, so a value
+// alone cannot say which enum it came from: 2 is READ on 11 and INSTALLER on
+// 12+, and 3 is WRITE on 11 and PASS_THROUGH on 12+ — the first wants
+// /mnt/runtime/read, the second /mnt/installer, the third must not be touched
+// at all. The release therefore has to be asked, the same way the shell side
+// asks it (lib.sh unfuse_is_android_11, ro.build.version.sdk == 30).
+//
+// One case settles itself: 12+ never sends a value >= 5 (COUNT is 5 there), so
+// such a value is 11's numbering whatever the release says.
+constexpr int kMountModeExternalCount12 = 5;
+
+// 0 until onLoad() reads it; every fork inherits the value, and the release
+// cannot change under a running zygote.
+int g_sdk;
+
+int release_sdk() {
+    if (g_sdk != 0) return g_sdk;
+    char buf[PROP_VALUE_MAX] = {0};
+    __system_property_get("ro.build.version.sdk", buf);
+    g_sdk = atoi(buf);
+    return g_sdk;
+}
+
+// The incoming mode in the numbering kPoints is written in. An unreadable
+// property (sdk 0) means 11's numbering, i.e. no translation: the table is
+// written in it, and that reading leaves behaviour exactly as it was before
+// this translation existed.
+int table_mode(int mode) {
+    if (mode >= kMountModeExternalCount12) return mode;
+    if (release_sdk() <= 30) return mode;
+    switch (mode) {
+        case 1:  return kMountModeExternalDefault;          // DEFAULT is 1 on both
+        case 2:  return kMountModeExternalInstaller;        // INSTALLER
+        case 3:  return kMountModeExternalPassThrough;      // PASS_THROUGH
+        case 4:  return kMountModeExternalAndroidWritable;  // ANDROID_WRITABLE
+        default: return mode;                              // 0 NONE
+    }
+}
 
 // AID_USER_OFFSET from android_filesystem_config.h
 constexpr unsigned kAidUserOffset = 100000;
@@ -83,6 +138,12 @@ constexpr unsigned long kSdcardFsMagic = 0x5dca2df5UL;
 //   sdcardfs arm — Zygote.cpp:851-857, ExternalStorageViews[mount_mode]
 //   (Zygote.cpp:329-338).
 //
+// From 12 there is one arm and no property (Zygote.cpp:867-897 a36): the same
+// three exceptions, everything else /mnt/user/<user>; ExternalStorageViews and
+// isFuse are gone. /mnt/runtime/* survives as the sdcardfs arm's point on 11
+// only — on 12+ nothing in Zygote reads it, and the module's own source
+// /mnt/runtime/full/emulated is raised by storage.sh, not by the ROM.
+//
 // The module places the source at every point its mode can land on. The arm
 // that runs finds it; the other arm's points are left unused, which costs one
 // VFS mount and nothing else. That is the whole reason the module no longer
@@ -97,7 +158,10 @@ constexpr unsigned long kSdcardFsMagic = 0x5dca2df5UL;
 //
 // PASS_THROUGH is the one mode with no row: on the FUSE arm vold fills
 // /mnt/pass_through/<user> from /mnt/runtime/full (Utils.cpp:1568-1573), and on
-// the other arm its view IS /mnt/runtime/full. Both are sdcardfs already.
+// the other arm its view IS /mnt/runtime/full. Both are sdcardfs already. That
+// is why preAppSpecialize() returns before the unshare for it — and why it must
+// ask the release which number that mode is (7 on 11, 3 on 12+): exempting the
+// wrong number would exempt 11's WRITE instead, which is an ordinary app mode.
 //
 // %u is the user id. /mnt/runtime/full/emulated is the source itself and is
 // therefore never a destination — binding it onto itself would add nothing.
@@ -116,28 +180,28 @@ constexpr Point kPoints[] = {
     {kMountModeExternalWrite, "/mnt/user/%u/emulated"},
     {kMountModeExternalWrite, "/mnt/runtime/write/emulated"},
 
-    // Mode 4 is two different things. On 11 it is LEGACY, which no
-    // ExternalStorageMountPolicy returns and StorageManagerService therefore
-    // never hands out; from 12 on it is ANDROID_WRITABLE, which 11 numbers 8.
-    // The two meanings cannot collide, so one row carries both and is right on
-    // either release. A release that renumbers again shows up as a process
-    // whose mode is in no row, and the module declines it.
-    {kMountModeExternalLegacy, "/mnt/user/%u/emulated"},             // LEGACY / ANDROID_WRITABLE
+    // Mode 4 is LEGACY on 11 — a value no ExternalStorageMountPolicy returns and
+    // StorageManagerService therefore never hands out. The row is here for a
+    // release that does hand it out. 12+'s mode 4 is ANDROID_WRITABLE, and
+    // table_mode() has already moved it to 8, so the third point below is not
+    // reached through this row on 12+.
+    {kMountModeExternalLegacy, "/mnt/user/%u/emulated"},             // LEGACY
     {kMountModeExternalLegacy, "/mnt/runtime/write/emulated"},       // LEGACY
-    {kMountModeExternalLegacy, "/mnt/androidwritable/%u/emulated"},  // ANDROID_WRITABLE
+    {kMountModeExternalLegacy, "/mnt/androidwritable/%u/emulated"},  // dead on 11
 
     // INSTALLER: the FUSE arm binds /mnt/installer, the other arm
     // ExternalStorageViews[5] = /mnt/runtime/write. Installer sessions are apps
-    // like any other, so they get the same tree.
+    // like any other, so they get the same tree. Reached as 5 on 11 and as 2 on
+    // 12+ — table_mode() is what keeps an installer off the READ row there.
     {kMountModeExternalInstaller, "/mnt/installer/%u/emulated"},
     {kMountModeExternalInstaller, "/mnt/runtime/write/emulated"},
 
     // FULL: only /mnt/user is left, since the sdcardfs arm's view for it is the
-    // source itself.
+    // source itself. 12+ dropped the mode, so the row is 11's alone.
     {kMountModeExternalFull, "/mnt/user/%u/emulated"},
 
     // ANDROID_WRITABLE, 11's numbering: same as the mode-4 row plus 11's own
-    // value.
+    // value. Reached as 8 on 11 and as 4 on 12+ (table_mode).
     {kMountModeExternalAndroidWritable, "/mnt/user/%u/emulated"},
     {kMountModeExternalAndroidWritable, "/mnt/androidwritable/%u/emulated"},
 };
@@ -359,8 +423,18 @@ bool attach_card_points(int mode, unsigned user) {
 
 class UnfuseZygisk : public zygisk::ModuleBase {
 public:
+    void onLoad([[maybe_unused]] zygisk::Api *api, [[maybe_unused]] JNIEnv *env) override {
+        // Read before any fork: the release cannot change under a running zygote,
+        // and every child inherits the value, so preAppSpecialize() never asks
+        // the property service on the app's behalf.
+        release_sdk();
+    }
+
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        const int mode = args->mount_external;
+        // kPoints is written in 11's numbering; on 12+ this translates the mode
+        // into it (see table_mode). The exemption below and the rows read the
+        // translated value, so no number is spelled out twice.
+        const int mode = table_mode(args->mount_external);
 
         // NONE: Zygote returns before binding anything onto /storage
         // (Zygote.cpp:811-814), so there is no point to substitute — and a
