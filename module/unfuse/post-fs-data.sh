@@ -69,7 +69,16 @@ rm -f "$STATE/once" 2>/dev/null
 # off and every later mount fails with ENOTCONN.
 FUSEFS="$MODDIR/tools/vold-fusefs"
 if [ -x "$FUSEFS" ]; then
-    "$FUSEFS" --wait 3
+    # Сначала selftest, и только потом патч. Исполняемая половина selftest
+    # (оба обработчика как машинный код, со stub'ами mount/umount2) живёт под
+    # #if defined(__aarch64__), а хост сборки — x86_64, поэтому слово с
+    # неверной полярностью (strb на месте ldrb в обратном обходе SD-блока)
+    # доехало до v1.1 живым: selftest проверял только форму, а не поведение.
+    # Здесь он бежит на том же CPU, что и vold, — это единственное место, где
+    # исполняемая половина действительно исполняется.
+    if "$FUSEFS" --selftest >/dev/null 2>&1; then
+        "$FUSEFS" --wait 3
+    fi
 fi
 
 # vold does only DE this early (vold-16/FsCrypt.cpp:657), so we run before its

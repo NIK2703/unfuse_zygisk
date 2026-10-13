@@ -53,6 +53,130 @@ fi
 # has done its own CE work and after both patches.
 sh "$MODDIR/storage.sh"
 
+# --- vold is NOT done with the emulated volume at this point ----------------
+#
+# Reported end state (crDroid 7 / A11, sdcardfs in the kernel,
+# CONFIG_EXT4_FS_POSIX_ACL off): the raw bind itself is up — /storage/emulated/0
+# is ext4 over /data/media — yet /storage/emulated/0/Android and
+# /storage/emulated/0/Android/data come back with their AOSP rights
+# (media_rw:media_rw 02771 and media_rw:ext_data_rw 02771) and every app probe on
+# .../Android/data gets EACCES: traverse, no listing. Two independent things
+# happen after this script has already run, and both are vold's:
+#
+#   1. EmulatedVolume::mount() (model/EmulatedVolume.cpp:353-403) runs when the
+#      volume is mounted — at user start, after the late_start stage this script
+#      belongs to. Inside it:
+#
+#      * PrepareAndroidDirs() (Utils.cpp:1727) fs_prepare_dir()s Android and
+#        Android/{data,obb,media}: chown to media_rw/ext_data_rw and chmod 02771.
+#        On a kernel with POSIX ACL the named 9997 entry survives a chmod; on a
+#        kernel without one the grant rides gid 9997 (grant_by_group,
+#        tools/storage-fix.c) and a chown destroys it. Fix F's window covers the
+#        volume root; this is the same race one level deeper, and its writer is
+#        the next bullet.
+#      * mountFuseBindMounts() (EmulatedVolume.cpp:112-136) then bind-mounts
+#        /mnt/runtime/default/<label>/<user>/Android/{data,obb} over
+#        /mnt/user/<user>/emulated/<user>/Android/{data,obb}. Where vold raised
+#        sdcardfs that source is the sdcardfs DEFAULT view — AID_SDCARD_RW 1015,
+#        mask 0006 → 0771 — so an app in group 9997 has other = --x there. The
+#        vold-fusefs header calls these binds "self-binds", which is true only
+#        while mUseSdcardFs is false; where it is true they hide the raw tree the
+#        module put underneath. mUseSdcardFs cannot be turned off from a module
+#        script: it is cached in the EmulatedVolume constructor when vold starts
+#        (init.rc:453 `start vold` in early-fs, which precedes post-fs-data), so
+#        external_storage.sdcardfs.enabled=0 lands after the read. The same
+#        cached value is why the SD card had to be bound from the raw
+#        /mnt/media_rw instead of from the views.
+#   2. fscrypt_prepare_user_storage() (FsCrypt.cpp:1021) chowns the volume root
+#      later still — that one Fix F's window already covers.
+#
+# Hence the order below: wait until vold is observably through with the volume,
+# drop the stale view off the app's Android/{data,obb}, then re-award. One-shot
+# at this point of the boot and idempotent, like everything else in this script:
+# the wait is bounded and exits at its deadline, no second process is started.
+
+# The signal that vold is through with the emulated volume:
+# /mnt/pass_through/0/emulated is bound by MountUserFuse()'s tail
+# (Utils.cpp:1568-1577), which runs after PrepareAndroidDirs(); the app-view
+# bind from mountFuseBindMounts() follows one daemon-wait later. When
+# mAppDataIsolationEnabled (persist.sys.isolated_storage, EmulatedVolume.cpp:53,
+# default false) is true that app-view bind is never made at all, so the grace
+# below covers both ROM shapes.
+EMU_VIEW=/mnt/user/0/emulated
+PASS_THROUGH=/mnt/pass_through/0/emulated
+APP_DATA=/mnt/user/0/emulated/0/Android/data
+APP_OBB=/mnt/user/0/emulated/0/Android/obb
+
+# Last /proc/1/mounts entry for a mountpoint wins, since mounts stack — a grep
+# would also see what lies underneath (/proc/1/mounts, not the caller's own
+# namespace: the mounts that matter are vold's, made in the init ns).
+mounted_type() {
+    _t=""
+    while read -r _dev mp ty _rest; do
+        [ "$mp" = "$1" ] && _t="$ty"
+    done < /proc/1/mounts 2>/dev/null
+    echo "$_t"
+}
+
+# 0 = the signal never showed (bounded wait expired); otherwise the epoch second
+# it was first seen. The award loop uses the age of this moment, not the wait.
+T_SIGNAL=0
+WAIT_DEADLINE=$(( $(date +%s) + 120 ))
+while :; do
+    if [ -n "$(mounted_type "$PASS_THROUGH")" ]; then
+        T_SIGNAL=$(date +%s)
+        break
+    fi
+    [ "$(date +%s)" -ge "$WAIT_DEADLINE" ] && break
+    sleep 1
+done
+
+# mountFuseBindMounts()'s tail: the app-view bind, if this ROM makes one. It
+# trails the signal by the FUSE-daemon wait inside doMount()
+# (EmulatedVolume.cpp:390-397) — milliseconds on a healthy boot.
+GRACE_DEADLINE=$(( $(date +%s) + 10 ))
+while [ -z "$(mounted_type "$APP_DATA")" ] && [ -z "$(mounted_type "$APP_OBB")" ]; do
+    [ "$(date +%s)" -ge "$GRACE_DEADLINE" ] && break
+    sleep 1
+done
+
+# Take the stale view off the app's Android/{data,obb} — but only when the raw
+# bind is really underneath it. The premise is the same one the vold-noacl
+# decision above uses: with vold-fusefs in memory the topmost filesystem on
+# /mnt/user/0/emulated is the raw tree, and dropping the view exposes that tree,
+# with the grant storage.sh makes on it. Without the bind the parent is the FUSE
+# mount itself, and exposing the daemon's view of Android/data instead would
+# move things backwards — the half-applied state is not what this stage fixes.
+# MNT_DETACH (umount -l): the view is a shared mount apps are standing on, and
+# a plain unmount would return EBUSY. Returns 0 when it dropped something.
+drop_stale_view() {
+    [ "$FUSEFS_OK" = "0" ] || return 1
+    [ "$(mounted_type "$EMU_VIEW")" != "fuse" ] || return 1
+    _dropped=0
+    for p in "$APP_DATA" "$APP_OBB"; do
+        if [ -n "$(mounted_type "$p")" ]; then
+            if umount -l "$p" 2>/dev/null || umount "$p" 2>/dev/null; then
+                _dropped=1
+            fi
+        fi
+    done
+    [ "$_dropped" = "1" ]
+}
+
+drop_stale_view || :
+
+# storage.sh once more, now as the last word on the raw Android* levels: the
+# signal above proves PrepareAndroidDirs() has already run, so this grant is not
+# followed by a vold chown. The writers that remain — per-package dirs at
+# install time, and the volume root Fix F's window re-checks — are elsewhere.
+sh "$MODDIR/storage.sh"
+
+# A bind that landed during the grace (the daemon wait is not a promise) leaves
+# the grant masked; one more check costs a couple of /proc reads.
+if drop_stale_view; then
+    sh "$MODDIR/storage.sh"
+fi
+
 # --- The award has to outlive vold's own writers ---
 #
 # On a kernel without POSIX ACL (the x0 device) the grant rides the group: gid
@@ -103,13 +227,14 @@ while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 1
 done
 
-# The award names two targets, and the two vold writers do not hit the same
-# one: fscrypt_prepare_user_storage resets the volume root, PrepareAndroidDirs
-# resets the Android* levels. --check covers both in one call and reports the
-# whole grant (gid 9997, group bits, S_ISGID on a dir), so a zero here means
-# the kernel will really let an app in. The Android tree is checked only when
-# it exists — a volume that never expanded has no such level, and asking about
-# a missing path would only spin the loop.
+# The award names two targets, and the vold writers do not hit the same one:
+# fscrypt_prepare_user_storage resets the volume root, while the Android* levels
+# are re-awarded by the corrective stage above (its signal proves
+# PrepareAndroidDirs has already run). --check covers both in one call and
+# reports the whole grant (gid 9997, group bits, S_ISGID on a dir), so a zero
+# here means the kernel will really let an app in. The Android tree is checked
+# only when it exists — a volume that never expanded has no such level, and
+# asking about a missing path would only spin the loop.
 award_ok() {
     [ -x "$FIX" ] || return 1
     if [ -d /data/media/0/Android ]; then
@@ -119,18 +244,30 @@ award_ok() {
     fi
 }
 
-# The settle window. It has to reach past the later of the two writers, which
-# on the reported device was ~47 s after service.sh; 90 s past the wait covers
-# that with margin, and a vold restart inside the window is covered too (the
-# re-award simply repeats). The re-award is the full storage.sh pass — a
-# recursive walk of /data/media — so it is spaced out rather than run every
-# tick; the check in between is cheap. Unconditional exit at the deadline: the
-# loop is finite and does not outlive the boot stage it belongs to.
+# The settle window. It has to reach past the writer that is left, which on the
+# reported device was ~47 s after service.sh; 90 s covers that with margin, and
+# a vold restart inside the window is covered too (the re-award simply repeats).
+# The re-award is the full storage.sh pass — a recursive walk of /data/media — so
+# it is spaced out rather than run every tick; the check in between is cheap.
+# Unconditional exit at the deadline: the loop is finite and does not outlive the
+# boot stage it belongs to.
+#
+# The break is deliberately gated: an award that merely survived so far is not
+# proof the writers are done, and this loop used to exit on the first green
+# check — which on the reported device was before the volume had even mounted,
+# so nothing re-awarded the Android* levels afterwards. It now breaks only once
+# the boot has settled AND the volume mount is a moment that is at least 15 s in
+# the past, so the late root writer lands inside the window instead of behind
+# the break. If boot never settles, or the volume never mounts, the deadline
+# breaks the loop anyway.
 AWARD_DEADLINE=$(( $(date +%s) + 90 ))
 last_pass=0
 while :; do
-    award_ok && break
     now=$(date +%s)
+    if [ "$(getprop sys.boot_completed)" = "1" ] &&
+       [ "$T_SIGNAL" -gt 0 ] && [ $(( now - T_SIGNAL )) -ge 15 ]; then
+        award_ok && break
+    fi
     [ "$now" -ge "$AWARD_DEADLINE" ] && break
     if [ $(( now - last_pass )) -ge 5 ]; then
         sh "$MODDIR/storage.sh"

@@ -1,6 +1,6 @@
 id=unfuse_zygisk
 name=Unfuse Zygisk
-version=v1.1
-versionCode=2
+version=v1.2
+versionCode=3
 author=NIK2703
 description=Direct internal storage for all apps — no FUSE, no scoped storage. vold's FUSE mount for emulated storage is replaced by a bind of the raw /data/media, and Android/data + Android/obb isolation is lifted.

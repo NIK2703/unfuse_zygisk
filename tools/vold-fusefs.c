@@ -807,13 +807,34 @@ static int64_t dec_cbz_w(uint32_t w, int *rt_out, int *is_zero) {
     return d;
 }
 /* LDRB (immediate, pre-index): `ldrb Wt, [Xn, #-1]!` — the SD handler's
- * back-walk from the target's NUL to the volume name's last '/'. Bytes 11:10
- * = 0b11 is what makes it pre-index rather than unsigned-offset. */
+ * back-walk from the target's NUL to the volume name's last '/'.
+ *
+ * The base is 0x385ffc00, not 0x381ffc00: bit 22 (0x00400000) is the L bit of
+ * this encoding group, and without it the word is `strb`, not `ldrb`. That is
+ * the shape of the field-report bug the 2026-10-13 device logs showed: with a
+ * STRB on this position the "walk" writes its byte — the first byte of the
+ * tail that failed to match "/emulated", i.e. the first byte of the volume's
+ * UUID — backwards over the whole target string, and the mount that follows
+ * gets a path of repeated single characters. On the reporter's SD card
+ * (35B8-1B1E) MountUserFuse logged
+ *     Failed to mount 333333333333333333333: No such file or directory
+ * — 21 '3's over "/mnt/user/0/35B8-1B1E", exactly the walk's trail — and vold
+ * marked the volume unmountable.
+ *
+ * The word is pinned against clang: `ldrb w10,[x12,#-1]!` is 0x385ffd8a, its
+ * store twin `strb w10,[x12,#-1]!` is 0x381ffd8a, and nothing else in the
+ * group carries the pre-index form (bits 11:10 = 0b11) with imm9 = -1.
+ * Setting bit 24 as well (0x395ffc00) is not "more correct": it turns the
+ * unsigned-offset bit pattern on and the word reads #0x7ff bytes ahead.
+ */
 static uint32_t enc_ldrb_pre_dec(int rt, int rn) {
-    return 0x381ffc00u | ((uint32_t)rn << 5) | (uint32_t)rt;
+    return 0x385ffc00u | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
 static int dec_ldrb_pre_dec(uint32_t w, int *rt_out, int *rn_out, int64_t *imm9_out) {
-    if ((w & 0xffc00c00u) != 0x38000c00u) return 0;
+    /* 0x38400c00, not 0x38000c00: the L bit (bit 22) is inside the mask, and
+     * its absence is how the store twin passed for a load. A decoder that
+     * accepts both halves of the pair proves nothing about either. */
+    if ((w & 0xffc00c00u) != 0x38400c00u) return 0;
     int64_t imm9 = (int64_t)((w >> 12) & 0x1ff);
     if (imm9 & 0x100) imm9 -= 0x200;
     *imm9_out = imm9;
@@ -3772,6 +3793,18 @@ static int selftest(void) {
         for (int i = 0; i < nw; i++) {
             int rt = 0, rn = 0; int64_t imm = 0;
             if (!dec_ldrb_pre_dec(w[i], &rt, &rn, &imm) || imm != -1) continue;
+            /* The polarity of this one word is a bug that shipped: with the
+             * store twin in this slot the back-walk writes over the caller's
+             * path instead of reading it (see enc_ldrb_pre_dec). The decoder
+             * now rejects the store, so a regression shows up here as a
+             * missing head — with the reason said plainly rather than as a
+             * block that failed to be found. */
+            if ((w[i] & 0xffc00c00u) != 0x38400c00u) {
+                fprintf(stderr, "selftest FAIL: обратный обход читает не ldrb:"
+                                " слово %d = %08x (байт идёт в строку цели, а"
+                                " не из неё)\n", i, w[i]);
+                return 1;
+            }
             int j = i - 1;
             while (j >= 0 && (w[j] >> 24) == 0x54u) j--;
             if (j >= 0) bw_head = j;
