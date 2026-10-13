@@ -80,6 +80,20 @@ unfuse_require_zygisk_so() {
 unfuse_install_common() {
     set_perm_recursive "$MODPATH" 0 0 0755 0644
     set_perm "$MODPATH/zygisk/$1.so" 0 0 0644
+
+    # zygisk/<ABI>.so — контекст от менеджера не гарантирован: у распакованного
+    # дерева он system_file, а у всех zygisk-модулей на устройстве
+    # zygisk/*.so лежит как system_lib_file (install.sh:47-48 метит оба файла —
+    # это и есть ожидаемое состояние). Ставим явно и на ОБА ABI: $1 называет
+    # только тот, что выбрал установщик, а на zygote64_32 (ro.zygote) 32-битный
+    # zygote живой и armeabi-v7a.so тоже грузится, так что оставленный ему
+    # system_file — расхождение, а не мелочь. chcon не критичен для установки:
+    # не прошёл — модуль всё равно рабочий, поэтому молчим и продолжаем.
+    for _so in "$MODPATH"/zygisk/*.so; do
+        [ -f "$_so" ] || continue
+        chcon u:object_r:system_lib_file:s0 "$_so" 2>/dev/null || true
+    done
+
     set_perm "$MODPATH/lib.sh"          0 0 0755 2>/dev/null
     set_perm "$MODPATH/customize.sh"    0 0 0755 2>/dev/null
     set_perm "$MODPATH/post-fs-data.sh" 0 0 0755 2>/dev/null

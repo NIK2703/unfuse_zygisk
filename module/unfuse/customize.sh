@@ -36,9 +36,9 @@ rm -f "$MODPATH/tools/storage-fix-arm64" "$MODPATH/tools/storage-fix-arm" \
 
 unfuse_install_common "$ABI"
 
-# .so вне /system: контекст от менеджера не гарантирован — у всех zygisk-модулей на
-# устройстве он system_lib_file. Фиксируем явно.
-chcon u:object_r:system_lib_file:s0 "$MODPATH/zygisk/$ABI.so" 2>/dev/null || true
+# Контекст zygisk/*.so выставляет общий шаг установщика — на ОБА ABI сразу
+# (lib.sh, unfuse_install_common). Раньше строка стояла здесь и метила только
+# $ABI.so, оставляя armeabi-v7a.so в system_file на zygote64_32.
 
 # Права только у этой сборки: утилиты vold-плеча.
 set_perm "$MODPATH/tools/storage-fix"  0 0 0755
