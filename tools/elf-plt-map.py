@@ -2,14 +2,19 @@
 """Build-independent locator for a dynamically imported symbol's PLT stub.
 
 Instead of assuming `reloc_index -> plt_base + 16*(i+1)` (which is WRONG for
-this linker: lld emits two header entries), this decodes *every* 16-byte entry
-in .plt and matches it against the GOT slot taken from .rela.plt:
+this linker: lld emits two header entries), this decodes entries in .plt and
+matches them against the GOT slot taken from .rela.plt:
 
     adrp x16, page      ->  page
     ldr  x17, [x16, #k] ->  page + k*8   ==  relocation r_offset ?
 
 That is self-validating: the match proves the stub belongs to the symbol, so
 the patch never depends on a byte signature or on section sizes.
+
+Entries are walked in 8-byte steps, not 16: Android 17's vold is built with
+branch protection and has 24-byte entries (16 bytes of code + 8 padding), so
+half of its stubs start at addresses that are 8 mod 16. Decoding is strict,
+so the smaller step cannot invent a stub in the padding.
 
 Usage: elf-plt-map.py <elf> [symbol ...]
 """
@@ -96,14 +101,14 @@ def main():
     by_target = {}
     nstubs = 0
     base = plt['addr']
-    for k in range(plt['size'] // 16):
-        off = plt['off'] + 16 * k
+    for rel in range(0, plt['size'] - 16 + 1, 8):
+        off = plt['off'] + rel
         tgt = stub_ldr_target(d, off)
         if tgt is None:
             continue
         nstubs += 1
-        va = base + 16 * k
-        by_target.setdefault(tgt, []).append((k, va, off))
+        va = base + rel
+        by_target.setdefault(tgt, []).append((rel, va, off))
 
     print('== %s ==' % path)
     print('.plt base=0x%x size=0x%x  decoded entries=%d  JMP_SLOT relocs=%d'
@@ -120,9 +125,9 @@ def main():
     for t, (symidx, ridx, rtype) in jmpslots.items():
         sname, shndx = names.get(symidx, ('', -1))
         if t in by_target:
-            k, va, off = by_target[t][0]
+            rel, va, off = by_target[t][0]
             name2stub.setdefault(sname, []).append(
-                dict(slot=t, va=va, off=off, k=k, reloc=ridx, shndx=shndx))
+                dict(slot=t, va=va, off=off, rel=rel, reloc=ridx, shndx=shndx))
 
     if not want:
         want = set(name2stub)
@@ -134,9 +139,9 @@ def main():
             print('  no PLT stub found')
             continue
         for e in ents:
-            print('  GOT slot VA=0x%x  ->  .plt entry #%d VA=0x%x file=0x%x'
+            print('  GOT slot VA=0x%x  ->  .plt offset +0x%x VA=0x%x file=0x%x'
                   '  (rela.plt[%d], dynsym shndx=%d)'
-                  % (e['slot'], e['k'], e['va'], e['off'], e['reloc'],
+                  % (e['slot'], e['rel'], e['va'], e['off'], e['reloc'],
                      e['shndx']))
             text = sh('.text')
             hits = []

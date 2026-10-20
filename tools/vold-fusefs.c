@@ -1413,7 +1413,6 @@ typedef struct {
     uint64_t stub_va;
     uint32_t sym_index;
     int      reloc_index;
-    int      plt_delta;
 } Resolved;
 
 /* ------------------------------------------------------------------ *
@@ -1965,7 +1964,6 @@ static int ep_exit_code(int why) {
 static int resolve_sym(Src *s, const char *sym, Resolved *r) {
     memset(r, 0, sizeof(*r));
     r->reloc_index = -1;
-    r->plt_delta = -1;
 
     Dyn d;
     if (read_dynamic(s, &d) != 0) return EXIT_NO_RESOLVE;
@@ -2017,8 +2015,13 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
         uint8_t *buf = malloc(len);
         if (!buf) continue;
         if (src_pread(s, p->p_vaddr, buf, len) != 0) { free(buf); continue; }
-        uint64_t start = (p->p_vaddr + 15u) & ~15ULL;
-        for (uint64_t va = start; va + 16 <= p->p_vaddr + p->p_filesz; va += 16) {
+        /* 8, not 16: Android 17's vold is built with branch protection and its
+         * PLT entries are 24 bytes (16 code + 8 padding), so every other stub
+         * starts at an 8-mod-16 address. A 16-byte stride skips those entries
+         * entirely and the scan used to return no stubs at all. decode_stub()
+         * is strict enough that stepping in 8s cannot invent one. */
+        uint64_t start = p->p_vaddr & ~7ULL;
+        for (uint64_t va = start; va + 16 <= p->p_vaddr + p->p_filesz; va += 8) {
             const uint8_t *q = buf + (va - p->p_vaddr);
             uint64_t tgt = 0;
             if (decode_stub(q, va, &tgt) && nstubs < MAXSTUB) {
@@ -2030,11 +2033,15 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
         free(buf);
     }
 
-    r->plt_delta = plt_layout_delta(stub_va, stub_tg, nstubs, rel, nrel);
-    if (r->plt_delta < 0) {
-        free(stub_va); free(stub_tg); free(rel);
-        return EXIT_NO_RESOLVE;
-    }
+    /* The layout is needed only for a stub that is already patched: its own
+     * `ldr` is gone, so it cannot be matched by GOT slot. On a fresh image the
+     * direct lookup below is authoritative and a layout failure is harmless —
+     * refusing here would make the tool fail on any image whose PLT is not
+     * evenly spaced even though both target stubs were found. */
+    int64_t plt_base = 0;
+    int plt_stride = 0;
+    bool have_layout = (plt_layout(stub_va, stub_tg, nstubs, rel, nrel,
+                                   &plt_base, &plt_stride) == 0);
 
     int hits = 0;
     uint64_t direct = 0;
@@ -2048,7 +2055,8 @@ static int resolve_sym(Src *s, const char *sym, Resolved *r) {
     } else if (hits > 1) {
         return EXIT_NO_RESOLVE;
     } else {
-        int64_t cand = (int64_t)r->plt_delta * 16 + (int64_t)r->reloc_index * 16;
+        if (!have_layout) return EXIT_NO_RESOLVE;
+        int64_t cand = plt_base + (int64_t)plt_stride * (int64_t)r->reloc_index;
         if (cand <= 0) {
             return EXIT_NO_RESOLVE;
         }
@@ -4077,7 +4085,11 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
         return -1;
     }
 
-    /* Last stub = last `br x17` (0xd61f0220) at a 16-byte boundary.
+    /* Last stub = last `br x17` (0xd61f0220) at an 8-byte boundary.
+     *
+     * 8, not 16: PLT entries are 24 bytes on Android 17 (BTI build), so their
+     * starts alternate between 0 and 8 mod 16. A 16-byte walk misses the last
+     * entry and then measures the wrong "end of the PLT".
      *
      * Reading the whole segment to find it is not avoidable by looking at the
      * caller's own stub first, tempting as that is: the refusal is decided by
@@ -4090,7 +4102,7 @@ static int find_handler_room(Src *s, uint64_t stub_va, uint64_t *out_va) {
     size_t rel_stub = (size_t)(stub_va - seg->p_vaddr);
     size_t last = 0;
     bool have = false;
-    for (size_t off = (rel_stub + 15) & ~(size_t)15; off + 16 <= len; off += 16) {
+    for (size_t off = (rel_stub + 7) & ~(size_t)7; off + 16 <= len; off += 8) {
         uint32_t w3;
         memcpy(&w3, buf + off + 12, 4);
         if (w3 == 0xd61f0220u) { last = off + 16; have = true; }
@@ -4678,9 +4690,11 @@ resolved_as_file:
         return EXIT_NO_WRITE;
     }
 
-    /* 3) redirect both stubs. Each is 16 bytes and so is our replacement, so
-     * no neighbouring stub is touched. The mount hook goes first, so that a
-     * failure on the second one can be undone by putting the first back. */
+    /* 3) redirect both stubs. Our replacement is 16 bytes; the entry may be 16
+     * or 24 bytes (Android 17 pads it), so on the padded layout the two NOPs
+     * after the code stay as they were. No neighbouring stub is touched. The
+     * mount hook goes first, so that a failure on the second one can be undone
+     * by putting the first back. */
     if (hook_install(&s, &hm, handler_abs) != EXIT_OK) {
         uint8_t zeros[1024];
         memset(zeros, 0, (size_t)total);

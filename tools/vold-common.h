@@ -18,7 +18,7 @@
  *
  * Two things that are not the "reading" half but are shared all the same:
  *
- *   - plt_layout_delta(): the .plt layout constant C, derived from relocation
+ *   - plt_layout(): the .plt base and stride, derived from relocation
  *     and trampoline pairs. Both patchers need it, and it depends on nothing but
  *     the two tables.
  *   - STUB_PATCH_W0/W1: the 16-byte patch vold-fusefs writes over a trampoline.
@@ -240,19 +240,46 @@ static int load_relocs(Src *s, const Dyn *d, Elf64_Rela **out, size_t *nout) {
     return 0;
 }
 
-/* The .plt layout constant, from foreign pairs: for any relocation whose stub
- * was found, C = va - 16*i must be the same number — that is what "the stubs are
- * 16-byte spaced and in relocation order" means, and it is what lets a patched
- * trampoline (whose own `ldr` is gone, so it can no longer be matched by GOT
- * slot) still be located on a later run. Returns C/16, or -1 if the pairs
- * disagree or there are none.
+/* Euclid on non-negative 64-bit values; 0 is the identity. */
+static int64_t gcd_i64(int64_t a, int64_t b) {
+    while (b) {
+        int64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
+/* The .plt layout, from foreign pairs: for any relocation whose stub was found,
+ * va = base + stride*i must hold for the same base and stride — that is what
+ * "the stubs are in relocation order and evenly spaced" means, and it is what
+ * lets a patched trampoline (whose own `ldr` is gone, so it can no longer be
+ * matched by GOT slot) still be located on a later run.
+ *
+ * The stride is MEASURED, not assumed to be 16. lld pads PLT entries when the
+ * image is built with branch protection: Android 17's vold has 24-byte entries
+ * (16 bytes of code followed by two NOPs, so adrp/ldr/add/br sit at the start
+ * of each entry, not at 16-byte boundaries). Both the scan in the callers and
+ * this derivation used to hardcode 16; on such an image no stub was decoded at
+ * all and the patchers refused with code 2 before touching anything.
+ *
+ * base and stride are derived with gcd over the pairs rather than by dividing
+ * adjacent ones: a patched stub is missing from the arrays here, so the pairs
+ * are not guaranteed to be adjacent in relocation order. With at least two
+ * pairs, gcd(va - va0) / gcd(i - i0) is the stride of the lattice they lie on,
+ * and every pair is then checked against it. Returns 0 and fills the outputs,
+ * or -1 if there are fewer than two pairs or they do not form one lattice.
  *
  * Takes the two parallel arrays rather than either tool's own container: both
  * hold (va, target) pairs, and this reads nothing else. */
-static int plt_layout_delta(const uint64_t *stub_va, const uint64_t *stub_target,
-                            size_t nstubs, const Elf64_Rela *rel, size_t nrel) {
+static int plt_layout(const uint64_t *stub_va, const uint64_t *stub_target,
+                      size_t nstubs, const Elf64_Rela *rel, size_t nrel,
+                      int64_t *base_out, int *stride_out) {
     bool have = false;
-    int64_t delta = 0;
+    uint64_t va0 = 0;
+    int64_t i0 = 0;
+    int64_t gva = 0, gidx = 0;
+
     for (size_t i = 0; i < nrel; i++) {
         int hits = 0;
         uint64_t va = 0;
@@ -260,19 +287,44 @@ static int plt_layout_delta(const uint64_t *stub_va, const uint64_t *stub_target
             if (stub_target[j] == rel[i].r_offset) { va = stub_va[j]; hits++; }
         }
         if (hits != 1) continue;
-        int64_t d = ((int64_t)va - (int64_t)i * 16) / 16;
         if (!have) {
-            delta = d;
             have = true;
-        } else if (d != delta) {
-            /* A nonlinear layout means the stubs are not 16-byte spaced in
-             * relocation order (with -mbranch-protection=bti they are 32), so C
-             * is not a constant and the derivation below would lie. Refuse. */
-            return -1;
+            va0 = va;
+            i0 = (int64_t)i;
+            continue;
         }
+        int64_t dva = (int64_t)va - (int64_t)va0;
+        int64_t di  = (int64_t)i  - i0;
+        if (dva < 0) dva = -dva;
+        if (di  < 0) di  = -di;
+        gva  = gcd_i64(gva, dva);
+        gidx = gcd_i64(gidx, di);
     }
-    if (!have) return -1;
-    return (int)delta;
+
+    if (!have || gidx == 0 || gva == 0 || gva % gidx != 0) return -1;
+
+    int64_t stride = gva / gidx;
+    /* AArch64 PLT entries are 16 or 24 bytes on the builds seen so far, and
+     * both are multiples of 8. The range is a sanity gate, not a list: a
+     * nonsense stride must fail here rather than point the patch into .text. */
+    if (stride < 16 || stride > 64 || (stride & 7) != 0) return -1;
+
+    int64_t base = (int64_t)va0 - stride * i0;
+    if (base <= 0) return -1;
+
+    for (size_t i = 0; i < nrel; i++) {
+        int hits = 0;
+        uint64_t va = 0;
+        for (size_t j = 0; j < nstubs; j++) {
+            if (stub_target[j] == rel[i].r_offset) { va = stub_va[j]; hits++; }
+        }
+        if (hits != 1) continue;
+        if (base + stride * (int64_t)i != (int64_t)va) return -1;
+    }
+
+    *base_out = base;
+    *stride_out = (int)stride;
+    return 0;
 }
 
 static int sym_name(Src *s, const Dyn *d, uint32_t idx, char *out, size_t outlen) {

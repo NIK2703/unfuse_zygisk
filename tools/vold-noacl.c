@@ -43,8 +43,10 @@
  *    device setxattr is rela.plt[185], its stub #187). --selftest checks the mapping is one-to-one for ALL symbols.
  * 4. Repeat run / --check: the patch overwrote `ldr`, so the stub is no longer
  *    findable via the GOT slot. But .plt layout is linear: for any other pair
- *    "relocation i -> stub v", C = v - 16*i is constant (lld's numbering shift).
- *    Derive C from foreign pairs; setxattr's stub is C + 16*i_setxattr (v2.9.0 hardcoded this C as 0x54ea0).
+ *    "relocation i -> stub v", v - stride*i is constant (lld's numbering shift).
+ *    Derive base and stride from foreign pairs; setxattr's stub is
+ *    base + stride*i_setxattr (v2.9.0 hardcoded this C as 0x54ea0). The stride
+ *    is measured, not assumed: Android 17's BTI build has 24-byte entries.
  * 5. Patch writes 8 bytes: `mov w0,#0` (0x52800000) then `ret` (0xd65f03c0). Eight,
  *    not sixteen: the /proc/<pid>/mem write is a memcpy into the page and 8 bytes at
  *    an aligned address land as one word — atomically; the trailing `add`/`br` stay
@@ -71,9 +73,11 @@
  * NOTHING — refusing beats a false success that leaves the race unrecorded.
  * (1) setxattr is called EXACTLY ONCE (--dry-run resolves the count and stops there);
  * 0 calls would report success changing nothing, >1 would disarm unrelated code.
- * (2) Stubs are 16-byte spaced and shaped as above (lld without BTI/PAC); with
- * -mbranch-protection=bti they are 32 bytes and C stops being constant, caught on the
- * second pair.
+ * (2) The stubs are evenly spaced in relocation order and shaped as above. The
+ * stride is measured rather than assumed: lld pads entries under branch
+ * protection (Android 17's vold: 24 bytes = 16 code + 8 NOP), and a hardcoded
+ * 16 made this tool miss the entries that start at an 8-mod-16 address and
+ * refuse.
  *
  * The tool prints nothing, at any verbosity: an answer is its exit code, and that is
  * what every caller reads (module/post-fs-data.sh, module/service.sh, status.sh).
@@ -185,8 +189,11 @@ static int collect_stubs(Src *s, Stubs *st) {
             return -1;
         }
 
-        uint64_t start = (p->p_vaddr + 15u) & ~15ULL;
-        for (uint64_t va = start; va + 16 <= p->p_vaddr + p->p_filesz; va += 16) {
+        /* 8, not 16: Android 17's vold has 24-byte PLT entries (16 bytes of
+         * code + 8 padding, branch-protection build), so entries start at
+         * addresses that are 8 but not always 16 mod 16. See plt_layout(). */
+        uint64_t start = p->p_vaddr & ~7ULL;
+        for (uint64_t va = start; va + 16 <= p->p_vaddr + p->p_filesz; va += 8) {
             const uint8_t *q = buf + (va - p->p_vaddr);
             uint64_t tgt = 0;
             if (decode_stub(q, va, &tgt)) {
@@ -210,7 +217,6 @@ typedef struct {
     uint32_t sym_index;
     int      reloc_index;
     int      call_sites;
-    int      plt_delta;          /* C/16 derived from the .plt layout */
     bool     already_patched;
 } Resolved;
 
@@ -252,7 +258,6 @@ static int count_call_sites(Src *s, uint64_t stub_va) {
 static int resolve(Src *s, Resolved *r) {
     memset(r, 0, sizeof(*r));
     r->reloc_index = -1;
-    r->plt_delta = -1;
 
     Dyn d;
     if (read_dynamic(s, &d) != 0) return EXIT_NO_RESOLVE;
@@ -286,13 +291,15 @@ static int resolve(Src *s, Resolved *r) {
         return EXIT_NO_RESOLVE;
     }
 
-    /* 3. .plt layout from foreign pairs — works even when the symbol's own ldr is gone. */
-    r->plt_delta = plt_layout_delta(st.va, st.target, st.n, rel, nrel);
+    /* 3. .plt layout from foreign pairs — works even when the symbol's own ldr
+     * is gone. The layout is only needed in that case: a fresh stub is found
+     * by GOT slot directly, and requiring a derivable layout there would make
+     * the tool refuse an image it can patch. */
+    int64_t plt_base = 0;
+    int plt_stride = 0;
+    bool have_layout = (plt_layout(st.va, st.target, st.n, rel, nrel,
+                                   &plt_base, &plt_stride) == 0);
     free(rel);
-    if (r->plt_delta < 0) {
-        stubs_free(&st);
-        return EXIT_NO_RESOLVE;
-    }
 
     /* 4. The stub: direct GOT-slot lookup (fresh vold), else the derived layout. */
     int hits = 0;
@@ -304,8 +311,11 @@ static int resolve(Src *s, Resolved *r) {
         stubs_free(&st);
         return EXIT_NO_RESOLVE;
     } else {
-        int64_t cand = (int64_t)r->plt_delta * 16 +
-                       (int64_t)r->reloc_index * 16;
+        if (!have_layout) {
+            stubs_free(&st);
+            return EXIT_NO_RESOLVE;
+        }
+        int64_t cand = plt_base + (int64_t)plt_stride * (int64_t)r->reloc_index;
         if (cand <= 0) {
             stubs_free(&st);
             return EXIT_NO_RESOLVE;
@@ -333,7 +343,7 @@ static int resolve(Src *s, Resolved *r) {
 }
 
 /* Require exactly one stub per JUMP_SLOT relocation and distinct stubs for distinct
- * symbols, so no arithmetic like "rela.plt[i] -> plt+16*(i+1)" is needed. On a patched
+ * symbols, so no arithmetic like "rela.plt[i] -> plt+stride*i" is needed. On a patched
  * image a patched stub has no `ldr` and is not decoded, so misses are tolerated only
  * if their count equals the number we patched. */
 static int selftest(Src *s) {
