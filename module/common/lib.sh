@@ -50,8 +50,8 @@ unfuse_setprop() {
 #
 # Без этого getattr() на /storage/emulated отдаёт EACCES у appdomain и coredomain
 # (domain.te:252: один search и ни одного getattr), причём без AVC — отказ помечен
-# dontaudit. Содержимое уже несёт media_rw_data_file, где у appdomain полные права
-# (app.te:149), так что перемаркировать надо ровно корень.
+# dontaudit. Содержимое уже несёт media_rw_data_file, поэтому перемаркировать
+# надо ровно корень; права на execute, symlink и hardlink добавляет sepolicy.rule.
 #
 # Молчит: раньше функция печатала ПРЕЖНЮЮ метку и различала три кода возврата
 # (метка уже нужная / перемаркировали / chcon не прошёл) — это уходило в лог

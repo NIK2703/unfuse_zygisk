@@ -14,7 +14,7 @@ MODDIR="${MODDIR:-${0%/*}}"
 
 # media_userdir_file gives appdomain one search and no getattr (domain.te:252),
 # so stat()/ls() on /storage/emulated return EACCES with no AVC; the contents
-# already carry media_rw_data_file, where appdomain has full rights (app.te:149).
+# already carry media_rw_data_file, where appdomain has read/write (app.te:149).
 # Почему именно так — в lib.sh (unfuse_relabel_media_root).
 unfuse_relabel_media_root
 

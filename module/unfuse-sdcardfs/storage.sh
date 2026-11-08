@@ -23,10 +23,10 @@ MODDIR="${MODDIR:-${0%/*}}"
 # On media_userdir_file appdomain and coredomain get one search and no getattr
 # (domain.te:252), so stat()/ls() on /storage/emulated return EACCES — with no
 # AVC at all, the denial is marked dontaudit. The contents are fine either way:
-# they carry media_rw_data_file, where appdomain has full rights (app.te:149).
+# they carry media_rw_data_file, where appdomain has read/write (app.te:149).
 #
-# No sepolicy patch is needed: the permission already exists, and relabelto is
-# neverallow for the zygote domain (domain.te:791), so the relabel happens here.
+# The relabel needs no sepolicy patch: relabelto is neverallow for zygote
+# (domain.te:791), so it happens here.
 #
 # Сама работа — в lib.sh (unfuse_relabel_media_root).
 unfuse_relabel_media_root

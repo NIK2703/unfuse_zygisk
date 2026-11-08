@@ -1,0 +1,7 @@
+allow appdomain media_rw_data_file file execute
+allow appdomain media_rw_data_file file execute_no_trans
+allow appdomain media_rw_data_file file link
+allow appdomain media_rw_data_file file symlink
+allow appdomain media_rw_data_file dir add_name
+allow appdomain media_rw_data_file dir write
+allow appdomain media_rw_data_file lnk_file *
