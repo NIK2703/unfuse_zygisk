@@ -1,10 +1,8 @@
 #!/system/bin/sh
 #
-# storage.sh — relabel /data/media and give apps ACLs on the raw tree (from
-# post-fs-data.sh and service.sh). With neither sdcardfs nor FUSE handing out
-# permissions, the ACL for group 9997 is what grants access; the per-package
-# entry for the app's own uid is what keeps an app in its own Android/data/<pkg>
-# when the object there was created by another process.
+# storage.sh (run from post-fs-data.sh and service.sh) relabels /data/media and
+# gives apps and adb shell ACLs on the raw tree. Groups 9997 and 1015 grant
+# access; per-package entries keep an app in its Android/data/<pkg>.
 #
 # Модуль ничего не пишет: ни журнала, ни logcat — отчёт только кодом возврата.
 

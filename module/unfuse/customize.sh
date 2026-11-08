@@ -48,6 +48,8 @@ set_perm "$MODPATH/tools/vold-fusefs"  0 0 0755
 # Второй конфиг — тот же мёртвый, но лежал внутри модуля.
 rm -f "$MODPATH/unfuse_zygisk.conf" 2>/dev/null
 
+unfuse_choose_sepolicy
+
 # Форму хранилища на 11 модуль выставляет сам (post-fs-data.sh), но смена
 # бэкенда не должна быть неожиданной. FUSE — значение AOSP по умолчанию
 # (init.rc:792), вендор мог его переопределить. external_storage.sdcardfs.enabled

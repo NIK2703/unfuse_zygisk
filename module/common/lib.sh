@@ -65,6 +65,51 @@ unfuse_relabel_media_root() {
     chcon u:object_r:media_rw_data_file:s0 /data/media 2>/dev/null
 }
 
+# unfuse_choose_sepolicy: громкость вверх оставляет sepolicy.rule, вниз удаляет.
+unfuse_choose_sepolicy() {
+    _ge=$(command -v getevent 2>/dev/null)
+    if [ -z "$_ge" ]; then
+        ui_print "- getevent not found; SELinux rules enabled"
+        return 0
+    fi
+
+    _to=$(command -v timeout 2>/dev/null)
+    if [ -z "$_to" ]; then
+        ui_print "- timeout not found; SELinux rules enabled"
+        return 0
+    fi
+
+    ui_print "- SELinux exec/symlink/hardlink rules:"
+    ui_print "  Volume UP = enable, Volume DOWN = disable"
+    ui_print "  No key in 30 s: enabled"
+
+    while :; do
+        _ev=$("$_to" 30 "$_ge" -qlc 1 2>/dev/null)
+        _rc=$?
+
+        case "$_ev" in
+            *KEY_VOLUMEUP*)
+                ui_print "- SELinux rules: enabled"
+                return 0
+                ;;
+            *KEY_VOLUMEDOWN*)
+                rm -f "$MODPATH/sepolicy.rule"
+                ui_print "- SELinux rules: disabled"
+                return 0
+                ;;
+        esac
+
+        if [ "$_rc" -ne 0 ]; then
+            ui_print "- No volume key or getevent error; SELinux rules: enabled"
+            return 0
+        fi
+        if [ -z "$_ev" ]; then
+            ui_print "- No input event; SELinux rules: enabled"
+            return 0
+        fi
+    done
+}
+
 # unfuse_require_zygisk_so <ABI> — сборка не доехала. Только для customize.sh:
 # abort() определяет установщик Magisk/KernelSU.
 unfuse_require_zygisk_so() {

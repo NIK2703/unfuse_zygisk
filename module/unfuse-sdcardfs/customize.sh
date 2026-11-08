@@ -41,6 +41,8 @@ if ! grep -qw sdcardfs /proc/filesystems 2>/dev/null; then
     abort "! Это ядро не умеет sdcardfs — модуль на нём работать не будет"
 fi
 
+unfuse_choose_sepolicy
+
 # --- one line of output ------------------------------------------------------
 #
 # The installer says one thing about the storage path: that the kernel has

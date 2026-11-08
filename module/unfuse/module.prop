@@ -3,4 +3,4 @@ name=Unfuse Zygisk
 version=v1.4
 versionCode=5
 author=NIK2703
-description=Direct internal storage for all apps — no FUSE, no scoped storage. vold's FUSE mount for emulated storage is replaced by a bind of the raw /data/media, Android/data + Android/obb isolation is lifted, and apps can execute files and create symlinks/hardlinks on storage.
+description=Direct internal storage for all apps — no FUSE, no scoped storage. vold's FUSE mount for emulated storage is replaced by a bind of the raw /data/media, Android/data + Android/obb isolation is lifted, and apps can execute files and create symlinks/hardlinks on storage when the optional SELinux rules are enabled.

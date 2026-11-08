@@ -5,10 +5,8 @@
  * sdcardfs synthesises rights: from the mount's mask/gid it gives any process in
  * group 9997 (AID_EVERYBODY) 0770 dirs and 0660 files regardless of the lower FS.
  * Without it, /data/media is 1023:1023 (media_rw) with modes 0550/2770/0670, so apps
- * (which lack 1023) cannot even enter. We place a POSIX ACL with a named entry for
- * group 9997 — the same gid the sdcardfs read/write/full mounts use
- * (system-core-16/sdcard/sdcard.cpp:182-206); 9997 is shared by all apps
- * (android_filesystem_config.h:166).
+ * (which lack 1023) cannot even enter. We place a POSIX ACL for group 9997
+ * (AID_EVERYBODY, shared by all apps) and group 1015 (sdcard_rw, adb shell).
  *
  * Why ACL, not chmod: a mode is system-wide; an ACL entry sits on top without
  * disturbing MediaProvider or vold.
@@ -35,10 +33,11 @@
  * mode arm of the libc hooks (src/hook_libc.cpp) probes the same way and keeps
  * the same setgid chain alive.
  *
- * Modes: <dir>... grant group 9997 rwx/rw recursively; --traverse <dir> r-x on the
- * dir only (volume root: traverse, no write); --check <dir>... verify the 9997 entry
- * (0 ok, 1 not); --app-dirs <dir>... add the per-package entry to
- * Android/{data,obb,media}/<pkg> (see acl_apply_extra and fix_app_dirs);
+ * Modes: <dir>... grant groups 9997 and 1015 rwx/rw recursively;
+ * --traverse <dir> r-x on the dir only (volume root: traverse, no write);
+ * --check <dir>... verify the 9997 entry (0 ok, 1 not); --app-dirs <dir>...
+ * add the per-package entry to Android/{data,obb,media}/<pkg>
+ * (see acl_apply_extra and fix_app_dirs);
  * --dump <path>... print mode/owner and the ACLs (diagnostics; the default ACL is
  * printed only when it differs from the access one — see dump_path);
  * --probe <uid> <path> run an access check as that uid (diagnostics).
@@ -90,10 +89,10 @@
 #define XATTR_ACL_DEFAULT "system.posix_acl_default"
 
 /* linux/include/uapi/linux/posix_acl_xattr.h. ACL_USER (0x02) is never written
- * here — access is granted through the named GROUP entry for 9997 — but --dump
- * does read it back: vold writes per-package entries as additional *groups*
- * (Utils.cpp:321), yet an entry of that tag may still appear in a tree the module
- * did not create, and a dump that silently skipped it would misreport the ACL. */
+ * here; access uses the named GROUP entries for 1015 and 9997. --dump still
+ * reads ACL_USER because vold writes per-package entries as additional groups
+ * (Utils.cpp:321), and an entry of that tag can exist in a tree the module did
+ * not create. */
 #define POSIX_ACL_XATTR_VERSION 0x0002
 #define ACL_USER_OBJ 0x01
 #define ACL_USER 0x02
@@ -104,6 +103,9 @@
 
 /* android_filesystem_config.h: shared group of all apps in a profile */
 #define AID_EVERYBODY 9997
+
+/* android_filesystem_config.h: adb shell's storage group. */
+#define AID_SDCARD_RW 1015
 
 /* android_filesystem_config.h: AID_APP_START — the first app uid. Used only to
  * tell a per-package directory (owned by the app) from one owned by root/system,
@@ -117,7 +119,7 @@
 #define AID_EXT_OBB_RW 1079
 #define AID_INET 3003
 
-/* ACL entries we will parse; neither vold nor we write more than five. */
+/* Maximum ACL entries read from an xattr. */
 #define ACL_MAX_ENTRIES 32
 
 struct acl_entry {
@@ -193,65 +195,9 @@ static int acl_allows_everybody(const char *path, const char *name, uint16_t *pe
     return 1;
 }
 
-/* Build a 5-entry ACL like vold::SetDefaultAcl (vold-16/Utils.cpp:142): mode sets
- * owner/group/other; the 9997 named entry gets group rights, which also go into
- * the mask (otherwise the mask would null the grant). */
+/* Build a 6-entry ACL like vold::SetDefaultAcl: mode sets owner/group/other;
+ * groups 9997 and 1015 get group rights, which are also copied into the mask. */
 static int acl_apply(const char *path, const char *name, mode_t mode) {
-    struct acl_entry e[5];
-    const uint16_t group_perm = (mode & S_IRWXG) >> 3;
-    size_t n = 0;
-
-    e[n].e_tag = ACL_USER_OBJ;
-    e[n].e_perm = (mode & S_IRWXU) >> 6;
-    e[n].e_id = (uint32_t)-1;
-    n++;
-    e[n].e_tag = ACL_GROUP_OBJ;
-    e[n].e_perm = group_perm;
-    e[n].e_id = (uint32_t)-1;
-    n++;
-    e[n].e_tag = ACL_GROUP;
-    e[n].e_perm = group_perm;
-    e[n].e_id = AID_EVERYBODY;
-    n++;
-    e[n].e_tag = ACL_MASK;
-    e[n].e_perm = group_perm;
-    e[n].e_id = 0;
-    n++;
-    e[n].e_tag = ACL_OTHER;
-    e[n].e_perm = mode & S_IRWXO;
-    e[n].e_id = 0;
-    n++;
-
-    uint8_t buf[sizeof(uint32_t) + 5 * sizeof(struct acl_entry)];
-    const uint32_t version = POSIX_ACL_XATTR_VERSION;
-    memcpy(buf, &version, sizeof(version));
-    memcpy(buf + sizeof(version), e, n * sizeof(struct acl_entry));
-    const size_t len = sizeof(version) + n * sizeof(struct acl_entry);
-
-    return setxattr(path, name, buf, len, 0);
-}
-
-/* The same ACL plus a named entry for the package's own uid — AOSP's
- * additionalGids.push_back(uid) (vold-11/Utils.cpp:321, used at :398). Its
- * comment names the reason exactly: an app must keep access to the files in its
- * own Android/data/<pkg> "even if they are created by other processes".
- *
- * Our single 9997 entry does not cover that case. An object created inside the
- * app's directory by another uid (a root helper, an installer, MTP, vold) inherits
- * no entry for the app, and if the creating process asked for a restrictive mode
- * the mask cuts the grant as well (posix_acl_create_masq on 0600/0700 — the failure
- * the project itself had already named in docs/android-11-design.md). With the
- * app's own uid present the app is matched by name, and the mode the creator used
- * stops deciding whether it gets in.
- *
- * tools/vold-noacl stops vold from writing its own version of this ACL (it turns
- * the one setxattr call behind SetDefaultAcl into a no-op), so this pass is what
- * supplies it. Keeping 9997 as well is deliberate: vold's own buffer carries the
- * uid and drops 9997, ours carries both, so the module's cross-app model survives
- * the fix instead of being traded for it. ACL_GROUP entries have to be sorted by
- * id (posix_acl_valid), and an app uid is always above 9997, so the order below
- * is the required one. */
-static int acl_apply_extra(const char *path, const char *name, mode_t mode, uint32_t extra_uid) {
     struct acl_entry e[6];
     const uint16_t group_perm = (mode & S_IRWXG) >> 3;
     size_t n = 0;
@@ -266,9 +212,70 @@ static int acl_apply_extra(const char *path, const char *name, mode_t mode, uint
     n++;
     e[n].e_tag = ACL_GROUP;
     e[n].e_perm = group_perm;
+    e[n].e_id = AID_SDCARD_RW;
+    n++;
+    e[n].e_tag = ACL_GROUP;
+    e[n].e_perm = group_perm;
     e[n].e_id = AID_EVERYBODY;
     n++;
-    if (extra_uid != AID_EVERYBODY) {
+    e[n].e_tag = ACL_MASK;
+    e[n].e_perm = group_perm;
+    e[n].e_id = 0;
+    n++;
+    e[n].e_tag = ACL_OTHER;
+    e[n].e_perm = mode & S_IRWXO;
+    e[n].e_id = 0;
+    n++;
+
+    uint8_t buf[sizeof(uint32_t) + 6 * sizeof(struct acl_entry)];
+    const uint32_t version = POSIX_ACL_XATTR_VERSION;
+    memcpy(buf, &version, sizeof(version));
+    memcpy(buf + sizeof(version), e, n * sizeof(struct acl_entry));
+    const size_t len = sizeof(version) + n * sizeof(struct acl_entry);
+
+    return setxattr(path, name, buf, len, 0);
+}
+
+/* The same ACL plus a named entry for the package's own uid — AOSP's
+ * additionalGids.push_back(uid) (vold-11/Utils.cpp:321, used at :398). Its
+ * comment names the reason exactly: an app must keep access to the files in its
+ * own Android/data/<pkg> "even if they are created by other processes".
+ *
+ * The 9997 entry alone does not cover that case. An object created inside the
+ * app's directory by another uid (a root helper, an installer, MTP, vold) inherits
+ * no entry for the app, and if the creating process asked for a restrictive mode
+ * the mask cuts the grant as well (posix_acl_create_masq on 0600/0700 — the failure
+ * the project itself had already named in docs/android-11-design.md). With the
+ * app's own uid present the app is matched by name, and the mode the creator used
+ * stops deciding whether it gets in.
+ *
+ * tools/vold-noacl stops vold from writing its own version of this ACL (it turns
+ * the one setxattr call behind SetDefaultAcl into a no-op), so this pass is what
+ * supplies it. Keeping 9997 and 1015 is deliberate: vold's buffer carries only
+ * the uid, while this ACL keeps both groups. ACL_GROUP entries must be sorted by
+ * id, and an app uid is above 9997, so the order below is required. */
+static int acl_apply_extra(const char *path, const char *name, mode_t mode, uint32_t extra_uid) {
+    struct acl_entry e[7];
+    const uint16_t group_perm = (mode & S_IRWXG) >> 3;
+    size_t n = 0;
+
+    e[n].e_tag = ACL_USER_OBJ;
+    e[n].e_perm = (mode & S_IRWXU) >> 6;
+    e[n].e_id = (uint32_t)-1;
+    n++;
+    e[n].e_tag = ACL_GROUP_OBJ;
+    e[n].e_perm = group_perm;
+    e[n].e_id = (uint32_t)-1;
+    n++;
+    e[n].e_tag = ACL_GROUP;
+    e[n].e_perm = group_perm;
+    e[n].e_id = AID_SDCARD_RW;
+    n++;
+    e[n].e_tag = ACL_GROUP;
+    e[n].e_perm = group_perm;
+    e[n].e_id = AID_EVERYBODY;
+    n++;
+    if (extra_uid != AID_EVERYBODY && extra_uid != AID_SDCARD_RW) {
         e[n].e_tag = ACL_GROUP;
         e[n].e_perm = group_perm;
         e[n].e_id = extra_uid;
@@ -283,7 +290,7 @@ static int acl_apply_extra(const char *path, const char *name, mode_t mode, uint
     e[n].e_id = 0;
     n++;
 
-    uint8_t buf[sizeof(uint32_t) + 6 * sizeof(struct acl_entry)];
+    uint8_t buf[sizeof(uint32_t) + 7 * sizeof(struct acl_entry)];
     const uint32_t version = POSIX_ACL_XATTR_VERSION;
     memcpy(buf, &version, sizeof(version));
     memcpy(buf + sizeof(version), e, n * sizeof(struct acl_entry));

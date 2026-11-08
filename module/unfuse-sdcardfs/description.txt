@@ -1,1 +1,1 @@
-Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace, lifts Android/data and Android/obb isolation, and adds execute/symlink/hardlink permissions for apps on storage.
+Direct internal storage for all apps — no FUSE, no scoped storage. Exposes /data/media in each app's private mount namespace, lifts Android/data and Android/obb isolation, and adds optional SELinux execute/symlink/hardlink permissions for apps on storage.
